@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 8] = b"CSTREE\x01\n";
-const VERSION: u32 = 2;
+const VERSION: u32 = 4;
 
 pub struct Cache {
     pub nodes: Vec<Node>,
@@ -110,6 +110,7 @@ impl Cache {
             put_u64(&mut w, self.stats.subvolumes)?;
             put_u64(&mut w, self.stats.skipped_nonbtrfs)?;
             put_u64(&mut w, self.stats.unreadable)?;
+            put_u64(&mut w, self.stats.fd_fallback)?;
             put_u64(&mut w, self.stats.elapsed.as_millis() as u64)?;
 
             let nodes: &[u8] = unsafe {
@@ -135,7 +136,7 @@ impl Cache {
                 w.write_all(&s.uuid)?;
                 w.write_all(&s.parent_uuid)?;
                 put_u64(&mut w, s.flags)?;
-                put_u64(&mut w, s.ctime)?;
+                put_u64(&mut w, s.otime)?;
                 w.write_all(&[s.snapshot as u8, s.seen as u8])?;
                 put_bytes(&mut w, &s.name)?;
                 put_bytes(&mut w, &s.path)?;
@@ -199,6 +200,7 @@ impl Cache {
             subvolumes: read_u64(&mut r)?,
             skipped_nonbtrfs: read_u64(&mut r)?,
             unreadable: read_u64(&mut r)?,
+            fd_fallback: read_u64(&mut r)?,
             elapsed: std::time::Duration::from_millis(read_u64(&mut r)?),
         };
 
@@ -218,7 +220,7 @@ impl Cache {
             let mut parent_uuid = [0u8; 16];
             r.read_exact(&mut parent_uuid)?;
             let flags = read_u64(&mut r)?;
-            let ctime = read_u64(&mut r)?;
+            let otime = read_u64(&mut r)?;
             let mut flags2 = [0u8; 2];
             r.read_exact(&mut flags2)?;
             subvols.push(Subvol {
@@ -226,7 +228,7 @@ impl Cache {
                 uuid,
                 parent_uuid,
                 flags,
-                ctime,
+                otime,
                 name: read_bytes(&mut r)?,
                 path: read_bytes(&mut r)?,
                 seen: flags2[1] != 0,

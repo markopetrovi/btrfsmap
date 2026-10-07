@@ -496,10 +496,16 @@ pub fn render_tree_report(tree: &Tree, stats: &ScanStats, opt: &TreeReportOption
         stats.files, stats.dirs, stats.extents, stats.refs, stats.subvolumes,
         stats.elapsed.as_secs_f64()
     ));
-    if stats.skipped_nonbtrfs > 0 {
+    if stats.skipped_nonbtrfs > 0 || stats.unreadable > 0 {
         out.push_str(&format!(
             "  ({} non-btrfs mounts skipped, {} unreadable)\n",
             stats.skipped_nonbtrfs, stats.unreadable
+        ));
+    }
+    if stats.fd_fallback > 0 {
+        out.push_str(&format!(
+            "  ({} of {} files needed their own descriptor for the extent ioctl)\n",
+            stats.fd_fallback, stats.files
         ));
     }
 

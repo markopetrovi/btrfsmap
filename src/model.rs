@@ -49,6 +49,13 @@ pub struct Node {
     pub kind: u8,
     pub flags: u8,
     pub inline_ram: u16,
+    /// inode creation time (unix seconds): with the subvolume's age this is the
+    /// ownership key - the oldest holder of an extent owns it
+    pub btime: u32,
+    /// sub-second part of the birth time, nanoseconds >> 14 (~16 us steps, so
+    /// files created microseconds apart still order correctly). Fits in what
+    /// used to be struct padding.
+    pub btime_ns: u16,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -73,8 +80,13 @@ pub struct DirExtra {
 pub struct ExtentInfo {
     pub disk: u64,
     pub ram: u64,
-    pub count_live: u32,
-    pub count_snap: u32,
+    /// smallest (birth time, subvolume creation time) seen for this extent,
+    /// tracked incrementally during the walk
+    pub win_btime: u32,
+    pub win_btime_ns: u16,
+    pub win_otime: u64,
+    /// how many references share that smallest key
+    pub win_count: u32,
     /// attribution cursor, used only while walking refs in file order
     pub assigned: u32,
 }
@@ -87,7 +99,9 @@ pub struct Subvol {
     pub uuid: [u8; 16],
     pub parent_uuid: [u8; 16],
     pub flags: u64,
-    pub ctime: u64,
+    /// subvolume creation time: the tiebreak when two holders share a file's
+    /// birth time, which is exactly the snapshot case
+    pub otime: u64,
     pub name: Vec<u8>,
     pub path: Vec<u8>,
     pub seen: bool,
@@ -166,54 +180,77 @@ impl Tree {
 
 impl Tree {
     /// Split every extent between its references and give each file its
-    /// `owned` / `uncomp` share. Exact: the remainder of the integer division
-    /// goes to the last reference, so a subtree's total equals the true sum.
-    pub fn attribute_owned(&mut self, refs: &[Vec<u64>], extents: &mut ExtentMap) {
+    /// `owned` / `uncomp` share.
+    ///
+    /// The ownership rule: every reference carries a key of (inode birth time,
+    /// creation time of the subvolume it lives in). The smallest key owns the
+    /// extent. A snapshot shares its inodes with the subvolume it was taken
+    /// from, so those references tie on birth time and the older subvolume -
+    /// the original - keeps ownership; a reflink copy is strictly younger than
+    /// its source, whichever subvolume it landed in, so the source keeps
+    /// ownership. References that share the smallest key split the extent
+    /// evenly, and the integer remainder goes to the last of them, so every
+    /// subtree's total still equals the real physical usage.
+    pub fn attribute_owned(
+        &mut self,
+        refs: &[Vec<u64>],
+        extents: &mut ExtentMap,
+        subvol_otime: &[u64],
+    ) {
         for e in extents.values_mut() {
             e.assigned = 0;
         }
         for i in 0..self.nodes.len() {
-            let (kind, flags, nrefs, first_ref, block, inline_disk, inline_ram) = {
+            let (kind, nrefs, first_ref, block, inline_disk, inline_ram, btime, btime_ns, parent) = {
                 let n = &self.nodes[i];
                 (
                     n.kind,
-                    n.flags,
                     n.nrefs as usize,
                     n.first_ref as usize,
                     n.extra as usize,
                     n.inline_disk as u64,
                     n.inline_ram as u64,
+                    n.btime,
+                    n.btime_ns,
+                    n.parent,
                 )
             };
             if kind != KIND_FILE {
                 continue;
             }
-            let class_snap = flags & FLAG_SNAP_CLASS != 0;
-            // Inline payloads are private to this file and need no splitting -
-            // and a file can have inline data and no regular extents at all.
+            let ctime = {
+                let p = &self.nodes[parent as usize];
+                let sv = if p.kind == KIND_DIR {
+                    self.dirs[p.extra as usize].subvol
+                } else {
+                    0
+                };
+                *subvol_otime.get(sv as usize).unwrap_or(&0)
+            };
+            // Inline payloads are private to this file and need no splitting.
             let mut owned = inline_disk;
             let mut uncomp = inline_ram;
             for r in &refs[block][first_ref..first_ref + nrefs] {
                 let Some(e) = extents.get_mut(&((*r >> 32) as u32)) else {
                     continue;
                 };
-                let (count, take) = if e.count_live > 0 {
-                    (e.count_live, !class_snap)
-                } else {
-                    (e.count_snap, class_snap)
-                };
-                if !take || count == 0 {
+                // only the holders of the extent's smallest key own it
+                if btime != e.win_btime
+                    || btime_ns != e.win_btime_ns
+                    || ctime != e.win_otime
+                    || e.win_count == 0
+                {
                     continue;
                 }
+                let n = e.win_count as u64;
                 let a = e.assigned;
                 e.assigned += 1;
-                let count = count as u64;
-                if a as u64 + 1 == count {
-                    owned += e.disk - (count - 1) * (e.disk / count);
-                    uncomp += e.ram - (count - 1) * (e.ram / count);
+                if a as u64 + 1 == n {
+                    owned += e.disk - (n - 1) * (e.disk / n);
+                    uncomp += e.ram - (n - 1) * (e.ram / n);
                 } else {
-                    owned += e.disk / count;
-                    uncomp += e.ram / count;
+                    owned += e.disk / n;
+                    uncomp += e.ram / n;
                 }
             }
             let n = &mut self.nodes[i];
@@ -428,7 +465,7 @@ impl Metric {
     /// Short explanation, shown under the selector.
     pub fn help(self) -> &'static str {
         match self {
-            Metric::Owned => "fair share of physical extents - live data owns what it references, snapshots own only what the live tree no longer holds; adds up",
+            Metric::Owned => "the oldest holder of a shared extent owns it: file birth time first, then the age of the subvolume it lives in. A snapshot ties with its parent (they share inodes) so the original keeps ownership; a reflink copy is younger than its source and owns only what is unique to it. Adds up.", 
             Metric::Freeable => "what would actually be freed by deleting this subtree",
             Metric::Compsize => "every extent referenced anywhere below, counted once - what compsize prints for that path",
             Metric::Referenced => "what the files claim, the number du and baobab show",

@@ -76,7 +76,9 @@ const OFF_SUBVOL_FLAGS: usize = 8 + (BTRFS_VOL_NAME_MAX + 1) + 8 + 8 + 8;
 const OFF_SUBVOL_UUID: usize = OFF_SUBVOL_FLAGS + 8;
 const OFF_SUBVOL_PARENT_UUID: usize = OFF_SUBVOL_UUID + BTRFS_UUID_SIZE;
 const OFF_SUBVOL_RECEIVED_UUID: usize = OFF_SUBVOL_PARENT_UUID + BTRFS_UUID_SIZE;
+// ctime, otime, stime, rtime each occupy 16 bytes (u64 sec + u32 nsec + pad).
 const OFF_SUBVOL_CTIME: usize = OFF_SUBVOL_RECEIVED_UUID + BTRFS_UUID_SIZE + 4 * 8;
+const OFF_SUBVOL_OTIME: usize = OFF_SUBVOL_CTIME + 16;
 
 #[allow(dead_code)]
 pub const BTRFS_SUBVOL_RDONLY: u64 = 1 << 1;
@@ -92,7 +94,9 @@ pub struct SubvolInfo {
     pub parent_uuid: [u8; BTRFS_UUID_SIZE],
     #[allow(dead_code)]
     pub received_uuid: [u8; BTRFS_UUID_SIZE],
-    pub ctime_sec: u64,
+    /// when the subvolume was created - never changes, unlike ctime which any
+    /// write bumps. This is the age a snapshot/parent comparison needs.
+    pub otime_sec: u64,
 }
 
 pub fn get_subvol_info(fd: i32) -> io::Result<SubvolInfo> {
@@ -120,7 +124,7 @@ pub fn get_subvol_info(fd: i32) -> io::Result<SubvolInfo> {
         uuid,
         parent_uuid,
         received_uuid,
-        ctime_sec: u64_at(OFF_SUBVOL_CTIME),
+        otime_sec: u64_at(OFF_SUBVOL_OTIME),
     })
 }
 
@@ -399,4 +403,100 @@ pub fn list_subvolumes(fd: i32) -> io::Result<Vec<RootItem>> {
         }
     })?;
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// statx: one call per file that yields inode, mode, mtime and birth time
+// ---------------------------------------------------------------------------
+
+extern "C" {
+    fn statx(dirfd: i32, pathname: *const i8, flags: i32, mask: u32, buf: *mut Statx) -> i32;
+}
+
+pub const AT_FDCWD: i32 = -100;
+pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+const STATX_BASIC_STATS: u32 = 0x7ff;
+pub const STATX_BTIME: u32 = 0x800;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct StatxTimestamp {
+    tv_sec: i64,
+    tv_nsec: u32,
+    _reserved: i32,
+}
+
+/// struct statx, 256 bytes; offsets checked against the C compiler.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Statx {
+    mask: u32,
+    blksize: u32,
+    attributes: u64,
+    nlink: u32,
+    uid: u32,
+    gid: u32,
+    mode: u16,
+    _spare0: u16,
+    ino: u64,
+    size: u64,
+    blocks: u64,
+    attributes_mask: u64,
+    atime: StatxTimestamp,
+    btime: StatxTimestamp,
+    ctime: StatxTimestamp,
+    mtime: StatxTimestamp,
+    rdev_major: u32,
+    rdev_minor: u32,
+    dev_major: u32,
+    dev_minor: u32,
+    mnt_id: u64,
+    dio_mem_align: u32,
+    dio_offset_align: u32,
+    _spare3: [u64; 12],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct StatInfo {
+    pub ino: u64,
+    /// S_IFMT bits
+    pub mode: u16,
+    pub mtime: u64,
+    /// inode creation time; the ownership rule's primary key
+    pub btime: u64,
+    /// sub-second part, in nanoseconds
+    pub btime_ns: u32,
+    pub has_btime: bool,
+    pub dev: u64,
+}
+
+pub const S_IFMT: u16 = 0o170000;
+pub const S_IFREG: u16 = 0o100000;
+
+/// `path` must be NUL-terminated.
+pub fn stat_path(path: &[u8], nofollow: bool) -> io::Result<StatInfo> {
+    let mut st: Statx = unsafe { std::mem::zeroed() };
+    let flags = if nofollow { AT_SYMLINK_NOFOLLOW } else { 0 };
+    let rc = unsafe {
+        statx(
+            AT_FDCWD,
+            path.as_ptr() as *const i8,
+            flags,
+            STATX_BASIC_STATS | STATX_BTIME,
+            &mut st,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(StatInfo {
+        ino: st.ino,
+        mode: st.mode,
+        mtime: st.mtime.tv_sec.max(0) as u64,
+        btime: st.btime.tv_sec.max(0) as u64,
+        btime_ns: st.btime.tv_nsec.min(999_999_999),
+        has_btime: st.mask & STATX_BTIME != 0,
+        // st_dev as the rest of the system encodes it (new_encode_dev)
+        dev: ((st.dev_major as u64) << 20) | (st.dev_minor as u64 & 0x000f_ffff),
+    })
 }

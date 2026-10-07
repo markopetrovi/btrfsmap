@@ -111,6 +111,8 @@ pub struct ScanStats {
     pub subvolumes: u64,
     pub skipped_nonbtrfs: u64,
     pub unreadable: u64,
+    /// files whose extent ioctl could not reuse the directory descriptor
+    pub fd_fallback: u64,
     pub elapsed: Duration,
 }
 
@@ -127,6 +129,9 @@ struct Shared {
     warnings: Mutex<Vec<String>>,
     unreadable: AtomicU64,
     nonbtrfs: AtomicU64,
+    no_btime: AtomicBool,
+    /// how often the directory descriptor could not be used (device mismatch)
+    fd_fallback: AtomicU64,
     prog: Arc<Progress>,
 }
 
@@ -164,7 +169,7 @@ impl Shared {
             uuid: info.uuid,
             parent_uuid: info.parent_uuid,
             flags: info.flags,
-            ctime: info.ctime_sec,
+            otime: info.otime_sec,
             name: info.name.clone(),
             path: path.to_vec(),
             seen: true,
@@ -179,6 +184,8 @@ struct Worker {
     refs: Vec<u64>,
     extents: ExtentMap,
     block: u32,
+    /// reusable NUL-terminated copy of the current path for statx
+    pathz: Vec<u8>,
 }
 
 /// `nofollow` mirrors compsize (and is the default); with --follow-symlinks the
@@ -223,28 +230,69 @@ fn is_excluded(opts: &ScanOptions, path: &[u8]) -> bool {
 
 /// Read one regular file's extent list. Returns its node with `owned` left at
 /// zero (that needs global extent counts, so it happens after the walk).
+/// Read one regular file's extent list. Returns its node with `owned` left at
+/// zero (that needs the global extent table, so it happens after the walk).
+///
+/// One syscall for the file itself - `statx`, which yields the birth time the
+/// ownership rule keys on - plus the extent ioctl. No open/close per file: the
+/// ioctl only needs *a* descriptor from the file's subvolume, so the containing
+/// directory's descriptor serves every entry in it.
+#[allow(clippy::too_many_arguments)]
 fn scan_file(
     w: &mut Worker,
     shared: &Shared,
     path: &[u8],
     snap_class: bool,
+    dir_fd: i32,
+    dir_dev: u64,
+    subvol_otime: u64,
     nofollow: bool,
 ) -> Option<Node> {
-    let f = match open_file(path, nofollow) {
-        Ok(f) => f,
-        Err(e) => {
-            note_open_error(shared, path, &e);
-            return None;
+    let st = {
+        w.pathz.clear();
+        w.pathz.extend_from_slice(path);
+        w.pathz.push(0);
+        match btrfs::stat_path(&w.pathz, nofollow) {
+            Ok(s) => s,
+            Err(e) => {
+                note_open_error(shared, path, &e);
+                return None;
+            }
         }
     };
-    let md = match f.metadata() {
-        Ok(m) => m,
-        Err(_) => return None,
-    };
-    if !md.is_file() {
+    if st.mode & btrfs::S_IFMT != btrfs::S_IFREG {
         return None;
     }
-    let ino = md.ino();
+    if !st.has_btime && !shared.no_btime.swap(true, Ordering::Relaxed) {
+        shared.warn(
+            "this filesystem does not report file birth times; ownership falls back to \
+             subvolume age alone"
+                .to_string(),
+        );
+    }
+    let ino = st.ino;
+    let btime = st.btime.min(u32::MAX as u64) as u32;
+    let btime_ns = (st.btime_ns >> 14) as u16;
+
+    // A followed symlink can lead into another subvolume, where the directory's
+    // descriptor would search the wrong tree; fall back to the file's own.
+    let owned_fd;
+    let fd = if dir_fd >= 0 && st.dev == dir_dev {
+        dir_fd
+    } else {
+        shared.fd_fallback.fetch_add(1, Ordering::Relaxed);
+        match open_file(path, nofollow) {
+            Ok(f) => {
+                owned_fd = f;
+                owned_fd.as_raw_fd()
+            }
+            Err(e) => {
+                note_open_error(shared, path, &e);
+                return None;
+            }
+        }
+    };
+
     let mut referenced = 0u64;
     let mut inline_disk = 0u32;
     let mut inline_ram = 0u32;
@@ -257,7 +305,7 @@ fn scan_file(
         ..
     } = w;
     let first_ref = refs.len() as u32;
-    let res = searcher.for_each_extent(f.as_raw_fd(), ino, &mut |item: &ExtentItem| {
+    let res = searcher.for_each_extent(fd, ino, &mut |item: &ExtentItem| {
         if item.kind == BTRFS_FILE_EXTENT_INLINE {
             // Inline payloads live in metadata, are never shared, and compsize
             // counts them per file: add them straight to this file.
@@ -277,14 +325,22 @@ fn scan_file(
         let e = extents.entry(page).or_insert_with(|| ExtentInfo {
             disk: item.disk_num_bytes,
             ram: item.ram_bytes,
-            count_live: 0,
-            count_snap: 0,
+            win_btime: u32::MAX,
+            win_btime_ns: u16::MAX,
+            win_otime: u64::MAX,
+            win_count: 0,
             assigned: 0,
         });
-        if snap_class {
-            e.count_snap += 1;
-        } else {
-            e.count_live += 1;
+        // keep the smallest (birth time, subvolume age) seen for this extent
+        let key = (btime, btime_ns, subvol_otime);
+        let best = (e.win_btime, e.win_btime_ns, e.win_otime);
+        if key < best {
+            e.win_btime = btime;
+            e.win_btime_ns = btime_ns;
+            e.win_otime = subvol_otime;
+            e.win_count = 1;
+        } else if key == best {
+            e.win_count += 1;
         }
         refs.push((page as u64) << 32);
         referenced += item.num_bytes;
@@ -312,7 +368,9 @@ fn scan_file(
         first_ref,
         nrefs: (w.refs.len() as u32) - first_ref,
         extra: w.block,
-        mtime: md.mtime().clamp(0, u32::MAX as i64) as u32,
+        mtime: st.mtime.min(u32::MAX as u64) as u32,
+        btime,
+        btime_ns,
         referenced,
         inline_disk: inline_disk.min(u16::MAX as u32) as u16,
         inline_ram: inline_ram.min(u16::MAX as u32) as u16,
@@ -345,6 +403,27 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
     };
     let mut path = item.path.to_vec();
     let base_len = path.len();
+
+    // One descriptor for every file in this directory: the extent ioctl only
+    // needs a descriptor from the file's subvolume, and the inode number is
+    // part of the search key, so this replaces open/close per file.
+    let dir_file = open_dir(&item.path).ok();
+    let dir_fd = dir_file
+        .as_ref()
+        .map(|f| std::os::fd::AsRawFd::as_raw_fd(f))
+        .unwrap_or(-1);
+    let subvol_otime = {
+        let table = shared.subvols.lock().unwrap();
+        table.get(item.subvol as usize).map(|s| s.otime).unwrap_or(0)
+    };
+    // Same source as the per-file value, so the comparison is meaningful
+    // (stat(2) and statx(2) pack the device differently).
+    let dir_dev = {
+        let mut z = Vec::with_capacity(item.path.len() + 1);
+        z.extend_from_slice(&item.path);
+        z.push(0);
+        btrfs::stat_path(&z, true).map(|s| s.dev).unwrap_or(u64::MAX)
+    };
 
     let rd = match fs::read_dir(OsStr::from_bytes(&item.path)) {
         Ok(rd) => rd,
@@ -486,8 +565,16 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
                 ..Default::default()
             });
         } else if is_file {
-            let Some(mut node) = scan_file(w, shared, &path, item.snap_class, !opts.follow_symlinks)
-            else {
+            let Some(mut node) = scan_file(
+                w,
+                shared,
+                &path,
+                item.snap_class,
+                dir_fd,
+                dir_dev,
+                subvol_otime,
+                !opts.follow_symlinks,
+            ) else {
                 continue;
             };
             let name_off = result.names.len() as u32;
@@ -557,6 +644,8 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
         warnings: Mutex::new(Vec::new()),
         unreadable: AtomicU64::new(0),
         nonbtrfs: AtomicU64::new(0),
+        no_btime: AtomicBool::new(false),
+        fd_fallback: AtomicU64::new(0),
         prog: opts
             .live
             .clone()
@@ -575,6 +664,7 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
         refs: Vec::new(),
         extents: ExtentMap::new(),
         block: 0,
+        pathz: Vec::with_capacity(4096),
     };
     for root in &opts.roots {
         let md = match fs::metadata(OsStr::from_bytes(root)) {
@@ -635,7 +725,9 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
                 ..Default::default()
             });
         } else if md.is_file() {
-            let Some(mut node) = scan_file(&mut main_worker, &shared, root, false, false) else {
+            let Some(mut node) =
+                scan_file(&mut main_worker, &shared, root, false, -1, 0, 0, false)
+            else {
                 continue;
             };
             let name_off = root_result.names.len() as u32;
@@ -690,6 +782,7 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
                     refs: Vec::new(),
                     extents: ExtentMap::new(),
                     block,
+                    pathz: Vec::with_capacity(4096),
                 };
                 loop {
                     let item = {
@@ -769,6 +862,7 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
         subvolumes: subvols.len() as u64,
         skipped_nonbtrfs: shared.nonbtrfs.load(Ordering::Relaxed),
         unreadable: shared.unreadable.load(Ordering::Relaxed),
+        fd_fallback: shared.fd_fallback.load(Ordering::Relaxed),
         elapsed: started.elapsed(),
     };
     shared.prog.running.store(false, Ordering::SeqCst);
@@ -880,8 +974,17 @@ pub fn merge_extents(maps: Vec<ExtentMap>) -> ExtentMap {
         for (k, v) in m {
             match out.get_mut(&k) {
                 Some(e) => {
-                    e.count_live += v.count_live;
-                    e.count_snap += v.count_snap;
+                    let mine = (e.win_btime, e.win_btime_ns, e.win_otime);
+                    let theirs = (v.win_btime, v.win_btime_ns, v.win_otime);
+                    if theirs < mine {
+                        e.win_btime = v.win_btime;
+                        e.win_btime_ns = v.win_btime_ns;
+                        e.win_otime = v.win_otime;
+                        e.win_count = v.win_count;
+                    } else if theirs == mine {
+                        e.win_count += v.win_count;
+                    }
+                    // disk/ram keep the first-seen value, as compsize does
                 }
                 None => {
                     out.insert(k, v);
@@ -899,10 +1002,11 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     let (mut tree, mut ref_blocks, maps, mut stats) = flatten(raw, inventory);
     let mut extents = merge_extents(maps);
     stats.extents = extents.len() as u64;
+    let subvol_otime: Vec<u64> = tree.subvols.iter().map(|s| s.otime).collect();
     tree.stats = stats.clone();
     tree.scanned_at = crate::cache::now();
     tree.scanned_roots = opts.roots.clone();
-    tree.attribute_owned(&ref_blocks, &mut extents);
+    tree.attribute_owned(&ref_blocks, &mut extents, &subvol_otime);
     tree.attribute_reach(&mut ref_blocks, &extents);
     tree.rollup();
     drop(ref_blocks);

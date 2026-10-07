@@ -40,15 +40,18 @@ filesystem).
 
 | metric | meaning |
 |---|---|
-| **owned** | Semantic ownership. An extent is owned by its live references if it has any, otherwise by its snapshot references; within a class the bytes are split evenly (2 references -> 50/50). Additive: children sum to the parent and the whole tree sums to the true physical usage. A snapshot at creation owns nothing and grows only as the live tree overwrites data. This is the default. |
+| **owned** | Semantic ownership: **the oldest holder of an extent owns it**. Every reference carries a key of (the file's birth time, the creation time of the subvolume it lives in); the smallest key owns the extent, and references sharing that smallest key split it evenly. A snapshot shares its inodes with the subvolume it was taken from, so the two tie on birth time and the older subvolume - the original - keeps ownership; a reflink copy is strictly younger than its source, whichever subvolume it landed in. Delete the parent and the oldest snapshot becomes the new custodian, exactly as if ownership had transferred. Additive: children sum to the parent and the whole tree sums to the true physical usage. This is the default. |
 | **freeable** | Bytes that deleting this path would actually free: extents whose references are *all* below it. Same idea as `btrfs fi du`'s "Exclusive", but per subtree and compression-aware. |
 | **compsize** | Exactly what `compsize <path>` prints as Disk Usage: every extent referenced anywhere below, counted once. The cross-check number (it is order-independent even though compsize itself is not). |
 | **referenced** | What the files claim (du/baobab's number, the 27 TB). |
 | **uncompressed** | Deduplicated data before compression; `compsize / uncompressed` is the effective compression ratio. |
 
-A fresh snapper snapshot of `/home` therefore shows a few hundred MB owned (its
-CoW cost so far) instead of "another 605 GB", and `/home/marko` keeps its
-compsize number even though 190 snapshots reference the same extents.
+A fresh snapper snapshot of `/home` therefore shows a few hundred MB owned (its CoW cost so
+far) instead of "another 605 GB"; when the live tree overwrites or deletes something, that data's
+ownership moves to the snapshot holding it, and `/home/marko` keeps its compsize number even
+though 190 snapshots reference the same extents. In a reflink farm the original keeps the shared
+bytes and every copy owns only its own deltas, so the numbers do not move when an unrelated copy
+appears or is deleted.
 
 ## Commands
 
@@ -151,7 +154,10 @@ buffer.
 
 The scanner is std-only Rust; the browser is GTK4 (gtk4-rs). Per file it asks the kernel for the inode's
 `EXTENT_DATA` items with `BTRFS_IOC_TREE_SEARCH_V2`, exactly like compsize,
-and reads the packed `btrfs_file_extent_item` layout directly. Subvolume
+and reads the packed `btrfs_file_extent_item` layout directly. One `statx` per file supplies the
+inode, mtime and birth time the ownership rule needs; that replaced `fstat`, and the ioctl reuses the
+containing directory's descriptor (it only needs *a* descriptor from the file's subvolume, since the
+inode number travels in the search key), so a file costs two syscalls instead of four. Subvolume
 identity comes from `BTRFS_IOC_GET_SUBVOL_INFO` at `st_dev` boundaries plus a
 root-tree scan for the UUID inventory, so snapshots are recognised
 structurally rather than by path convention. Compression, inline extents,
