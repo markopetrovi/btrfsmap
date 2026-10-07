@@ -8,6 +8,7 @@ mod cache;
 mod chart;
 mod gui;
 mod listmodel;
+mod metadata;
 mod model;
 mod report;
 mod walk;
@@ -63,6 +64,13 @@ fn main() -> ExitCode {
         }
         Some("scan") => cmd_scan(&args[1..]),
         Some("report") => cmd_report(&args[1..]),
+        Some("meta-probe") => match args.get(1) {
+            Some(d) => cmd_meta_probe(&PathBuf::from(d)),
+            None => {
+                eprintln!("meta-probe needs a directory");
+                ExitCode::from(2)
+            }
+        },
         Some("check") => match args.get(1) {
             Some(f) => cmd_check(&PathBuf::from(f)),
             None => {
@@ -87,6 +95,58 @@ fn main() -> ExitCode {
 
 pub fn is_root() -> bool {
     unsafe { geteuid() == 0 }
+}
+
+/// Development aid: report what one pass over a subvolume's fs tree sees, to be
+/// checked against `find -xdev` before any of it is trusted.
+fn cmd_meta_probe(dir: &PathBuf) -> ExitCode {
+    let f = match std::fs::File::open(dir) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{}: {e}", dir.display());
+            return ExitCode::from(1);
+        }
+    };
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
+    let info = match btrfs::get_subvol_info(fd) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{}: not a btrfs subvolume fd: {e}", dir.display());
+            return ExitCode::from(1);
+        }
+    };
+    let started = Instant::now();
+    match metadata::probe(fd, info.treeid) {
+        Ok(p) => {
+            println!(
+                "subvolume {} (id {}) of {}:",
+                String::from_utf8_lossy(&info.name),
+                info.treeid,
+                dir.display()
+            );
+            println!(
+                "  {} inodes: {} files, {} dirs, {} symlinks, {} other",
+                p.inodes, p.files, p.dirs, p.symlinks, p.other
+            );
+            println!(
+                "  {} inode refs ({} extended), {} extent-data items, {} items total",
+                p.refs, p.extrefs, p.extents, p.items
+            );
+            println!("  nested subvolumes: {}", p.nested.len());
+            for (root, dirid, name) in p.nested.iter().take(8) {
+                println!(
+                    "    root {root} at inode {dirid} name {:?}",
+                    String::from_utf8_lossy(name)
+                );
+            }
+            println!("  read in {:.1}s", started.elapsed().as_secs_f64());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("probe failed: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn cmd_check(path: &PathBuf) -> ExitCode {

@@ -217,7 +217,7 @@ impl Searcher {
             min_objectid: ino,
             max_objectid: ino,
         };
-        self.for_each_item(fd, &spec, &mut |_obj, key_offset, payload| {
+        self.for_each_item(fd, &spec, &mut |_obj, _ty, key_offset, payload| {
             if let Some(item) = parse_extent_item(payload, key_offset) {
                 f(&item);
             }
@@ -233,7 +233,7 @@ impl Searcher {
     /// lost or double counted.
     pub fn for_each_item<F>(&mut self, fd: i32, spec: &SearchSpec, f: &mut F) -> io::Result<u64>
     where
-        F: FnMut(u64, u64, &[u8]),
+        F: FnMut(u64, u32, u64, &[u8]),
     {
         let cap = self.capacity();
         let mut n_seen = 0u64;
@@ -247,6 +247,7 @@ impl Searcher {
                 return Err(io::Error::last_os_error());
             }
             let nr_items = u32::from_ne_bytes(self.buf[64..68].try_into().unwrap()) as usize;
+            let dbg = std::env::var_os("CST_PAGE_DEBUG").is_some();
 
             let items = &self.buf[SEARCH_ARGS_V2_SIZE..];
             let mut pos = 0usize;
@@ -269,26 +270,31 @@ impl Searcher {
                     break;
                 }
                 let payload = &items[pos + SEARCH_HEADER_SIZE..pos + SEARCH_HEADER_SIZE + len];
-                f(obj, key_off, payload);
+                f(obj, key_type, key_off, payload);
                 last_complete = Some((obj, key_type, key_off));
                 n_seen += 1;
                 pos += SEARCH_HEADER_SIZE + len;
                 count += 1;
             }
 
-            // "no room left for another header" is the reliable signal that the
-            // kernel stopped because the buffer was full, not because the range
-            // ran out. Either way, one more search from the resume point settles it.
-            let no_room = pos + SEARCH_HEADER_SIZE > cap;
-            let resume = match (truncated_at, last_complete) {
+            // Keep asking until the kernel returns nothing: a buffer that fills
+            // up stops mid-item, and "how much room is left" cannot tell the
+            // difference between that and the end of the range (an item needs
+            // its header *and* payload, and the payload can be any size). One
+            // extra, empty call per enumeration is the price of not losing items.
+            if nr_items == 0 || last_complete.is_none() && truncated_at.is_none() {
+                return Ok(n_seen);
+            }
+            let resume = match truncated_at {
                 // Refetch the cut-off item; if it cannot fit in the whole buffer,
-                // there is no way to make progress, so step over it instead of looping.
-                (Some((obj, ty, off, len)), _) if SEARCH_HEADER_SIZE + len <= cap => {
-                    (obj, ty, off)
-                }
-                (Some((obj, ty, off, _)), _) => (obj, ty, off + 1),
-                (None, Some((obj, ty, off))) if no_room => (obj, ty, off + 1),
-                _ => return Ok(n_seen),
+                // there is no way to make progress, so step over it instead.
+                Some((obj, ty, off, len)) if SEARCH_HEADER_SIZE + len <= cap => (obj, ty, off),
+                Some((obj, ty, off, _)) => (obj, ty, off + 1),
+                // Otherwise continue after the last item we delivered whole.
+                None => match last_complete {
+                    Some((obj, ty, off)) => (obj, ty, off + 1),
+                    None => return Ok(n_seen),
+                },
             };
             min_objectid = resume.0;
             // advancing the type too is what lets a whole-tree walk move past the
@@ -409,7 +415,7 @@ pub fn list_subvolumes(fd: i32) -> io::Result<Vec<RootItem>> {
         max_objectid: u64::MAX,
     };
     let mut out = Vec::new();
-    searcher.for_each_item(fd, &spec, &mut |obj, _off, payload| {
+    searcher.for_each_item(fd, &spec, &mut |obj, _ty, _off, payload| {
         if let Some(r) = parse_root_item(payload, obj) {
             out.push(r);
         }
@@ -562,4 +568,118 @@ pub fn fmt_fsid(id: &([u8; 16], [u8; 16])) -> String {
     } else {
         fmt_uuid(&id.0)
     }
+}
+
+// ---------------------------------------------------------------------------
+// fs-tree items: what a metadata scan reads instead of statx + per-inode ioctl
+// ---------------------------------------------------------------------------
+
+pub const BTRFS_INODE_ITEM_KEY: u32 = 1;
+pub const BTRFS_INODE_REF_KEY: u32 = 12;
+pub const BTRFS_INODE_EXTREF_KEY: u32 = 13;
+pub const BTRFS_ROOT_BACKREF_KEY: u32 = 144;
+pub const BTRFS_FIRST_FREE_OBJECTID: u64 = 256;
+
+pub const S_IFDIR: u16 = 0o040000;
+pub const S_IFLNK: u16 = 0o120000;
+
+/// Everything the scan needs about one inode, read from its INODE_ITEM.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InodeItem {
+    pub size: u64,
+    pub nlink: u32,
+    pub mode: u16,
+    pub mtime_sec: u64,
+    /// inode creation time - the ownership rule's primary key
+    pub otime_sec: u64,
+    pub otime_nsec: u32,
+}
+
+/// `struct btrfs_inode_item` is packed: size@16, nlink@40, mode@52, mtime@136,
+/// otime@148 (each timespec is 8 bytes of seconds + 4 of nanoseconds).
+pub fn parse_inode_item(p: &[u8]) -> Option<InodeItem> {
+    if p.len() < 160 {
+        return None;
+    }
+    let u64_at = |o: usize| u64::from_le_bytes(p[o..o + 8].try_into().unwrap());
+    let u32_at = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+    let u16_at = |o: usize| u16::from_le_bytes(p[o..o + 2].try_into().unwrap());
+    Some(InodeItem {
+        size: u64_at(16),
+        nlink: u32_at(40),
+        mode: u16_at(52),
+        mtime_sec: u64_at(136),
+        otime_sec: u64_at(148),
+        otime_nsec: u32_at(156),
+    })
+}
+
+/// Parent inode and name of this inode, from an INODE_REF (`index@0`,
+/// `name_len@8`) or an INODE_EXTREF (`parent@0`, `index@8`, `name_len@16`).
+pub fn parse_inode_ref(p: &[u8], extref: bool) -> Option<(u64, &[u8])> {
+    let (parent, name_off, name_len) = if extref {
+        if p.len() < 18 {
+            return None;
+        }
+        (
+            u64::from_le_bytes(p[0..8].try_into().unwrap()),
+            18usize,
+            u16::from_le_bytes(p[16..18].try_into().unwrap()) as usize,
+        )
+    } else {
+        if p.len() < 10 {
+            return None;
+        }
+        (
+            0,
+            10usize,
+            u16::from_le_bytes(p[8..10].try_into().unwrap()) as usize,
+        )
+    };
+    if p.len() < name_off + name_len {
+        return None;
+    }
+    Some((parent, &p[name_off..name_off + name_len]))
+}
+
+/// Enumerate every item of one subvolume's fs tree, in key order.
+pub fn for_each_fs_item<F>(fd: i32, subvol_root_id: u64, f: &mut F) -> io::Result<u64>
+where
+    F: FnMut(u64, u32, u64, &[u8]),
+{
+    let mut searcher = Searcher::new(4 << 20);
+    let spec = SearchSpec {
+        tree_id: subvol_root_id,
+        min_type: 0,
+        max_type: u32::MAX,
+        min_objectid: BTRFS_FIRST_FREE_OBJECTID,
+        max_objectid: u64::MAX,
+    };
+    searcher.for_each_item(fd, &spec, f)
+}
+
+/// `(child_root, dirid, name)` for every subvolume that lives inside
+/// `parent_root` - found in the root tree, so no directory walk is needed to
+/// know where subvolumes are nested.
+pub fn subvolumes_inside(fd: i32, parent_root: u64) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
+    let mut searcher = Searcher::new(1 << 20);
+    let spec = SearchSpec {
+        tree_id: BTRFS_ROOT_TREE_OBJECTID,
+        min_type: BTRFS_ROOT_BACKREF_KEY,
+        max_type: BTRFS_ROOT_BACKREF_KEY,
+        min_objectid: parent_root,
+        max_objectid: parent_root,
+    };
+    let mut out = Vec::new();
+    searcher.for_each_item(fd, &spec, &mut |obj, _ty, child, payload| {
+        if obj != parent_root || payload.len() < 18 {
+            return;
+        }
+        let dirid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let name_len = u16::from_le_bytes(payload[16..18].try_into().unwrap()) as usize;
+        if payload.len() >= 18 + name_len {
+            out.push((child, dirid, payload[18..18 + name_len].to_vec()));
+        }
+    })?;
+    Ok(out)
 }
