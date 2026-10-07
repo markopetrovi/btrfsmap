@@ -597,6 +597,20 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
             });
             let name_off = result.names.len() as u32;
             result.names.extend_from_slice(name);
+            // birth time, which only statx reports; a directory's is not used by
+            // the ownership rule, but leaving it zero would make two otherwise
+            // identical scans differ
+            let (btime, btime_ns) = {
+                let mut z = path.clone();
+                z.push(0);
+                match btrfs::stat_path(&z, !opts.follow_symlinks) {
+                    Ok(st) => (
+                        st.btime.min(u32::MAX as u64) as u32,
+                        (st.btime_ns >> 14) as u16,
+                    ),
+                    Err(_) => (0, 0),
+                }
+            };
             result.entries.push(Node {
                 parent: NO_NODE,
                 name_off,
@@ -605,6 +619,8 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
                 flags,
                 extra: dir_id,
                 mtime,
+                btime,
+                btime_ns,
                 ..Default::default()
             });
         } else if is_file {
@@ -642,6 +658,16 @@ fn sort_entries(result: &mut DirResult) {
         let bn = &names[b.name_off as usize..b.name_off as usize + b.name_len as usize];
         an.cmp(bn)
     });
+    // Rebuild the blob so the names follow the sorted entries: a metadata scan
+    // has no readdir order to reproduce, so node order is the convention both
+    // have to agree on.
+    let old = std::mem::take(names);
+    for e in entries.iter_mut() {
+        let a = e.name_off as usize;
+        let b = a + e.name_len as usize;
+        e.name_off = names.len() as u32;
+        names.extend_from_slice(&old[a..b]);
+    }
 }
 
 fn store_slot(shared: &Shared, dir_id: u32, mut result: DirResult) {
@@ -822,6 +848,17 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
             });
             let name_off = root_result.names.len() as u32;
             root_result.names.extend_from_slice(name);
+            // the root's own birth time, which statx is the only way to get
+            let mut btime = 0u32;
+            let mut btime_ns = 0u16;
+            {
+                let mut z = root.clone();
+                z.push(0);
+                if let Ok(st) = btrfs::stat_path(&z, true) {
+                    btime = st.btime.min(u32::MAX as u64) as u32;
+                    btime_ns = (st.btime_ns >> 14) as u16;
+                }
+            }
             root_result.entries.push(Node {
                 parent: NO_NODE,
                 name_off,
@@ -830,6 +867,8 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
                 flags,
                 extra: dir_id,
                 mtime: md.mtime().clamp(0, u32::MAX as i64) as u32,
+                btime,
+                btime_ns,
                 ..Default::default()
             });
         } else if md.is_file() {
@@ -850,6 +889,7 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
             ));
         }
     }
+    sort_entries(&mut root_result);
     shared.slots.lock().unwrap()[0] = Some(root_result);
 
     let show_progress = opts.progress;

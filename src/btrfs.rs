@@ -310,7 +310,7 @@ impl Searcher {
 
 /// Parse a `struct btrfs_file_extent_item`. Returns None for items that carry
 /// no data accounting (holes are reported so the caller can skip them).
-fn parse_extent_item(p: &[u8], key_offset: u64) -> Option<ExtentItem> {
+pub fn parse_extent_item(p: &[u8], key_offset: u64) -> Option<ExtentItem> {
     if p.len() < INLINE_HEADER_SIZE {
         return None;
     }
@@ -578,6 +578,40 @@ pub const BTRFS_INODE_ITEM_KEY: u32 = 1;
 pub const BTRFS_INODE_REF_KEY: u32 = 12;
 pub const BTRFS_INODE_EXTREF_KEY: u32 = 13;
 pub const BTRFS_ROOT_BACKREF_KEY: u32 = 144;
+pub const BTRFS_DIR_INDEX_KEY: u32 = 96;
+pub const BTRFS_DIR_ITEM_KEY: u32 = 84;
+
+/// A directory entry: `btrfs_dir_item` is packed, location@0 (a disk key:
+/// objectid@0, type@8, offset@9), name_len@27, file type@29, name@30.
+#[derive(Debug, Clone, Copy)]
+pub struct DirEntry<'a> {
+    pub child: u64,
+    /// key type of the location: BTRFS_ROOT_ITEM_KEY means the child is a
+    /// subvolume root rather than a file inside this tree
+    pub location_type: u8,
+    /// DT_* style file type of the entry
+    pub file_type: u8,
+    pub name: &'a [u8],
+}
+
+pub fn parse_dir_item(p: &[u8]) -> Option<DirEntry<'_>> {
+    if p.len() < 30 {
+        return None;
+    }
+    let child = u64::from_le_bytes(p[0..8].try_into().unwrap());
+    let location_type = p[8];
+    let name_len = u16::from_le_bytes(p[27..29].try_into().unwrap()) as usize;
+    let file_type = p[29];
+    if p.len() < 30 + name_len {
+        return None;
+    }
+    Some(DirEntry {
+        child,
+        location_type,
+        file_type,
+        name: &p[30..30 + name_len],
+    })
+}
 pub const BTRFS_FIRST_FREE_OBJECTID: u64 = 256;
 
 pub const S_IFDIR: u16 = 0o040000;
@@ -661,18 +695,21 @@ where
 /// `(child_root, dirid, name)` for every subvolume that lives inside
 /// `parent_root` - found in the root tree, so no directory walk is needed to
 /// know where subvolumes are nested.
+///
+/// A backref is keyed `(child_root, ROOT_BACKREF, parent_root)`: the objectid is
+/// the subvolume, the offset is the subvolume it was snapshotted from.
 pub fn subvolumes_inside(fd: i32, parent_root: u64) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
     let mut searcher = Searcher::new(1 << 20);
     let spec = SearchSpec {
         tree_id: BTRFS_ROOT_TREE_OBJECTID,
         min_type: BTRFS_ROOT_BACKREF_KEY,
         max_type: BTRFS_ROOT_BACKREF_KEY,
-        min_objectid: parent_root,
-        max_objectid: parent_root,
+        min_objectid: 1,
+        max_objectid: u64::MAX,
     };
     let mut out = Vec::new();
-    searcher.for_each_item(fd, &spec, &mut |obj, _ty, child, payload| {
-        if obj != parent_root || payload.len() < 18 {
+    searcher.for_each_item(fd, &spec, &mut |child, _ty, parent, payload| {
+        if parent != parent_root || payload.len() < 18 {
             return;
         }
         let dirid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
@@ -680,6 +717,7 @@ pub fn subvolumes_inside(fd: i32, parent_root: u64) -> io::Result<Vec<(u64, u64,
         if payload.len() >= 18 + name_len {
             out.push((child, dirid, payload[18..18 + name_len].to_vec()));
         }
+        let _ = &out;
     })?;
     Ok(out)
 }
