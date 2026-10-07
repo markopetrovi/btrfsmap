@@ -20,7 +20,7 @@ use crate::btrfs::{
 };
 use crate::model::*;
 use crate::walk::{ScanOptions, ScanStats};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::ffi::OsStrExt;
 use std::io;
 
@@ -53,6 +53,35 @@ struct Entry {
     ft: u8,
     /// the location's key type: BTRFS_ROOT_ITEM_KEY means a subvolume entry
     loc_type: u8,
+}
+
+/// Which inodes are inside a directory of `root_id`, found by walking
+/// DIR_INDEX entries only - far cheaper than a second full pass, and it is what
+/// lets a scan rooted inside a subvolume ignore the rest of it.
+fn scope_of(fd: i32, root_id: u64, root_inode: u64) -> io::Result<HashSet<u64>> {
+    let mut entries: Vec<(u64, u64)> = Vec::new(); // (parent dir, child)
+    btrfs::for_each_fs_item(fd, root_id, &mut |obj, ty, _off, payload| {
+        if ty != BTRFS_DIR_INDEX_KEY {
+            return;
+        }
+        if let Some(e) = btrfs::parse_dir_item(payload) {
+            entries.push((obj, e.child));
+        }
+    })?;
+    entries.sort_unstable();
+    let mut inside: HashSet<u64> = HashSet::new();
+    inside.insert(root_inode);
+    let mut frontier = vec![root_inode];
+    while let Some(dir) = frontier.pop() {
+        let lo = entries.partition_point(|e| e.0 < dir);
+        let hi = entries.partition_point(|e| e.0 <= dir);
+        for (_, child) in &entries[lo..hi] {
+            if inside.insert(*child) {
+                frontier.push(*child);
+            }
+        }
+    }
+    Ok(inside)
 }
 
 /// One subvolume's collected tree.
@@ -119,7 +148,9 @@ fn collect_subvolume(
     root_id: u64,
     subvol: u16,
     subvol_otime: u64,
+    scope: Option<&HashSet<u64>>,
 ) -> io::Result<Collected> {
+    let in_scope = |inode: u64| scope.map(|s| s.contains(&inode)).unwrap_or(true);
     let mut col = Collected {
         subvol,
         recs: Vec::new(),
@@ -146,6 +177,9 @@ fn collect_subvolume(
         let same = cur.as_ref().map(|r| r.inode == obj).unwrap_or(false);
         if !same && ty == BTRFS_INODE_ITEM_KEY {
             flush(&mut cur, &mut col, c);
+        }
+        if !in_scope(obj) {
+            return;
         }
         match ty {
             BTRFS_INODE_ITEM_KEY => {
@@ -543,7 +577,15 @@ fn collect_all(
         }
         done.push(root_id);
         let otime = c.subvols[subvol as usize].otime;
-        let col = collect_subvolume(c, fd, root_id, subvol, otime)?;
+        // Scanning a whole subvolume (its root inode) is the common case and
+        // needs no filtering; only a scan started deeper has to work out which
+        // inodes are inside the requested directory.
+        let scope = if path == start.path && start.inode != btrfs::BTRFS_FIRST_FREE_OBJECTID {
+            Some(scope_of(fd, root_id, start.inode)?)
+        } else {
+            None
+        };
+        let col = collect_subvolume(c, fd, root_id, subvol, otime, scope.as_ref())?;
         for (child_root, _dirid, name) in &col.nested {
             // the nested subvolume is reachable as a directory of this one, so
             // its identity is one open() away - no need to decode root items
