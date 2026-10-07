@@ -64,6 +64,13 @@ fn main() -> ExitCode {
         }
         Some("scan") => cmd_scan(&args[1..]),
         Some("report") => cmd_report(&args[1..]),
+        Some("extent-probe") => match args.get(1) {
+            Some(p) => cmd_extent_probe(&PathBuf::from(p)),
+            None => {
+                eprintln!("extent-probe needs a path inside the filesystem");
+                ExitCode::from(2)
+            }
+        },
         Some("check") => match args.get(1) {
             Some(f) => cmd_check(&PathBuf::from(f)),
             None => {
@@ -88,6 +95,39 @@ fn main() -> ExitCode {
 
 pub fn is_root() -> bool {
     unsafe { geteuid() == 0 }
+}
+
+fn cmd_extent_probe(path: &PathBuf) -> ExitCode {
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{}: {e}", path.display());
+            return ExitCode::from(1);
+        }
+    };
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
+    let started = Instant::now();
+    match metadata::probe_extent_tree(fd) {
+        Ok((extents, bytes, refs, shared, metadata, roots)) => {
+            println!("extent tree: {extents} data extents, {bytes} bytes, {refs} references, {shared} shared-refs, {metadata} metadata extents");
+            println!("  {} subvolumes reference data; biggest:", roots.len());
+            for (root, n) in roots.iter().take(6) {
+                println!("    root {root}: {n} refs");
+            }
+            println!("  read in {:.1}s", started.elapsed().as_secs_f64());
+            if let Ok((n, refs, secs)) = metadata::probe_logical_ino(fd, 20000) {
+                println!(
+                    "  logical-ino on {n} extents: {refs} refs in {secs:.2}s ({:.1} us/extent)",
+                    secs * 1e6 / n.max(1) as f64
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("extent tree read failed: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn cmd_check(path: &PathBuf) -> ExitCode {

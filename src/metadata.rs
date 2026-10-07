@@ -215,7 +215,7 @@ fn collect_subvolume(
             }
             BTRFS_EXTENT_DATA_KEY => {
                 let Some(rec) = cur.as_mut() else { return };
-                let Some(item) = btrfs::parse_extent_item(payload, key_off) else {
+                let Some(item) = btrfs::parse_file_extent(payload, key_off) else {
                     return;
                 };
                 if item.kind == BTRFS_FILE_EXTENT_INLINE {
@@ -729,3 +729,95 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
 }
 
 
+
+/// Time the kernel's reference lookup on a sample of extents.
+pub fn probe_logical_ino(fd: i32, sample: usize) -> io::Result<(usize, usize, f64)> {
+    let mut extents: Vec<u64> = Vec::new();
+    btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, _len, payload| {
+        if extents.len() >= sample {
+            return;
+        }
+        if ty == btrfs::BTRFS_EXTENT_ITEM_KEY {
+            if let Some(h) = btrfs::parse_extent_item_hdr(payload) {
+                if !h.is_metadata {
+                    extents.push(bytenr);
+                }
+            }
+        }
+    })?;
+    let mut buf = Vec::new();
+    let started = std::time::Instant::now();
+    let mut refs = 0usize;
+    let mut failed = 0usize;
+    for e in &extents {
+        match btrfs::logical_ino(fd, *e, &mut buf) {
+            Ok(r) => refs += r.len(),
+            Err(_) => failed += 1,
+        }
+    }
+    Ok((extents.len(), refs + failed * 0, started.elapsed().as_secs_f64()))
+}
+
+/// Development aid: what one pass over the filesystem's extent tree sees.
+pub fn probe_extent_tree(fd: i32) -> io::Result<(u64, u64, u64, u64, u64, Vec<(u64, u64)>)> {
+    use std::collections::HashMap;
+    let mut extents = 0u64;
+    let mut bytes = 0u64;
+    let mut refs = 0u64;
+    let mut shared = 0u64;
+    let mut metadata_extents = 0u64;
+    let mut per_root: HashMap<u64, u64> = HashMap::new();
+    let mut cur_data = false;
+    btrfs::for_each_extent_tree_item(fd, &mut |_bytenr, ty, len, payload| match ty {
+        btrfs::BTRFS_EXTENT_ITEM_KEY => match btrfs::parse_extent_item_hdr(payload) {
+            Some(h) if !h.is_metadata => {
+                cur_data = true;
+                extents += 1;
+                bytes += len;
+                if extents < 201 && std::env::var_os("CST_DUMP_EXT").is_some() {
+                    println!("{} {} {} {}", _bytenr, len, payload.len(),
+                        payload.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                }
+                // the single-reference case is stored inline in this very item
+                btrfs::for_each_inline_ref(payload, &mut |_ty, body| {
+                    if let Some(r) = btrfs::parse_data_ref(body) {
+                        if r.root > 100_000 && std::env::var_os("CST_DEBUG_EXT").is_some() {
+                            eprintln!(
+                                "  [bad] bytenr {_bytenr} len {len} item_len {} root {} ino {} count {} hex {}",
+                                payload.len(), r.root, r.inode, r.count,
+                                payload.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                            );
+                        }
+                        refs += r.count as u64;
+                        *per_root.entry(r.root).or_insert(0) += r.count as u64;
+                    }
+                });
+            }
+            _ => {
+                cur_data = false;
+                metadata_extents += 1;
+            }
+        },
+        btrfs::BTRFS_METADATA_ITEM_KEY => {
+            cur_data = false;
+            metadata_extents += 1;
+        }
+        btrfs::BTRFS_EXTENT_DATA_REF_KEY => {
+            if cur_data {
+                if let Some(r) = btrfs::parse_data_ref(payload) {
+                    refs += r.count as u64;
+                    *per_root.entry(r.root).or_insert(0) += r.count as u64;
+                }
+            }
+        }
+        btrfs::BTRFS_SHARED_DATA_REF_KEY => {
+            if cur_data {
+                shared += 1;
+            }
+        }
+        _ => {}
+    })?;
+    let mut roots: Vec<(u64, u64)> = per_root.into_iter().collect();
+    roots.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    Ok((extents, bytes, refs, shared, metadata_extents, roots))
+}

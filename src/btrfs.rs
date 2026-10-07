@@ -218,7 +218,7 @@ impl Searcher {
             max_objectid: ino,
         };
         self.for_each_item(fd, &spec, &mut |_obj, _ty, key_offset, payload| {
-            if let Some(item) = parse_extent_item(payload, key_offset) {
+            if let Some(item) = parse_file_extent(payload, key_offset) {
                 f(&item);
             }
         })
@@ -310,7 +310,7 @@ impl Searcher {
 
 /// Parse a `struct btrfs_file_extent_item`. Returns None for items that carry
 /// no data accounting (holes are reported so the caller can skip them).
-pub fn parse_extent_item(p: &[u8], key_offset: u64) -> Option<ExtentItem> {
+pub fn parse_file_extent(p: &[u8], key_offset: u64) -> Option<ExtentItem> {
     if p.len() < INLINE_HEADER_SIZE {
         return None;
     }
@@ -719,5 +719,180 @@ pub fn subvolumes_inside(fd: i32, parent_root: u64) -> io::Result<Vec<(u64, u64,
         }
         let _ = &out;
     })?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// extent tree: who references each physical extent
+// ---------------------------------------------------------------------------
+
+pub const BTRFS_EXTENT_TREE_OBJECTID: u64 = 2;
+pub const BTRFS_EXTENT_ITEM_KEY: u32 = 168;
+pub const BTRFS_METADATA_ITEM_KEY: u32 = 169;
+pub const BTRFS_EXTENT_DATA_REF_KEY: u32 = 178;
+pub const BTRFS_SHARED_DATA_REF_KEY: u32 = 184;
+pub const BTRFS_BLOCK_GROUP_DATA: u64 = 1 << 0;
+pub const BTRFS_BLOCK_GROUP_METADATA: u64 = 1 << 2;
+
+/// A data extent's header: `btrfs_extent_item` is 24 bytes packed, with the
+/// reference count first and the block-group flags last.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtentItemHdr {
+    pub refs: u64,
+    pub is_metadata: bool,
+}
+
+pub fn parse_extent_item_hdr(p: &[u8]) -> Option<ExtentItemHdr> {
+    if p.len() < 24 {
+        return None;
+    }
+    let refs = u64::from_le_bytes(p[0..8].try_into().unwrap());
+    let flags = u64::from_le_bytes(p[16..24].try_into().unwrap());
+    Some(ExtentItemHdr {
+        refs,
+        is_metadata: flags & BTRFS_BLOCK_GROUP_METADATA != 0,
+    })
+}
+
+/// Inline references live inside the EXTENT_ITEM itself, after its 24-byte
+/// header: a 9-byte `btrfs_extent_inline_ref` (type + offset) and, for a data
+/// reference, a 28-byte `btrfs_extent_data_ref` body. An extent with a single
+/// reference - the common case - stores it only here, so a reader that looks
+/// for EXTENT_DATA_REF items alone sees almost nothing.
+pub const BTRFS_TREE_BLOCK_REF_KEY: u32 = 176;
+/// simple-quota's "which subvolume wrote this extent" ref; in the tree it is
+/// carried in the header's offset field, so it is 9 bytes with no body
+pub const BTRFS_EXTENT_OWNER_REF_KEY: u32 = 172;
+pub const BTRFS_SHARED_BLOCK_REF_KEY: u32 = 182;
+
+/// Call `f` for each inline reference of an extent item payload.
+pub fn for_each_inline_ref<F: FnMut(u32, &[u8])>(p: &[u8], f: &mut F) {
+    let mut off = 24usize; // sizeof(btrfs_extent_item)
+    while off + 9 <= p.len() {
+        let ty = p[off] as u32;
+        let body = match ty {
+            BTRFS_EXTENT_DATA_REF_KEY => {
+                if off + 9 + 28 > p.len() {
+                    return;
+                }
+                Some(&p[off + 9..off + 9 + 28])
+            }
+            // a shared data ref has a 4-byte count body; the others carry
+            // everything in the 9-byte header
+            BTRFS_EXTENT_OWNER_REF_KEY
+            | BTRFS_TREE_BLOCK_REF_KEY
+            | BTRFS_SHARED_BLOCK_REF_KEY
+            | BTRFS_SHARED_DATA_REF_KEY => {
+                if off + 9 + body_len(ty) > p.len() {
+                    return;
+                }
+                None
+            }
+            _ => return, // unknown layout: stop rather than guess
+        };
+        if let Some(b) = body {
+            f(ty, b);
+        }
+        off += 9 + body_len(ty);
+    }
+}
+
+fn body_len(ty: u32) -> usize {
+    match ty {
+        BTRFS_EXTENT_DATA_REF_KEY => 28,
+        BTRFS_SHARED_DATA_REF_KEY => 4,
+        _ => 0,
+    }
+}
+
+/// One reference to a data extent: which subvolume, which inode, at which file
+/// offset, and how many times over (`btrfs_extent_data_ref`, 28 bytes packed).
+#[derive(Debug, Clone, Copy)]
+pub struct DataRef {
+    pub root: u64,
+    pub inode: u64,
+    pub file_offset: u64,
+    pub count: u32,
+}
+
+pub fn parse_data_ref(p: &[u8]) -> Option<DataRef> {
+    if p.len() < 28 {
+        return None;
+    }
+    Some(DataRef {
+        root: u64::from_le_bytes(p[0..8].try_into().unwrap()),
+        inode: u64::from_le_bytes(p[8..16].try_into().unwrap()),
+        file_offset: u64::from_le_bytes(p[16..24].try_into().unwrap()),
+        count: u32::from_le_bytes(p[24..28].try_into().unwrap()),
+    })
+}
+
+/// Enumerate the whole extent tree in key order: each data extent's header is
+/// followed by its references, which is what makes a streaming pass possible.
+pub fn for_each_extent_tree_item<F>(fd: i32, f: &mut F) -> io::Result<u64>
+where
+    F: FnMut(u64, u32, u64, &[u8]),
+{
+    let mut searcher = Searcher::new(4 << 20);
+    let spec = SearchSpec {
+        tree_id: BTRFS_EXTENT_TREE_OBJECTID,
+        min_type: 0,
+        max_type: u32::MAX,
+        min_objectid: 0,
+        max_objectid: u64::MAX,
+    };
+    searcher.for_each_item(fd, &spec, f)
+}
+
+// ---------------------------------------------------------------------------
+// LOGICAL_INO_V2: the kernel resolves an extent's references for us
+// ---------------------------------------------------------------------------
+
+/// struct btrfs_ioctl_logical_ino_args is 56 bytes (checked against C)
+const BTRFS_IOC_LOGICAL_INO_V2: u64 = ioc(IOC_WRITE | IOC_READ, BTRFS_IOCTL_MAGIC, 59, 56);
+/// "return every ref to the extent, not just those containing logical block"
+pub const BTRFS_LOGICAL_INO_ARGS_IGNORE_OFFSET: u64 = 1;
+
+#[repr(C)]
+#[derive(Default)]
+struct LogicalInoArgs {
+    logical: u64,
+    size: u64,
+    reserved: [u64; 3],
+    flags: u64,
+    inodes: u64,
+}
+
+/// Every reference to the extent starting at `bytenr`: (root, inode, offset).
+///
+/// One ioctl per extent, but the kernel does the reference-tree walk and the
+/// item parsing, which is both exact and far less code than reading the extent
+/// tree's inline reference encoding by hand.
+pub fn logical_ino(fd: i32, bytenr: u64, buf: &mut Vec<u8>) -> io::Result<Vec<(u64, u64, u64)>> {
+    if buf.len() < 4096 {
+        buf.resize(64 * 1024, 0);
+    }
+    let mut args = LogicalInoArgs {
+        logical: bytenr,
+        size: buf.len() as u64,
+        flags: BTRFS_LOGICAL_INO_ARGS_IGNORE_OFFSET,
+        inodes: buf.as_mut_ptr() as u64,
+        ..Default::default()
+    };
+    let rc = unsafe { ioctl(fd, BTRFS_IOC_LOGICAL_INO_V2, &mut args as *mut LogicalInoArgs) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // btrfs_data_container: bytes_left, bytes_missing, elem_cnt, elem_missed, then u64 values
+    let elem_cnt = u32::from_ne_bytes(buf[8..12].try_into().unwrap()) as usize;
+    let mut out = Vec::with_capacity(elem_cnt / 3);
+    let mut i = 16;
+    while i + 24 <= 16 + elem_cnt * 8 && i + 24 <= buf.len() {
+        let inum = u64::from_ne_bytes(buf[i..i + 8].try_into().unwrap());
+        let offset = u64::from_ne_bytes(buf[i + 8..i + 16].try_into().unwrap());
+        let root = u64::from_ne_bytes(buf[i + 16..i + 24].try_into().unwrap());
+        out.push((root, inum, offset));
+        i += 24;
+    }
     Ok(out)
 }
