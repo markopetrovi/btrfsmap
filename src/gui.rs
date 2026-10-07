@@ -804,6 +804,14 @@ impl Ui {
                 String::new()
             }
         };
+        let extra = if stats.skipped_otherfs > 0 || stats.skipped_nonbtrfs > 0 {
+            format!(
+                " · {} non-btrfs and {} other btrfs filesystems skipped",
+                stats.skipped_nonbtrfs, stats.skipped_otherfs
+            )
+        } else {
+            String::new()
+        };
         let src = match &path {
             Some(p) => format!("opened {}", p.display()),
             None => format!(
@@ -816,13 +824,14 @@ impl Ui {
             ),
         };
         self.status(&format!(
-            "{src} · {} files · {} extents · {} references · {} dirs · {:.0}s{}",
+            "{src} · {} files · {} extents · {} references · {} dirs · {:.0}s{}{}",
             thousands(stats.files),
             thousands(stats.extents),
             thousands(stats.refs),
             thousands(stats.dirs),
             stats.elapsed.as_secs_f64(),
-            snap_note
+            snap_note,
+            extra
         ));
         self.navigate(root);
     }

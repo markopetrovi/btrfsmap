@@ -496,10 +496,10 @@ pub fn render_tree_report(tree: &Tree, stats: &ScanStats, opt: &TreeReportOption
         stats.files, stats.dirs, stats.extents, stats.refs, stats.subvolumes,
         stats.elapsed.as_secs_f64()
     ));
-    if stats.skipped_nonbtrfs > 0 || stats.unreadable > 0 {
+    if stats.skipped_nonbtrfs > 0 || stats.unreadable > 0 || stats.skipped_otherfs > 0 {
         out.push_str(&format!(
-            "  ({} non-btrfs mounts skipped, {} unreadable)\n",
-            stats.skipped_nonbtrfs, stats.unreadable
+            "  ({} non-btrfs mounts skipped, {} other btrfs filesystems skipped, {} unreadable)\n",
+            stats.skipped_nonbtrfs, stats.skipped_otherfs, stats.unreadable
         ));
     }
     if stats.fd_fallback > 0 {

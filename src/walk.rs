@@ -110,6 +110,8 @@ pub struct ScanStats {
     pub refs: u64,
     pub subvolumes: u64,
     pub skipped_nonbtrfs: u64,
+    /// subvolumes skipped because they belong to a different btrfs filesystem
+    pub skipped_otherfs: u64,
     pub unreadable: u64,
     /// files whose extent ioctl could not reuse the directory descriptor
     pub fd_fallback: u64,
@@ -126,9 +128,17 @@ struct Shared {
     /// every subvolume on the filesystem (uuid, parent_uuid, treeid)
     inventory: Vec<btrfs::RootItem>,
     visited_dirs: Mutex<HashSet<(u64, u64)>>,
+    /// subvolume UUIDs already walked, so the same subvolume mounted at several
+    /// paths is not scanned (and its references not multiplied) once per mount
+    visited_subvols: Mutex<HashSet<[u8; 16]>>,
+    /// identity of the filesystem the scan started on; other btrfs filesystems
+    /// found under the scanned paths are skipped, since extent addresses are
+    /// only unique within one filesystem
+    fs_id: ([u8; 16], [u8; 16]),
     warnings: Mutex<Vec<String>>,
     unreadable: AtomicU64,
     nonbtrfs: AtomicU64,
+    otherfs: AtomicU64,
     no_btime: AtomicBool,
     /// how often the directory descriptor could not be used (device mismatch)
     fd_fallback: AtomicU64,
@@ -492,8 +502,39 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
             let Some(md) = md else { continue };
             let mtime = md.mtime().clamp(0, u32::MAX as i64) as u32;
             if md.dev() != item.dev {
-                match open_dir(&path).and_then(|f| btrfs::get_subvol_info(f.as_raw_fd())) {
-                    Ok(info) => {
+                let probe = open_dir(&path).and_then(|f| {
+                    let fd = f.as_raw_fd();
+                    let info = btrfs::get_subvol_info(fd)?;
+                    Ok((info, btrfs::fs_identity(fd).ok()))
+                });
+                match probe {
+                    Ok((info, ident)) => {
+                        // Another btrfs filesystem? Extent addresses are only
+                        // unique within one filesystem, so mixing them would
+                        // corrupt the dedup. Skip it; scanning it on its own
+                        // works, because then it is the reference filesystem.
+                        if let Some(id) = ident {
+                            if shared.fs_id != ([0u8; 16], [0u8; 16]) && id != shared.fs_id {
+                                shared.otherfs.fetch_add(1, Ordering::Relaxed);
+                                shared.warn(format!(
+                                    "{}: different btrfs filesystem ({}), subtree skipped",
+                                    String::from_utf8_lossy(&path),
+                                    btrfs::fmt_fsid(&id)
+                                ));
+                                continue;
+                            }
+                        }
+                        // The same subvolume reachable through another mount
+                        // would add a second reference to every file in it.
+                        if !shared.visited_subvols.lock().unwrap().insert(info.uuid) {
+                            shared.warn(format!(
+                                "{}: subvolume {} already walked through another mount, \
+                                 subtree skipped",
+                                String::from_utf8_lossy(&path),
+                                btrfs::fmt_uuid(&info.uuid)
+                            ));
+                            continue;
+                        }
                         subvol = shared.intern_subvol(&info, &path);
                         let table = shared.subvols.lock().unwrap();
                         let s = &table[subvol as usize];
@@ -617,10 +658,35 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
     };
     // Subvolume inventory first: it decides what counts as a snapshot.
     let mut inventory: Vec<btrfs::RootItem> = Vec::new();
+    let mut fs_id: ([u8; 16], [u8; 16]) = ([0u8; 16], [0u8; 16]);
     if let Some(first) = opts.roots.first() {
-        let file = open_dir(first).or_else(|_| open_file(first, true)).ok();
+        let file = match open_dir(first).or_else(|_| open_file(first, true)) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot open {}: {e}",
+                    String::from_utf8_lossy(first)
+                );
+                None
+            }
+        };
         if let Some(file) = file {
             let fd = file.as_raw_fd();
+            match btrfs::fs_identity(fd) {
+                Ok(id) => {
+                    fs_id = id;
+                    eprintln!(
+                        "filesystem: {} (from {})",
+                        btrfs::fmt_fsid(&fs_id),
+                        String::from_utf8_lossy(first)
+                    );
+                }
+                Err(e) => eprintln!(
+                    "warning: cannot read the filesystem identity of {}: {e} - other btrfs \
+                     filesystems will not be detected",
+                    String::from_utf8_lossy(first)
+                ),
+            }
             match btrfs::list_subvolumes(fd) {
                 Ok(list) => inventory = list,
                 Err(e) if e.raw_os_error() == Some(ENOTTY) => eprintln!(
@@ -641,9 +707,12 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
         slots: Mutex::new(vec![None]),
         subvols: Mutex::new(Vec::new()),
         visited_dirs: Mutex::new(HashSet::new()),
+        visited_subvols: Mutex::new(HashSet::new()),
+        fs_id,
         warnings: Mutex::new(Vec::new()),
         unreadable: AtomicU64::new(0),
         nonbtrfs: AtomicU64::new(0),
+        otherfs: AtomicU64::new(0),
         no_btime: AtomicBool::new(false),
         fd_fallback: AtomicU64::new(0),
         prog: opts
@@ -681,6 +750,24 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
             .next()
             .filter(|n| !n.is_empty())
             .unwrap_or(root);
+        // A root on a different btrfs filesystem cannot share the extent table
+        // with the first one: addresses are only unique within a filesystem.
+        if fs_id != ([0u8; 16], [0u8; 16]) {
+            if let Ok(f) = open_dir(root).or_else(|_| open_file(root, true)) {
+                match btrfs::fs_identity(f.as_raw_fd()) {
+                    Ok(id) if id != fs_id => {
+                        eprintln!(
+                            "{}: different btrfs filesystem ({}) than {}; scan it separately",
+                            String::from_utf8_lossy(root),
+                            btrfs::fmt_fsid(&id),
+                            String::from_utf8_lossy(&opts.roots[0])
+                        );
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+        }
         let mut flags = 0u8;
         if md.is_dir() {
             let mut subvol = 0u16;
@@ -705,6 +792,11 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
             }
             let dir_id = shared.next_dir_id.fetch_add(1, Ordering::Relaxed);
             shared.visited_dirs.lock().unwrap().insert((md.dev(), md.ino()));
+            if let Ok(f) = open_dir(root) {
+                if let Ok(info) = btrfs::get_subvol_info(f.as_raw_fd()) {
+                    shared.visited_subvols.lock().unwrap().insert(info.uuid);
+                }
+            }
             shared.push_work(WorkItem {
                 dir_id,
                 path: root.clone().into_boxed_slice(),
@@ -759,10 +851,11 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
                         break;
                     }
                     eprintln!(
-                        "  {:>7.0}s  {} files, {} dirs",
+                        "  {:>7.0}s  {} files, {} dirs  at {}",
                         t0.elapsed().as_secs_f64(),
                         shared.prog.files.load(Ordering::Relaxed),
                         shared.prog.dirs.load(Ordering::Relaxed),
+                        String::from_utf8_lossy(&shared.prog.current.lock().unwrap())
                     );
                 }
             }))
@@ -861,6 +954,7 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
         refs: refs.iter().map(|r| r.len() as u64).sum(),
         subvolumes: subvols.len() as u64,
         skipped_nonbtrfs: shared.nonbtrfs.load(Ordering::Relaxed),
+        skipped_otherfs: shared.otherfs.load(Ordering::Relaxed),
         unreadable: shared.unreadable.load(Ordering::Relaxed),
         fd_fallback: shared.fd_fallback.load(Ordering::Relaxed),
         elapsed: started.elapsed(),

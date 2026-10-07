@@ -330,8 +330,8 @@ fn cmd_scan(args: &[String]) -> ExitCode {
             println!(
                 "  id {:<6} uuid {} parent {} flags {:#x} otime {} {}",
                 r.treeid,
-                fmt_uuid(&r.uuid),
-                fmt_uuid(&r.parent_uuid),
+                btrfs::fmt_uuid(&r.uuid),
+                btrfs::fmt_uuid(&r.parent_uuid),
                 r.flags,
                 r.otime_sec,
                 if seen.contains(&r.treeid) { "seen" } else { "" }
@@ -368,16 +368,3 @@ fn cmd_scan(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-pub fn fmt_uuid(u: &[u8; 16]) -> String {
-    if *u == [0u8; 16] {
-        return "-".into();
-    }
-    let mut s = String::with_capacity(36);
-    for (i, b) in u.iter().enumerate() {
-        if matches!(i, 4 | 6 | 8 | 10) {
-            s.push('-');
-        }
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}

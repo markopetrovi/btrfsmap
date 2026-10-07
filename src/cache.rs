@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 8] = b"CSTREE\x01\n";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 pub struct Cache {
     pub nodes: Vec<Node>,
@@ -109,6 +109,7 @@ impl Cache {
             put_u64(&mut w, self.stats.refs)?;
             put_u64(&mut w, self.stats.subvolumes)?;
             put_u64(&mut w, self.stats.skipped_nonbtrfs)?;
+            put_u64(&mut w, self.stats.skipped_otherfs)?;
             put_u64(&mut w, self.stats.unreadable)?;
             put_u64(&mut w, self.stats.fd_fallback)?;
             put_u64(&mut w, self.stats.elapsed.as_millis() as u64)?;
@@ -199,6 +200,7 @@ impl Cache {
             refs: read_u64(&mut r)?,
             subvolumes: read_u64(&mut r)?,
             skipped_nonbtrfs: read_u64(&mut r)?,
+            skipped_otherfs: read_u64(&mut r)?,
             unreadable: read_u64(&mut r)?,
             fd_fallback: read_u64(&mut r)?,
             elapsed: std::time::Duration::from_millis(read_u64(&mut r)?),

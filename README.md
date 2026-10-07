@@ -126,7 +126,15 @@ buffer.
 * A scan is a snapshot in time; files changing during it are counted once, as
   seen.
 * Non-btrfs filesystems inside the tree (loop mounts, overlayfs, `/boot`) are
-  detected and skipped, and counted in the summary.
+  detected and skipped, and counted in the summary. So is a *different* btrfs
+  filesystem mounted inside the scanned tree: extent addresses are only unique
+  within one filesystem, so mixing two would corrupt the dedup. The check uses
+  the btrfs superblock UUID (`BTRFS_IOC_FS_INFO`), which is per filesystem and
+  stable - not `statfs`'s `f_fsid`, which varies per subvolume. Scanning such a
+  filesystem works by starting the scan there, and the summary says how many
+  were skipped.
+* A subvolume reachable through more than one mount point is walked once, so
+  its files do not gain a second reference.
 * Symlinks are skipped unless `--follow-symlinks`; hardlinked paths are counted
   per path, like compsize does.
 * `owned`/`referenced` for a *file* is its share; `compsize`/`freeable` are
