@@ -1,0 +1,19 @@
+[package]
+name = "compsize-tree"
+version = "0.1.0"
+edition = "2021"
+description = "One-pass, extent-accurate btrfs disk usage with a baobab-style GUI"
+license = "GPL-2.0-or-later"
+
+[[bin]]
+name = "compsize-tree"
+path = "src/main.rs"
+
+# No dependencies: raw ioctl(2) bindings, own JSON writer, own HTTP server.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

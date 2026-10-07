@@ -1,0 +1,721 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>compsize-tree</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-0: #f5f5f3;
+    --surface-1: #fcfcfb;
+    --surface-2: #ececea;
+    --border:    #d9d9d5;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #84837d;
+    --accent: #2a78d6;
+    --series-1:#2a78d6; --series-2:#eb6834; --series-3:#1baf7a; --series-4:#eda100;
+    --series-5:#e87ba4; --series-6:#008300; --series-7:#4a3aa7; --series-8:#e34948;
+    --other:   #b9b8b1;
+    --warn:    #a35a00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface-0: #121211;
+      --surface-1: #1a1a19;
+      --surface-2: #242423;
+      --border:    #35352f;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #8b8a80;
+      --accent: #3987e5;
+      --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70; --series-4:#c98500;
+      --series-5:#d55181; --series-6:#008300; --series-7:#9085e9; --series-8:#e66767;
+      --other:   #55554f;
+      --warn:    #e0a458;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-0: #121211; --surface-1: #1a1a19; --surface-2: #242423; --border: #35352f;
+    --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #8b8a80;
+    --accent: #3987e5;
+    --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70; --series-4:#c98500;
+    --series-5:#d55181; --series-6:#008300; --series-7:#9085e9; --series-8:#e66767;
+    --other: #55554f; --warn: #e0a458;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--surface-0); color: var(--text-primary);
+    font: 13px/1.45 "Adwaita Sans", Cantarell, system-ui, -apple-system, Segoe UI, sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  header { padding: 10px 14px 8px; border-bottom: 1px solid var(--border); background: var(--surface-1); }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .crumbs { font-size: 14px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .crumbs a { color: var(--text-secondary); text-decoration: none; cursor: pointer; }
+  .crumbs a:hover { color: var(--accent); }
+  .crumbs .sep { color: var(--text-muted); padding: 0 2px; }
+  select, button, input[type=search] {
+    background: var(--surface-2); color: var(--text-primary); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 8px; font: inherit;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .spacer { flex: 1 1 auto; }
+  .stats { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; }
+  .stat { min-width: 108px; }
+  .stat .k { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; }
+  .stat .v { font-size: 15px; font-variant-numeric: tabular-nums; }
+  .stat .v small { color: var(--text-secondary); font-size: 11px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: 999px;
+    background: var(--surface-2); border: 1px solid var(--border); font-size: 12px; color: var(--text-secondary);
+  }
+  .chip.bad { color: var(--warn); }
+  main { flex: 1 1 auto; display: flex; min-height: 0; }
+  #left, #right { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  #left { width: 46%; border-right: 1px solid var(--border); background: var(--surface-1); }
+  #right { flex: 1 1 auto; background: var(--surface-0); position: relative; }
+  .panelhead {
+    display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+    border-bottom: 1px solid var(--border); color: var(--text-muted); font-size: 11px;
+    text-transform: uppercase; letter-spacing: .04em;
+  }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  thead th {
+    position: sticky; top: 0; background: var(--surface-1); text-align: left; font-weight: 500;
+    color: var(--text-muted); font-size: 11px; padding: 6px 8px; border-bottom: 1px solid var(--border);
+    cursor: pointer; user-select: none; white-space: nowrap;
+  }
+  thead th.num, td.num { text-align: right; }
+  tbody td { padding: 3px 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent); white-space: nowrap; }
+  tbody tr:hover { background: var(--surface-2); }
+  tbody tr.sel { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+  .scroll { overflow: auto; flex: 1 1 auto; min-height: 0; }
+  #left .scroll { overflow-x: hidden; }
+  #bottom .scroll { overflow-x: auto; }
+  table { table-layout: fixed; }
+  td:first-child, th:first-child { width: auto; }
+  #bottomtable { table-layout: fixed; }
+  #bottomtable td { overflow: hidden; text-overflow: ellipsis; }
+  td.num, th.num { width: 84px; }
+  .name { overflow: hidden; text-overflow: ellipsis; max-width: 100%; display: inline-block; vertical-align: bottom; }
+  .bar { display: block; height: 3px; background: var(--accent); border-radius: 2px; margin-top: 2px; opacity: .55; }
+  .swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 6px; border: 1px solid color-mix(in srgb, var(--text-primary) 20%, transparent); vertical-align: baseline; }
+  .tag {
+    font-size: 10px; padding: 0 5px; border-radius: 4px; background: var(--surface-2);
+    border: 1px solid var(--border); color: var(--text-secondary); margin-left: 5px; vertical-align: 1px;
+  }
+  .tag.snap { color: var(--warn); }
+  .tag.shared { color: var(--accent); }
+  canvas { display: block; width: 100%; height: 100%; }
+  #tooltip {
+    position: absolute; pointer-events: none; background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; font-size: 12px;
+    box-shadow: 0 4px 14px rgba(0,0,0,.28); max-width: 340px; display: none; z-index: 5;
+  }
+  #tooltip .t { font-weight: 600; }
+  #tooltip .m { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  #bottom { border-top: 1px solid var(--border); max-height: 34%; display: flex; flex-direction: column; }
+  .muted { color: var(--text-muted); }
+  .err { color: var(--warn); padding: 10px; }
+  footer { display: flex; align-items: center; gap: 10px; padding: 4px 18px 4px 12px; border-top: 1px solid var(--border); background: var(--surface-1); color: var(--text-muted); font-size: 11px; }
+  footer button { padding: 1px 7px; font-size: 11px; flex: 0 0 auto; }
+  #cacheinfo { flex: 0 0 auto; white-space: nowrap; }
+  #cacheinfo b { color: var(--text-secondary); }
+  .legend { display: flex; flex-wrap: nowrap; gap: 10px; padding: 6px 10px; border-top: 1px solid var(--border); overflow-x: auto; overflow-y: hidden; min-height: 26px; }
+  .legend div { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-secondary); max-width: 260px; flex: 0 0 auto; }
+  .legend div span.n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <button id="up" title="Go up one level">↑</button>
+    <div class="crumbs" id="crumbs"></div>
+    <div class="spacer"></div>
+    <label class="muted" for="metric">size shown</label>
+    <select id="metric">
+      <option value="owned">owned (fair share, adds up)</option>
+      <option value="freeable">freeable if deleted</option>
+      <option value="compsize">compsize total</option>
+      <option value="referenced">referenced (du/baobab)</option>
+      <option value="uncompressed">uncompressed</option>
+    </select>
+    <button id="viewtoggle" title="Switch chart">▦ treemap</button>
+    <button id="themetoggle" title="Light / dark">◐</button>
+    <input type="search" id="search" placeholder="search names…" size="18">
+  </div>
+  <div class="stats" id="stats"></div>
+</header>
+<main>
+  <section id="left">
+    <div class="panelhead"><span id="listhead">contents</span><span class="spacer"></span><span id="listcount"></span></div>
+    <div class="scroll"><table id="list"><thead><tr>
+      <th data-sort="name">Name</th><th class="num" data-sort="metric">Size</th>
+      <th class="num" data-sort="share">%</th><th class="num" data-sort="files">Items</th>
+      <th class="num" data-sort="mtime">Modified</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+  <section id="right">
+    <canvas id="chart"></canvas>
+    <div class="legend" id="legend"></div>
+    <div id="tooltip"></div>
+  </section>
+</main>
+<section id="bottom">
+  <div class="panelhead"><span id="bottomhead">biggest files on this scan</span>
+    <span class="spacer"></span>
+    <button id="bottomsort" style="font-size:11px">show snapshots</button></div>
+  <div class="scroll"><table id="bottomtable"><thead><tr>
+    <th style="width:26%">Name</th><th class="num">Size</th><th class="num">Referenced</th><th>Path</th>
+  </tr></thead><tbody></tbody></table></div>
+</section>
+<footer id="footer">
+  <span id="footinfo"></span>
+  <span class="spacer"></span>
+  <span id="cacheinfo"></span>
+</footer>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+
+// ---- theme -----------------------------------------------------------------
+(function initTheme() {
+  const q = new URLSearchParams(location.search).get('theme');
+  let t = q || null;
+  try { t = t || localStorage.getItem('cst-theme'); } catch (e) {}
+  if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+})();
+
+// ---- palette ---------------------------------------------------------------
+function palette() {
+  const cs = getComputedStyle(document.documentElement);
+  return [1,2,3,4,5,6,7,8].map(i => cs.getPropertyValue(`--series-${i}`).trim());
+}
+let PAL = palette();
+let OTHER = getComputedStyle(document.documentElement).getPropertyValue('--other').trim();
+let SURFACE = getComputedStyle(document.documentElement).getPropertyValue('--surface-0').trim();
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  PAL = palette(); OTHER = getComputedStyle(document.documentElement).getPropertyValue('--other').trim();
+  SURFACE = getComputedStyle(document.documentElement).getPropertyValue('--surface-0').trim(); draw();
+});
+const MAXCOLOR = 8;
+
+// mix a hex colour toward the surface (for deeper rings: same hue, lighter/darker)
+function mix(hex, t) {
+  const m = (h) => [1,3,5].map(i => parseInt(h.substr(i,2),16));
+  const [r1,g1,b1] = m(hex), [r2,g2,b2] = m(SURFACE);
+  const c = (a,b) => Math.round(a + (b-a)*t);
+  return `rgb(${c(r1,r2)},${c(g1,g2)},${c(b1,b2)})`;
+}
+
+// ---- formatting ------------------------------------------------------------
+const UNITS = ['B','KiB','MiB','GiB','TiB','PiB'];
+function fmt(n) {
+  if (n === null || n === undefined) return '';
+  if (n < 1024) return n + ' B';
+  let v = n, u = 0;
+  while (v >= 1024 && u < UNITS.length-1) { v /= 1024; u++; }
+  return (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)) + ' ' + UNITS[u];
+}
+function pct(a, b) { return b > 0 ? (100*a/b) : 0; }
+function fmtPct(p) { return p >= 10 ? p.toFixed(1)+'%' : p >= 1 ? p.toFixed(2)+'%' : p.toFixed(3)+'%'; }
+function fmtDate(t) {
+  if (!t) return '';
+  const d = new Date(t*1000), now = Date.now()/1000;
+  const age = now - t;
+  if (age < 3600) return Math.max(1, Math.round(age/60)) + ' min ago';
+  if (age < 86400) return Math.round(age/3600) + ' h ago';
+  if (age < 86400*30) return Math.round(age/86400) + ' d ago';
+  return d.toISOString().slice(0,10);
+}
+
+// Colour follows the entity: one assignment per child list, reused everywhere
+// (chart wedges, legend, list swatches) so they can never disagree.
+let COLOR_OF = new Map();
+function assignColors() {
+  COLOR_OF = new Map();
+  let n = 0;
+  for (const c of state.children) {
+    if (metricOf(c) <= 0) continue;
+    COLOR_OF.set(c.id, n < MAXCOLOR ? PAL[n % MAXCOLOR] : OTHER);
+    n++;
+  }
+}
+function colorOf(id) { return COLOR_OF.get(id) || OTHER; }
+
+// ---- state -----------------------------------------------------------------
+const state = { id: null, node: null, metric: 'owned', view: 'ring', children: [], kids: new Map(),
+                sort: 'metric', dirFirst: true, summary: null, level2: new Map(), hover: null };
+
+async function api(path, params) {
+  const u = new URL(path, location.origin);
+  for (const k in (params||{})) u.searchParams.set(k, params[k]);
+  const r = await fetch(u);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+function metricOf(n) {
+  const m = n.metrics || {};
+  if (state.metric === 'compsize') return m.compsize;
+  if (state.metric === 'freeable')  return m.freeable;
+  if (state.metric === 'referenced') return m.referenced;
+  if (state.metric === 'uncompressed') return m.uncompressed;
+  return m.owned;
+}
+
+// ---- navigation ------------------------------------------------------------
+async function go(id) {
+  state.id = id;
+  const node = await api('/api/node', { id, metric: state.metric });
+  state.node = node;
+  renderHeader(node);
+  const kids = await api('/api/children', { id, metric: state.metric, limit: 20000 });
+  state.children = kids.items;
+  state.kids = new Map(kids.items.map(k => [k.id, k]));
+  renderList(node);
+  renderLegend();
+  // second ring: children of the largest children
+  assignColors();
+  state.level2 = new Map();
+  const top = state.children.slice(0, 12);
+  await Promise.all(top.map(async c => {
+    if (c.kind !== 'dir' || c.nchildren === 0) return;
+    try {
+      const r = await api('/api/children', { id: c.id, metric: state.metric, limit: 60 });
+      state.level2.set(c.id, r.items);
+    } catch (e) {}
+  }));
+  draw();
+  history.replaceState(null, '', '#' + id);
+}
+
+function renderHeader(node) {
+  // breadcrumbs
+  const c = $('#crumbs'); c.innerHTML = '';
+  (node.path || []).forEach((p, i, arr) => {
+    const a = document.createElement('a');
+    a.textContent = p.name || '/';
+    a.onclick = () => go(p.id);
+    c.appendChild(a);
+    if (i < arr.length-1) { const s = document.createElement('span'); s.className='sep'; s.textContent='/'; c.appendChild(s); }
+  });
+  const m = node.metrics, total = m.owned;
+  const shared = m.freeable !== undefined && m.freeable < m.owned;
+  $('#stats').innerHTML = `
+    <div class="stat"><div class="k">owned</div><div class="v">${fmt(m.owned)}</div></div>
+    <div class="stat"><div class="k">compsize</div><div class="v">${fmt(m.compsize)} <small>${pct(m.compsize,m.uncompressed).toFixed(0)}% of ${fmt(m.uncompressed)}</small></div></div>
+    <div class="stat"><div class="k">freeable</div><div class="v">${fmt(m.freeable)} <small>${shared ? pct(m.freeable,m.owned).toFixed(0)+'% of owned' : 'nothing shared'}</small></div></div>
+    <div class="stat"><div class="k">referenced</div><div class="v">${fmt(m.referenced)} <small>${m.owned>0 ? (m.referenced/m.owned).toFixed(1)+'× owned' : ''}</small></div></div>
+    <div class="stat"><div class="k">files</div><div class="v">${(m.files||0).toLocaleString()} <small>${(m.dirs||0).toLocaleString()} dirs</small></div></div>`;
+}
+
+function renderList(node) {
+  const tb = $('#list tbody');
+  tb.innerHTML = '';
+  const parentTotal = metricOf(node) || 0;
+  const items = state.children.slice();
+  if (state.dirFirst) items.sort((a,b) => (b.kind==='dir')-(a.kind==='dir'));
+  const max = items.reduce((x,i) => Math.max(x, metricOf(i)), 0);
+  $('#listcount').textContent = items.length.toLocaleString() + ' entries';
+  $('#listhead').textContent = 'contents' + (items.length > 500 ? ' (largest 500 shown)' : '');
+  for (const it of items.slice(0, 500)) {
+    const tr = document.createElement('tr');
+    const size = metricOf(it);
+    const isDir = it.kind === 'dir';
+    let tags = '';
+    if (it.flags.includes('snapshot')) tags += '<span class="tag snap">snapshot</span>';
+    else if (it.flags.includes('subvolume')) tags += '<span class="tag">subvolume</span>';
+    if (isDir && it.metrics.freeable < it.metrics.owned) tags += '<span class="tag shared">shared</span>';
+    const sw = isDir && COLOR_OF.has(it.id) ? `<span class="swatch" style="background:${colorOf(it.id)}"></span>` : '';
+    tr.innerHTML = `
+      <td>${sw}<span class="name" title="${it.name.replace(/"/g,'&quot;')}">${it.name || '/'}</span>${tags}
+        <span class="bar" style="width:${pct(size,max).toFixed(1)}%"></span></td>
+      <td class="num">${fmt(size)}</td>
+      <td class="num">${fmtPct(pct(size, parentTotal))}</td>
+      <td class="num">${isDir ? (it.metrics.files||0).toLocaleString() : ''}</td>
+      <td class="num muted">${fmtDate(it.mtime)}</td>`;
+    tr.onclick = () => { if (isDir) go(it.id); else selectRow(tr, it); };
+    tb.appendChild(tr);
+  }
+}
+function selectRow(tr, it) {
+  document.querySelectorAll('#list tr.sel').forEach(e => e.classList.remove('sel'));
+  tr.classList.add('sel');
+}
+
+// ---- legend ----------------------------------------------------------------
+function renderLegend() {
+  const dirs = state.children.filter(c => c.kind === 'dir' && metricOf(c) > 0).slice(0, MAXCOLOR);
+  const l = $('#legend');
+  l.innerHTML = '';
+  dirs.forEach((d) => {
+    const el = document.createElement('div');
+    el.innerHTML = `<span class="swatch" style="background:${colorOf(d.id)}"></span><span class="n">${d.name}</span><span class="muted">${fmt(metricOf(d))}</span>`;
+    el.style.cursor = 'pointer';
+    el.onclick = () => go(d.id);
+    l.appendChild(el);
+  });
+  const sumKids = state.children.filter(c => metricOf(c) > 0)
+    .reduce((s,c) => s + metricOf(c), 0);
+  const own = state.node ? Math.max(0, metricOf(state.node)) : 0;
+  if (own > sumKids * 1.005 && own > 0) {
+    const el = document.createElement('div');
+    el.title = `Bytes reachable from several children at once: no single child can free them, only deleting ${state.node.name || 'this node'} itself can.`;
+    el.innerHTML = `<span class="swatch" style="background:var(--other)"></span><span class="n">held in common</span><span class="muted">${fmt(own - sumKids)}</span>`;
+    l.appendChild(el);
+  }
+  if (l.children.length === 0) l.style.display = 'none'; else l.style.display = 'flex';
+}
+
+// ---- chart -----------------------------------------------------------------
+function wedgeColor(id, depth, parentColor) {
+  if (depth === 0) return colorOf(id);
+  return mix(parentColor, depth === 1 ? 0.34 : 0.55);
+}
+
+let hit = [];   // {a0,a1,r0,r1,item,parentColor,color}
+function draw() {
+  const cv = $('#chart'), ctx = cv.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = Math.max(1, w*dpr); cv.height = Math.max(1, h*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  hit = [];
+  if (state.view === 'ring') drawRing(ctx, w, h);
+  else drawTreemap(ctx, w, h);
+}
+
+function drawRing(ctx, w, h) {
+  const cur = state.node || { metrics: {} };
+  const kids = state.children.filter(c => metricOf(c) > 0);
+  const sumKids = kids.reduce((s,k) => s + metricOf(k), 0);
+  const own = Math.max(0, metricOf(cur));
+  // owned/referenced are additive, so the wedges fill the ring exactly.
+  // freeable/compsize/uncompressed are not: children overlap, so scale against
+  // whichever is larger and show what no single child can account for.
+  const denom = Math.max(sumKids, own) || 1;
+  const gap = denom - sumKids;
+  const cx = w/2, cy = h/2;
+  const rMax = Math.min(w, h) * 0.46;
+  const r0 = rMax * 0.34;
+  const thickness = (rMax - r0) / 2.1;
+  const GAP = 0.012;   // 2px-ish surface gap between wedges
+
+  if (denom <= 1) {
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--text-muted');
+    ctx.font = '13px system-ui'; ctx.textAlign='center';
+    ctx.fillText('nothing to show here', cx, cy);
+    return;
+  }
+  // centre disc: the current directory
+  ctx.beginPath(); ctx.arc(cx, cy, r0, 0, Math.PI*2);
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--surface-2');
+  ctx.fill();
+  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--border');
+  ctx.stroke();
+
+  let a = -Math.PI/2;
+  const labelCandidates = [];
+  kids.forEach((k, i) => {
+    const span = (metricOf(k)/denom) * Math.PI*2;
+    const a0 = a + GAP/2, a1 = a + span - GAP/2;
+    a += span;
+    const color = wedgeColor(k.id, 0, null);
+    ring(ctx, cx, cy, r0, r0+thickness, a0, a1, color);
+    hit.push({a0, a1, r0, r1: r0+thickness, item: k, color});
+    const sub = state.level2.get(k.id);
+    if (sub && sub.length) {
+      const subTotal = sub.reduce((s,x) => s + Math.max(0, metricOf(x)), 0);
+      if (subTotal > 0) {
+        let b = a0;
+        const shown = sub.slice(0, 12);
+        const shownTotal = shown.reduce((s,x) => s + Math.max(0,metricOf(x)), 0);
+        const scale = (a1-a0) / shownTotal;
+        shown.forEach((x, j) => {
+          const s2 = Math.max(0, metricOf(x)) * scale;
+          const b0 = b + GAP/2, b1 = b + s2 - GAP/2;
+          b += s2;
+          if (b1 <= b0) return;
+          const c2 = wedgeColor(x.id, 1, color);
+          ring(ctx, cx, cy, r0+thickness, r0+thickness*2, b0, b1, c2);
+          hit.push({a0:b0, a1:b1, r0:r0+thickness, r1:r0+thickness*2, item:x, color:c2});
+        });
+        if (sub.length > shown.length) {
+          const b1 = a1 - GAP/2;
+          if (b1 > b) ring(ctx, cx, cy, r0+thickness, r0+thickness*2, b, b1, OTHER);
+        }
+      }
+    }
+    if (span > 0.20) labelCandidates.push({k, a0, a1, color, span});
+  });
+
+  if (gap > denom * 0.005) {
+    const span = (gap/denom) * Math.PI*2;
+    ring(ctx, cx, cy, r0, r0+thickness, a + GAP/2, a + span - GAP/2, OTHER);
+    hit.push({a0: a, a1: a + span, r0, r1: r0+thickness, item: {name: 'held in common', kind: 'dir',
+      metrics: {owned: gap, compsize: gap, freeable: gap, referenced: gap, uncompressed: gap, files: 0, dirs: 0}, flags: []}, color: OTHER});
+    a += span;
+  }
+
+  // direct labels for the biggest wedges (identity is never colour-alone)
+  ctx.font = '11px system-ui';
+  ctx.textBaseline = 'middle';
+  labelCandidates.slice(0, 8).forEach(({k, a0, a1, color}) => {
+    const mid = (a0+a1)/2;
+    const rr = r0 + thickness*2 + 6;
+    const x = cx + Math.cos(mid)*rr, y = cy + Math.sin(mid)*rr;
+    const right = Math.cos(mid) >= 0;
+    const tx = x + (right ? 12 : -12);
+    ctx.strokeStyle = color; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx+Math.cos(mid)*(r0+thickness*2), cy+Math.sin(mid)*(r0+thickness*2));
+    ctx.lineTo(x, y); ctx.lineTo(x + (right?8:-8), y); ctx.stroke();
+    ctx.textAlign = right ? 'left' : 'right';
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--text-primary');
+    const label = (k.name.length > 22 ? k.name.slice(0,21)+'…' : k.name) + '  ' + fmt(metricOf(k));
+    ctx.fillText(label, tx, y);
+  });
+
+  // centre text: this node's own value for the selected metric
+  const curName = cur.name || '/';
+  ctx.textAlign='center'; ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--text-primary');
+  ctx.font = '600 12px system-ui';
+  ctx.fillText(curName.length>20 ? curName.slice(0,19)+'…' : curName, cx, cy-8);
+  ctx.font = '12px system-ui'; ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--text-secondary');
+  ctx.fillText(fmt(own), cx, cy+9);
+}
+
+function ring(ctx, cx, cy, r0, r1, a0, a1, color) {
+  if (a1 <= a0) return;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r1, a0, a1);
+  ctx.arc(cx, cy, r0, a1, a0, true);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.strokeStyle = SURFACE; ctx.lineWidth = 1.5; ctx.stroke();
+}
+
+function drawTreemap(ctx, w, h) {
+  const kids = state.children.filter(c => metricOf(c) > 0);
+  const total = kids.reduce((s,k) => s + metricOf(k), 0);
+  if (total <= 0) return;
+  const rects = squarify(kids.map(k => ({v: metricOf(k), k})), 0, 0, w, h);
+  rects.forEach((r) => {
+    const color = wedgeColor(r.k.id, 0, null);
+    ctx.fillStyle = color;
+    ctx.fillRect(r.x+1, r.y+1, Math.max(0,r.w-2), Math.max(0,r.h-2));
+    hit.push({x:r.x, y:r.y, w:r.w, h:r.h, item:r.k, color});
+    if (r.w > 62 && r.h > 26) {
+      ctx.fillStyle = '#fff'; ctx.font = '11px system-ui'; ctx.textAlign='left'; ctx.textBaseline='top';
+      ctx.fillText(r.k.name.slice(0, Math.floor(r.w/7)), r.x+5, r.y+4);
+      if (r.h > 40) ctx.fillText(fmt(metricOf(r.k)), r.x+5, r.y+18);
+    }
+  });
+}
+
+function squarify(items, x, y, w, h) {
+  const out = [];
+  const total = items.reduce((s,i) => s+i.v, 0);
+  if (total <= 0) return out;
+  let scale = (w*h)/total;
+  let row = [], rest = items.slice();
+  const worst = (row, side) => {
+    const s = row.reduce((a,i) => a+i.v*scale, 0);
+    let mx = 0, mn = Infinity;
+    for (const i of row) { const l = i.v*scale; mx = Math.max(mx,l); mn = Math.min(mn,l); }
+    return Math.max((side*side*mx)/(s*s), (s*s)/(side*side*mn));
+  };
+  while (rest.length) {
+    const side = Math.min(w,h);
+    const cand = row.concat([rest[0]]);
+    if (row.length === 0 || worst(cand, side) <= worst(row, side)) { row.push(rest.shift()); }
+    else {
+      // lay the row out
+      const s = row.reduce((a,i) => a+i.v*scale, 0);
+      if (w >= h) {
+        const rw = s/h; let yy = y;
+        for (const i of row) { const rh = (i.v*scale)/rw; out.push({x, y:yy, w:rw, h:rh, k:i.k}); yy += rh; }
+        x += rw; w -= rw;
+      } else {
+        const rh = s/w; let xx = x;
+        for (const i of row) { const rw2 = (i.v*scale)/rh; out.push({x:xx, y, w:rw2, h:rh, k:i.k}); xx += rw2; }
+        y += rh; h -= rh;
+      }
+      scale = (w*h)/Math.max(1, rest.reduce((a,i)=>a+i.v,0));
+      row = [];
+    }
+    if (w <= 0.5 || h <= 0.5) break;
+  }
+  if (row.length && w > 0.5 && h > 0.5) {
+    const s = row.reduce((a,i) => a+i.v*scale, 0);
+    if (w >= h) { const rw = Math.min(w, s/h); let yy=y; for (const i of row){ const rh=(i.v*scale)/Math.max(rw,1e-6); out.push({x,y:yy,w:rw,h:rh,k:i.k}); yy+=rh; } }
+    else { const rh = Math.min(h, s/w); let xx=x; for (const i of row){ const rw2=(i.v*scale)/Math.max(rh,1e-6); out.push({x:xx,y,w:rw2,h:rh,k:i.k}); xx+=rw2; } }
+  }
+  return out;
+}
+
+// ---- hover -----------------------------------------------------------------
+$('#chart').addEventListener('mousemove', (e) => {
+  const rect = e.target.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  let found = null;
+  if (state.view === 'ring') {
+    const cx = rect.width/2, cy = rect.height/2;
+    const dx = mx-cx, dy = my-cy, r = Math.hypot(dx,dy);
+    let ang = Math.atan2(dy,dx);
+    if (ang < -Math.PI/2) ang += Math.PI*2;
+    for (const hwedge of hit) {
+      if (r >= hwedge.r0 && r <= hwedge.r1 && ang >= hwedge.a0 && ang <= hwedge.a1) { found = hwedge; break; }
+    }
+  } else {
+    for (const hwedge of hit) {
+      if (mx >= hwedge.x && mx <= hwedge.x+hwedge.w && my >= hwedge.y && my <= hwedge.y+hwedge.h) { found = hwedge; break; }
+    }
+  }
+  const tip = $('#tooltip');
+  if (!found) { tip.style.display='none'; state.hover = null; return; }
+  state.hover = found;
+  const it = found.item, g = it.metrics || {};
+  const parentTotal = (state.kids.get(state.id)?.metrics?.[state.metric] ) || 1;
+  tip.innerHTML = `<div class="t">${it.name || '/'}</div>
+    <div class="m">owned ${fmt(g.owned)} · ${fmtPct(pct(metricOf(it), parentTotal))} of parent</div>
+    <div class="m">compsize ${fmt(g.compsize)} · freeable ${fmt(g.freeable)}</div>
+    <div class="m">referenced ${fmt(g.referenced)} · uncompressed ${fmt(g.uncompressed)}</div>
+    ${it.kind==='dir' ? `<div class="m">${(g.files||0).toLocaleString()} files in ${(g.dirs||0).toLocaleString()} dirs</div>` : ''}
+    ${it.flags.length ? `<div class="m">${it.flags.join(', ')}</div>` : ''}`;
+  tip.style.display = 'block';
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  tip.style.left = Math.min(rect.width-tw-6, mx+14) + 'px';
+  tip.style.top  = Math.min(rect.height-th-6, my+14) + 'px';
+});
+$('#themetoggle').onclick = () => {
+  const cur = document.documentElement.getAttribute('data-theme');
+  const next = cur === 'dark' ? 'light' : cur === 'light' ? '' : 'dark';
+  if (next) document.documentElement.setAttribute('data-theme', next);
+  else document.documentElement.removeAttribute('data-theme');
+  try { localStorage.setItem('cst-theme', next); } catch (e) {}
+  PAL = palette();
+  OTHER = getComputedStyle(document.documentElement).getPropertyValue('--other').trim();
+  SURFACE = getComputedStyle(document.documentElement).getPropertyValue('--surface-0').trim();
+  draw(); renderList(state.kids.get(state.id) || { metrics: {} }); renderLegend();
+};
+$('#chart').addEventListener('mouseleave', () => { $('#tooltip').style.display='none'; });
+$('#chart').addEventListener('click', (e) => {
+  if (state.hover && state.hover.item.kind === 'dir') go(state.hover.item.id);
+});
+$('#up').onclick = () => { const cur = state.kids.get(state.id); if (cur && cur.path && cur.path.length>1) go(cur.path[cur.path.length-2].id); };
+$('#metric').onchange = (e) => { state.metric = e.target.value; go(state.id); };
+$('#viewtoggle').onclick = () => {
+  state.view = state.view === 'ring' ? 'map' : 'ring';
+  $('#viewtoggle').textContent = state.view === 'ring' ? '▦ treemap' : '◔ ring chart';
+  $('#legend').style.display = state.view === 'ring' ? 'flex' : 'none';
+  $('#legend').style.display = state.view === 'ring' ? 'flex' : 'none';
+  draw();
+};
+window.addEventListener('resize', () => draw());
+
+// ---- bottom panel: top files / snapshots / search ---------------------------
+async function showTop(kind) {
+  const r = await api('/api/top', { kind, metric: state.metric, limit: 60 });
+  $('#bottomhead').textContent = kind === 'snapshot' ? 'snapshot subvolumes, biggest CoW cost first'
+    : kind === 'dir' ? 'biggest directories on this scan' : 'biggest files on this scan';
+  const tb = $('#bottomtable tbody'); tb.innerHTML = '';
+  for (const it of r.items) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><span class="name">${it.name}</span>${it.flags.includes('snapshot')?'<span class="tag snap">snapshot</span>':''}</td>
+      <td class="num">${fmt(it.metrics.owned)}</td><td class="num muted">${fmt(it.metrics.referenced)}</td>
+      <td class="muted" style="max-width:38vw;overflow:hidden;text-overflow:ellipsis">${it.path||''}</td>`;
+    tr.onclick = () => { if (it.kind === 'dir') go(it.id); };
+    tb.appendChild(tr);
+  }
+}
+$('#bottomsort').onclick = () => {
+  const order = ['file','dir','snapshot'];
+  const i = (order.indexOf(state.bottom) + 1) % order.length;
+  state.bottom = order[i];
+  $('#bottomsort').textContent = i === 0 ? 'show snapshots' : i === 1 ? 'show directories' : 'show files';
+  showTop(state.bottom);
+};
+state.bottom = 'file';
+
+$('#search').addEventListener('keydown', async (e) => {
+  if (e.key !== 'Enter') return;
+  const q = e.target.value.trim();
+  if (q.length < 2) return;
+  const r = await api('/api/search', { q, limit: 200 });
+  $('#bottomhead').textContent = `${r.items.length} matches for “${q}”`;
+  const tb = $('#bottomtable tbody'); tb.innerHTML = '';
+  for (const it of r.items) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><span class="name">${it.name}</span></td><td class="num">${fmt(it.metrics.owned)}</td>
+      <td class="num muted">${fmt(it.metrics.referenced)}</td><td class="muted">${it.path||''}</td>`;
+    tr.onclick = () => { if (it.kind === 'dir') go(it.id); };
+    tb.appendChild(tr);
+  }
+});
+
+// ---- cache chip ------------------------------------------------------------
+function renderCache(c) {
+  if (!c) return;
+  const el = $('#cacheinfo');
+  el.innerHTML = `cache ${c.files.length ? `<b>${fmt(c.total)}</b> in ${c.files.length} file${c.files.length>1?'s':''}` : '<b>empty</b>'}
+    · serving <span title="${c.path}">${c.path.split('/').pop()}</span>
+    ${c.files.length ? '<button id="cacheclean">clean up…</button>' : ''}`;
+  const btn = $('#cacheclean');
+  if (btn) btn.onclick = async () => {
+    const lines = c.files.map(f => `  ${f.name}  ${fmt(f.bytes)}`).join('\n');
+    const msg = `Delete ${c.files.length} saved scan${c.files.length>1?'s':''} from\n${c.dir}\n\n${lines}\n\n` +
+      `The chart you are looking at stays in memory until you stop the server; ` +
+      `you would just have to rescan next time.`;
+    if (!confirm(msg)) return;
+    const r = await fetch('/api/cache/delete?all=1', { method: 'POST' });
+    const j = await r.json();
+    if (j.error) { showError('could not delete: ' + j.error); return; }
+    renderCache(j.cache);
+    showError(`deleted ${j.deleted} file(s) - this view still works from memory`);
+  };
+}
+
+// ---- boot ------------------------------------------------------------------
+function showError(msg) {
+  const f = $('#footer');
+  f.innerHTML = '<span class="err">' + msg + '</span>';
+}
+window.addEventListener('error', (e) => showError('error: ' + e.message));
+window.addEventListener('unhandledrejection', (e) => showError('error: ' + (e.reason && e.reason.message || e.reason)));
+(async function boot() {
+  const info = await api('/api/info');
+  state.summary = info;
+  const t = info.totals;
+  $('#footinfo').innerHTML =
+    `scan of ${(info.scanned_roots||[]).join(', ')} · ${t.files.toLocaleString()} files · ` +
+    `${info.stats.extents.toLocaleString()} extents · ${info.stats.refs.toLocaleString()} references · ` +
+    `${info.stats.seconds.toFixed(0)}s · ${info.stats.subvolumes} subvolumes` +
+    (info.snapshots.count ? ` · <b>snapshots: ${info.snapshots.count} hold ${fmt(info.snapshots.owned)}, ${fmt(info.snapshots.freeable)} freeable</b>` : '');
+  renderCache(info.cache);
+  const params = new URLSearchParams(location.search);
+  if (params.get('view') === 'map') { state.view = 'map'; $('#viewtoggle').textContent = '◔ ring chart'; }
+  if (params.get('metric')) {
+    state.metric = params.get('metric');
+    $('#metric').value = state.metric;
+  }
+  const start = parseInt(location.hash.slice(1), 10);
+  try {
+    await go(Number.isFinite(start) && start > 0 ? start : (info.roots[0] ? info.roots[0].id : 0));
+    await showTop('file');
+  } catch (e) {
+    showError('error: ' + (e && e.message || e));
+  }
+})();
+</script>
+</body>
+</html>

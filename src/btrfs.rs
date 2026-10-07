@@ -1,0 +1,402 @@
+//! Raw btrfs ioctl bindings.
+//!
+//! This mirrors what compsize(8) does: for every regular file, ask the kernel
+//! for the inode's EXTENT_DATA items (`BTRFS_IOC_TREE_SEARCH_V2` with
+//! `tree_id = 0`, which searches the subvolume tree the inode belongs to).
+//! No libbtrfs is needed - the on-disk item layout is stable and defined in
+//! linux/btrfs_tree.h.
+
+use std::io;
+
+// ---------------------------------------------------------------------------
+// ioctl(2) glue
+// ---------------------------------------------------------------------------
+
+extern "C" {
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
+}
+
+// _IOC direction bits, x86_64/aarch64 Linux (asm-generic).
+const IOC_NRBITS: u64 = 8;
+const IOC_TYPEBITS: u64 = 8;
+const IOC_SIZEBITS: u64 = 14;
+const IOC_NRSHIFT: u64 = 0;
+const IOC_TYPESHIFT: u64 = IOC_NRSHIFT + IOC_NRBITS;
+const IOC_SIZESHIFT: u64 = IOC_TYPESHIFT + IOC_TYPEBITS;
+const IOC_DIRSHIFT: u64 = IOC_SIZESHIFT + IOC_SIZEBITS;
+const IOC_WRITE: u64 = 1;
+const IOC_READ: u64 = 2;
+
+const fn ioc(dir: u64, ty: u64, nr: u64, size: u64) -> u64 {
+    (dir << IOC_DIRSHIFT) | (ty << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT) | (size << IOC_SIZESHIFT)
+}
+
+// open(2) flags, x86_64 Linux.
+pub const O_NOCTTY: i32 = 0o400;
+pub const O_NONBLOCK: i32 = 0o4000;
+pub const O_DIRECTORY: i32 = 0o200_000;
+pub const O_NOFOLLOW: i32 = 0o400_000;
+
+pub const BTRFS_IOCTL_MAGIC: u64 = 0x94;
+
+// Item types (linux/btrfs_tree.h).
+pub const BTRFS_EXTENT_DATA_KEY: u32 = 108;
+pub const BTRFS_ROOT_ITEM_KEY: u32 = 132;
+
+pub const BTRFS_FILE_EXTENT_INLINE: u8 = 0;
+#[allow(dead_code)] // documented for completeness
+pub const BTRFS_FILE_EXTENT_REG: u8 = 1;
+pub const BTRFS_FILE_EXTENT_PREALLOC: u8 = 2;
+
+/// Size of `struct btrfs_file_extent_item` (it is __packed__).
+pub const FILE_EXTENT_ITEM_SIZE: usize = 53;
+/// Fixed header of an inline extent item: everything before the inline payload.
+const INLINE_HEADER_SIZE: usize = FILE_EXTENT_ITEM_SIZE - 4 * 8;
+
+const SEARCH_KEY_SIZE: usize = 104; // struct btrfs_ioctl_search_key, padded
+const SEARCH_ARGS_V2_SIZE: usize = SEARCH_KEY_SIZE + 8; // + buf_size
+const SEARCH_HEADER_SIZE: usize = 32; // struct btrfs_ioctl_search_header, padded
+
+const BTRFS_IOC_TREE_SEARCH_V2: u64 = ioc(IOC_WRITE | IOC_READ, BTRFS_IOCTL_MAGIC, 17, SEARCH_ARGS_V2_SIZE as u64);
+const BTRFS_IOC_GET_SUBVOL_INFO: u64 = ioc(IOC_READ, BTRFS_IOCTL_MAGIC, 60, SUBVOL_INFO_SIZE as u64);
+
+// ---------------------------------------------------------------------------
+// GET_SUBVOL_INFO
+// ---------------------------------------------------------------------------
+
+const BTRFS_VOL_NAME_MAX: usize = 255;
+const BTRFS_UUID_SIZE: usize = 16;
+/// struct btrfs_ioctl_get_subvol_info_args, laid out by hand because we only
+/// need a few fields and the struct is large (5 sectors of subvolume metadata).
+const SUBVOL_INFO_SIZE: usize = 504;
+
+const OFF_SUBVOL_TREEID: usize = 0;
+const OFF_SUBVOL_NAME: usize = 8;
+const OFF_SUBVOL_FLAGS: usize = 8 + (BTRFS_VOL_NAME_MAX + 1) + 8 + 8 + 8;
+const OFF_SUBVOL_UUID: usize = OFF_SUBVOL_FLAGS + 8;
+const OFF_SUBVOL_PARENT_UUID: usize = OFF_SUBVOL_UUID + BTRFS_UUID_SIZE;
+const OFF_SUBVOL_RECEIVED_UUID: usize = OFF_SUBVOL_PARENT_UUID + BTRFS_UUID_SIZE;
+const OFF_SUBVOL_CTIME: usize = OFF_SUBVOL_RECEIVED_UUID + BTRFS_UUID_SIZE + 4 * 8;
+
+#[allow(dead_code)]
+pub const BTRFS_SUBVOL_RDONLY: u64 = 1 << 1;
+
+/// What the kernel tells us about a subvolume - enough to identify snapshots
+/// structurally (via `parent_uuid`) instead of guessing from path names.
+#[derive(Debug, Clone)]
+pub struct SubvolInfo {
+    pub treeid: u64,
+    pub name: Vec<u8>,
+    pub flags: u64,
+    pub uuid: [u8; BTRFS_UUID_SIZE],
+    pub parent_uuid: [u8; BTRFS_UUID_SIZE],
+    #[allow(dead_code)]
+    pub received_uuid: [u8; BTRFS_UUID_SIZE],
+    pub ctime_sec: u64,
+}
+
+pub fn get_subvol_info(fd: i32) -> io::Result<SubvolInfo> {
+    let mut buf = [0u8; SUBVOL_INFO_SIZE];
+    let rc = unsafe { ioctl(fd, BTRFS_IOC_GET_SUBVOL_INFO, buf.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let u64_at = |off: usize| u64::from_ne_bytes(buf[off..off + 8].try_into().unwrap());
+    let name_end = buf[OFF_SUBVOL_NAME..OFF_SUBVOL_NAME + BTRFS_VOL_NAME_MAX + 1]
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(BTRFS_VOL_NAME_MAX);
+    let mut uuid = [0u8; BTRFS_UUID_SIZE];
+    uuid.copy_from_slice(&buf[OFF_SUBVOL_UUID..OFF_SUBVOL_UUID + BTRFS_UUID_SIZE]);
+    let mut parent_uuid = [0u8; BTRFS_UUID_SIZE];
+    parent_uuid.copy_from_slice(&buf[OFF_SUBVOL_PARENT_UUID..OFF_SUBVOL_PARENT_UUID + BTRFS_UUID_SIZE]);
+    let mut received_uuid = [0u8; BTRFS_UUID_SIZE];
+    received_uuid
+        .copy_from_slice(&buf[OFF_SUBVOL_RECEIVED_UUID..OFF_SUBVOL_RECEIVED_UUID + BTRFS_UUID_SIZE]);
+    Ok(SubvolInfo {
+        treeid: u64_at(OFF_SUBVOL_TREEID),
+        name: buf[OFF_SUBVOL_NAME..OFF_SUBVOL_NAME + name_end].to_vec(),
+        flags: u64_at(OFF_SUBVOL_FLAGS),
+        uuid,
+        parent_uuid,
+        received_uuid,
+        ctime_sec: u64_at(OFF_SUBVOL_CTIME),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// TREE_SEARCH_V2: per-inode extent list
+// ---------------------------------------------------------------------------
+
+/// One EXTENT_DATA item of a file, as compsize reads it.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtentItem {
+    /// BTRFS_FILE_EXTENT_{INLINE,REG,PREALLOC}
+    pub kind: u8,
+    /// Compression type, with 256 meaning prealloc (matches compsize's table).
+    pub comp_type: u16,
+    /// Physical address of the extent (0 = hole).
+    pub disk_bytenr: u64,
+    /// Physical size of the whole extent (shared extents included).
+    pub disk_num_bytes: u64,
+    /// Uncompressed size of the whole extent.
+    pub ram_bytes: u64,
+    /// How many bytes of the extent this file actually references.
+    pub num_bytes: u64,
+    /// Key offset: the file offset this item describes.
+    #[allow(dead_code)]
+    pub key_offset: u64,
+}
+
+pub const PREALLOC_TYPE: u16 = 256;
+
+/// Which items to ask the kernel for: a tree, an item type, and the first
+/// objectid (keys are ordered objectid, type, offset).
+pub struct SearchSpec {
+    pub tree_id: u64,
+    pub item_type: u32,
+    pub min_objectid: u64,
+    pub max_objectid: u64,
+}
+
+/// Reusable per-thread search state: one kernel-side buffer plus the key we
+/// mutate while walking a long extent list.
+pub struct Searcher {
+    buf: Vec<u8>,
+}
+
+impl Searcher {
+    pub fn new(buf_size: usize) -> Self {
+        let buf_size = buf_size.max(4096);
+        Searcher {
+            buf: vec![0u8; SEARCH_ARGS_V2_SIZE + buf_size],
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.buf.len() - SEARCH_ARGS_V2_SIZE
+    }
+
+    fn set_key(&mut self, spec: &SearchSpec, min_objectid: u64, min_offset: u64) {
+        const MAX: u64 = u64::MAX;
+        let b = &mut self.buf;
+        b[0..8].copy_from_slice(&spec.tree_id.to_ne_bytes());
+        b[8..16].copy_from_slice(&min_objectid.to_ne_bytes()); // min_objectid
+        b[16..24].copy_from_slice(&spec.max_objectid.to_ne_bytes()); // max_objectid
+        b[24..32].copy_from_slice(&min_offset.to_ne_bytes()); // min_offset
+        b[32..40].copy_from_slice(&MAX.to_ne_bytes()); // max_offset
+        b[40..48].copy_from_slice(&0u64.to_ne_bytes()); // min_transid
+        b[48..56].copy_from_slice(&MAX.to_ne_bytes()); // max_transid
+        b[56..60].copy_from_slice(&spec.item_type.to_ne_bytes()); // min_type
+        b[60..64].copy_from_slice(&spec.item_type.to_ne_bytes()); // max_type
+        b[64..68].copy_from_slice(&u32::MAX.to_ne_bytes()); // nr_items: as many as fit
+        b[68..72].copy_from_slice(&0u32.to_ne_bytes()); // unused
+        for off in [72, 80, 88, 96] {
+            b[off..off + 8].copy_from_slice(&0u64.to_ne_bytes()); // unused1..4
+        }
+        let cap = (self.buf.len() - SEARCH_ARGS_V2_SIZE) as u64;
+        self.buf[104..112].copy_from_slice(&cap.to_ne_bytes()); // buf_size
+    }
+
+    /// Call `f` for every EXTENT_DATA item of `ino`.
+    pub fn for_each_extent<F>(&mut self, fd: i32, ino: u64, f: &mut F) -> io::Result<u64>
+    where
+        F: FnMut(&ExtentItem),
+    {
+        let spec = SearchSpec {
+            tree_id: 0, // the subvolume the inode belongs to
+            item_type: BTRFS_EXTENT_DATA_KEY,
+            min_objectid: ino,
+            max_objectid: ino,
+        };
+        self.for_each_item(fd, &spec, &mut |_obj, key_offset, payload| {
+            if let Some(item) = parse_extent_item(payload, key_offset) {
+                f(&item);
+            }
+        })
+    }
+
+    /// Call `f(objectid, offset, payload)` for every item of `spec.item_type`
+    /// at or above `spec.min_objectid`.
+    ///
+    /// The kernel fills the buffer and reports how many items fit; we resume
+    /// from the last *completely* parsed item. A trailing item whose payload
+    /// did not fit is re-fetched whole rather than skipped, so no item can be
+    /// lost or double counted.
+    pub fn for_each_item<F>(&mut self, fd: i32, spec: &SearchSpec, f: &mut F) -> io::Result<u64>
+    where
+        F: FnMut(u64, u64, &[u8]),
+    {
+        let cap = self.capacity();
+        let mut n_seen = 0u64;
+        let mut min_objectid = spec.min_objectid;
+        let mut min_offset = 0u64;
+        loop {
+            self.set_key(spec, min_objectid, min_offset);
+            let rc = unsafe { ioctl(fd, BTRFS_IOC_TREE_SEARCH_V2, self.buf.as_mut_ptr()) };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let nr_items = u32::from_ne_bytes(self.buf[64..68].try_into().unwrap()) as usize;
+
+            let items = &self.buf[SEARCH_ARGS_V2_SIZE..];
+            let mut pos = 0usize;
+            // (objectid, offset) of the last item we fully delivered
+            let mut last_complete: Option<(u64, u64)> = None;
+            let mut truncated_at: Option<(u64, u64, usize)> = None;
+            let mut count = 0usize;
+            while count < nr_items {
+                if pos + SEARCH_HEADER_SIZE > cap {
+                    break; // no room even for a header
+                }
+                let h = &items[pos..pos + SEARCH_HEADER_SIZE];
+                let obj = u64::from_ne_bytes(h[8..16].try_into().unwrap());
+                let key_off = u64::from_ne_bytes(h[16..24].try_into().unwrap());
+                let len = u32::from_ne_bytes(h[28..32].try_into().unwrap()) as usize;
+                if pos + SEARCH_HEADER_SIZE + len > cap {
+                    // Header landed but the payload was cut off: refetch this item whole.
+                    truncated_at = Some((obj, key_off, len));
+                    break;
+                }
+                let payload = &items[pos + SEARCH_HEADER_SIZE..pos + SEARCH_HEADER_SIZE + len];
+                f(obj, key_off, payload);
+                last_complete = Some((obj, key_off));
+                n_seen += 1;
+                pos += SEARCH_HEADER_SIZE + len;
+                count += 1;
+            }
+
+            // "no room left for another header" is the reliable signal that the
+            // kernel stopped because the buffer was full, not because the range
+            // ran out. Either way, one more search from the resume point settles it.
+            let no_room = pos + SEARCH_HEADER_SIZE > cap;
+            let resume = match (truncated_at, last_complete) {
+                // Refetch the cut-off item; if it cannot fit in the whole buffer,
+                // there is no way to make progress, so step over it instead of looping.
+                (Some((obj, off, len)), _) if SEARCH_HEADER_SIZE + len <= cap => (obj, off),
+                (Some((obj, off, _)), _) => (obj, off + 1),
+                (None, Some((obj, off))) if no_room => (obj, off + 1),
+                _ => return Ok(n_seen),
+            };
+            min_objectid = resume.0;
+            min_offset = match resume.1 {
+                u64::MAX => return Ok(n_seen),
+                v => v,
+            };
+        }
+    }
+}
+
+/// Parse a `struct btrfs_file_extent_item`. Returns None for items that carry
+/// no data accounting (holes are reported so the caller can skip them).
+fn parse_extent_item(p: &[u8], key_offset: u64) -> Option<ExtentItem> {
+    if p.len() < INLINE_HEADER_SIZE {
+        return None;
+    }
+    let ram_bytes = u64::from_le_bytes(p[8..16].try_into().unwrap());
+    let compression = p[16];
+    let kind = p[20];
+    if kind == BTRFS_FILE_EXTENT_INLINE {
+        // The payload is whatever follows the fixed header.
+        let payload = p.len() - INLINE_HEADER_SIZE;
+        return Some(ExtentItem {
+            kind,
+            comp_type: compression as u16,
+            disk_bytenr: 0,
+            disk_num_bytes: payload as u64,
+            ram_bytes,
+            num_bytes: ram_bytes,
+            key_offset,
+        });
+    }
+    let disk_bytenr = u64::from_le_bytes(p[21..29].try_into().unwrap());
+    let disk_num_bytes = u64::from_le_bytes(p[29..37].try_into().unwrap());
+    let num_bytes = u64::from_le_bytes(p[45..53].try_into().unwrap());
+    let comp_type = if kind == BTRFS_FILE_EXTENT_PREALLOC {
+        PREALLOC_TYPE
+    } else {
+        compression as u16
+    };
+    Some(ExtentItem {
+        kind,
+        comp_type,
+        disk_bytenr,
+        disk_num_bytes,
+        ram_bytes,
+        num_bytes,
+        key_offset,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Root tree: the inventory of subvolumes (what makes a snapshot a snapshot)
+// ---------------------------------------------------------------------------
+
+pub const BTRFS_ROOT_TREE_OBJECTID: u64 = 1;
+
+/// One `struct btrfs_root_item`, reduced to what identifies a subvolume.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RootItem {
+    pub treeid: u64,
+    pub flags: u64,
+    pub uuid: [u8; 16],
+    pub parent_uuid: [u8; 16],
+    pub received_uuid: [u8; 16],
+    pub otime_sec: u64,
+}
+
+// Offsets inside the packed struct, checked against the C compiler.
+const OFF_ROOT_GENERATION: usize = 160;
+const OFF_ROOT_FLAGS: usize = 208;
+const OFF_ROOT_GENERATION_V2: usize = 239;
+const OFF_ROOT_UUID: usize = 247;
+const OFF_ROOT_PARENT_UUID: usize = 263;
+const OFF_ROOT_RECEIVED_UUID: usize = 279;
+const OFF_ROOT_OTIME: usize = 339;
+const ROOT_ITEM_FULL_LEN: usize = 439;
+
+fn parse_root_item(p: &[u8], treeid: u64) -> Option<RootItem> {
+    if p.len() < OFF_ROOT_FLAGS + 8 {
+        return None;
+    }
+    let u64_at = |off: usize| u64::from_le_bytes(p[off..off + 8].try_into().unwrap());
+    let mut item = RootItem {
+        treeid,
+        flags: u64_at(OFF_ROOT_FLAGS),
+        otime_sec: if p.len() >= OFF_ROOT_OTIME + 12 {
+            u64_at(OFF_ROOT_OTIME)
+        } else {
+            0
+        },
+        ..Default::default()
+    };
+    // The uuid fields only exist (and are only valid) in the extended layout.
+    if p.len() >= ROOT_ITEM_FULL_LEN && u64_at(OFF_ROOT_GENERATION) == u64_at(OFF_ROOT_GENERATION_V2)
+    {
+        item.uuid.copy_from_slice(&p[OFF_ROOT_UUID..OFF_ROOT_UUID + 16]);
+        item.parent_uuid
+            .copy_from_slice(&p[OFF_ROOT_PARENT_UUID..OFF_ROOT_PARENT_UUID + 16]);
+        item.received_uuid
+            .copy_from_slice(&p[OFF_ROOT_RECEIVED_UUID..OFF_ROOT_RECEIVED_UUID + 16]);
+    }
+    Some(item)
+}
+
+/// Every subvolume on the filesystem, with the parent link that distinguishes
+/// a snapshot from an original. `fd` may be any file inside the filesystem.
+pub fn list_subvolumes(fd: i32) -> io::Result<Vec<RootItem>> {
+    let mut searcher = Searcher::new(1 << 20);
+    let spec = SearchSpec {
+        tree_id: BTRFS_ROOT_TREE_OBJECTID,
+        item_type: BTRFS_ROOT_ITEM_KEY,
+        min_objectid: 1,
+        max_objectid: u64::MAX,
+    };
+    let mut out = Vec::new();
+    searcher.for_each_item(fd, &spec, &mut |obj, _off, payload| {
+        if let Some(r) = parse_root_item(payload, obj) {
+            out.push(r);
+        }
+    })?;
+    Ok(out)
+}
