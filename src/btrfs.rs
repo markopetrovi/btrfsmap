@@ -270,17 +270,23 @@ impl Searcher {
                 count += 1;
             }
 
-            // "no room left for another header" is the reliable signal that the
-            // kernel stopped because the buffer was full, not because the range
-            // ran out. Either way, one more search from the resume point settles it.
-            let no_room = pos + SEARCH_HEADER_SIZE > cap;
-            let resume = match (truncated_at, last_complete) {
+            // Keep asking until the kernel returns nothing. "Is there room for
+            // another header" cannot tell a full buffer from the end of the
+            // range: an item needs its header *and* its payload, so a buffer
+            // ending 1-31 bytes short looks not-full and the remaining items
+            // would be dropped silently. One extra, empty call is the price.
+            if nr_items == 0 || last_complete.is_none() && truncated_at.is_none() {
+                return Ok(n_seen);
+            }
+            let resume = match truncated_at {
                 // Refetch the cut-off item; if it cannot fit in the whole buffer,
-                // there is no way to make progress, so step over it instead of looping.
-                (Some((obj, off, len)), _) if SEARCH_HEADER_SIZE + len <= cap => (obj, off),
-                (Some((obj, off, _)), _) => (obj, off + 1),
-                (None, Some((obj, off))) if no_room => (obj, off + 1),
-                _ => return Ok(n_seen),
+                // there is no way to make progress, so step over it instead.
+                Some((obj, off, len)) if SEARCH_HEADER_SIZE + len <= cap => (obj, off),
+                Some((obj, off, _)) => (obj, off + 1),
+                None => match last_complete {
+                    Some((obj, off)) => (obj, off + 1),
+                    None => return Ok(n_seen),
+                },
             };
             min_objectid = resume.0;
             min_offset = match resume.1 {
