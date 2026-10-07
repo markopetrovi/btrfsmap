@@ -562,6 +562,46 @@ impl Collected {
     }
 }
 
+/// Build a path to a directory *inside* a collected subvolume: the path of a
+/// nested subvolume is its containing subvolume's path, plus the chain of
+/// names from that subvolume's root down to the directory holding it, plus the
+/// entry's own name. Without this, a snapshot like
+/// /home/.snapshots/457/snapshot - whose entry lives in a subdirectory of the
+/// .snapshots subvolume - cannot be found.
+fn path_to_dir(col: &Collected, dirid: u64, name: &[u8], root_path: &[u8]) -> Vec<u8> {
+    let mut chain: Vec<&[u8]> = Vec::new();
+    let mut cur = dirid;
+    while cur != btrfs::BTRFS_FIRST_FREE_OBJECTID {
+        // the entry whose child is `cur` gives its name and its parent
+        let mut found = None;
+        for e in &col.entries {
+            if e.child == cur {
+                found = Some((
+                    e.parent,
+                    &col.names[e.name_off as usize..e.name_off as usize + e.name_len as usize],
+                ));
+                break;
+            }
+        }
+        let Some((parent, n)) = found else { break };
+        chain.push(n);
+        cur = parent;
+    }
+    chain.reverse();
+    let mut out = root_path.to_vec();
+    for c in chain {
+        if !out.ends_with(b"/") {
+            out.push(b'/');
+        }
+        out.extend_from_slice(c);
+    }
+    if !out.ends_with(b"/") {
+        out.push(b'/');
+    }
+    out.extend_from_slice(name);
+    out
+}
+
 /// Collect one subvolume, then every subvolume nested inside it.
 fn collect_all(
     c: &mut Collector,
@@ -586,14 +626,10 @@ fn collect_all(
             None
         };
         let col = collect_subvolume(c, fd, root_id, subvol, otime, scope.as_ref())?;
-        for (child_root, _dirid, name) in &col.nested {
+        for (child_root, dirid, name) in &col.nested {
             // the nested subvolume is reachable as a directory of this one, so
             // its identity is one open() away - no need to decode root items
-            let mut child_path = path.clone();
-            if !child_path.ends_with(b"/") {
-                child_path.push(b'/');
-            }
-            child_path.extend_from_slice(name);
+            let child_path = path_to_dir(&col, *dirid, name, &path);
             let Ok(child) = open_dir(&child_path) else { continue };
             let Ok(info) = btrfs::get_subvol_info(std::os::fd::AsRawFd::as_raw_fd(&child)) else {
                 continue;
