@@ -29,6 +29,11 @@ pub const FLAG_SNAP_CLASS: u8 = 1 << 4; // node lives inside a snapshot-class su
 
 pub const NO_NODE: u32 = u32::MAX;
 
+const _: () = {
+    assert!(std::mem::size_of::<Node>() == 72);
+    assert!(std::mem::size_of::<DirExtra>() == 64);
+};
+
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct Node {
@@ -56,6 +61,10 @@ pub struct Node {
     /// files created microseconds apart still order correctly). Fits in what
     /// used to be struct padding.
     pub btime_ns: u16,
+    /// declared so the struct has no implicit padding: these bytes go into the
+    /// cache file, and compiler padding is not guaranteed to be zeroed, which
+    /// made otherwise identical scans differ
+    pub _pad: u16,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -74,6 +83,7 @@ pub struct DirExtra {
     pub inline_ram_sub: u64,
     pub subvol: u16,
     pub depth: u16,
+    pub _pad: u32,
 }
 
 #[derive(Clone, Copy, Default)]

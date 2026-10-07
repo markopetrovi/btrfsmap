@@ -164,7 +164,9 @@ impl Shared {
     fn intern_subvol(&self, info: &btrfs::SubvolInfo, path: &[u8]) -> u16 {
         let mut table = self.subvols.lock().unwrap();
         if let Some(i) = table.iter().position(|s| s.id == info.treeid) {
-            if table[i].path.is_empty() {
+            // keep the lexicographically smallest path, so the recorded one does
+            // not depend on which mount the walk happened to reach first
+            if table[i].path.is_empty() || path < table[i].path.as_slice() {
                 table[i].path = path.to_vec();
             }
             return i as u16;
@@ -629,7 +631,21 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
     store_slot(shared, item.dir_id, result);
 }
 
-fn store_slot(shared: &Shared, dir_id: u32, result: DirResult) {
+/// Sort a directory's entries by name. The file walker sees readdir order and
+/// a metadata scan sees inode order, so without this the two would lay the tree
+/// out differently - and so would two runs on kernels that iterate differently.
+/// Done here, in the worker that built the entries, so it is parallel.
+fn sort_entries(result: &mut DirResult) {
+    let DirResult { entries, names, .. } = result;
+    entries.sort_by(|a, b| {
+        let an = &names[a.name_off as usize..a.name_off as usize + a.name_len as usize];
+        let bn = &names[b.name_off as usize..b.name_off as usize + b.name_len as usize];
+        an.cmp(bn)
+    });
+}
+
+fn store_slot(shared: &Shared, dir_id: u32, mut result: DirResult) {
+    sort_entries(&mut result);
     let mut slots = shared.slots.lock().unwrap();
     if slots.len() <= dir_id as usize {
         slots.resize_with(dir_id as usize + 1, || None);
@@ -1048,6 +1064,25 @@ pub fn flatten(
         }
     }
 
+    // Deterministic subvolume numbering: sort by UUID and remap every index the
+    // tree already stored.
+    {
+        let mut order: Vec<usize> = (0..tree.subvols.len()).collect();
+        order.sort_by_key(|&i| tree.subvols[i].uuid);
+        let mut remap = vec![0u16; tree.subvols.len()];
+        let sorted: Vec<Subvol> = order
+            .iter()
+            .enumerate()
+            .map(|(new, &old)| {
+                remap[old] = new as u16;
+                tree.subvols[old].clone()
+            })
+            .collect();
+        tree.subvols = sorted;
+        for d in tree.dirs.iter_mut() {
+            d.subvol = remap[d.subvol as usize];
+        }
+    }
     tree.inventory = inventory_items;
     let mut stats = raw.stats.clone();
     stats.extents = raw

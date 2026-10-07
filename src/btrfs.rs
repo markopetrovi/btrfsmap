@@ -158,7 +158,10 @@ pub const PREALLOC_TYPE: u16 = 256;
 /// objectid (keys are ordered objectid, type, offset).
 pub struct SearchSpec {
     pub tree_id: u64,
-    pub item_type: u32,
+    /// inclusive range of item types; the same value for both restricts the
+    /// search to one type, 0..u32::MAX enumerates a whole tree
+    pub min_type: u32,
+    pub max_type: u32,
     pub min_objectid: u64,
     pub max_objectid: u64,
 }
@@ -181,7 +184,7 @@ impl Searcher {
         self.buf.len() - SEARCH_ARGS_V2_SIZE
     }
 
-    fn set_key(&mut self, spec: &SearchSpec, min_objectid: u64, min_offset: u64) {
+    fn set_key(&mut self, spec: &SearchSpec, min_objectid: u64, min_type: u32, min_offset: u64) {
         const MAX: u64 = u64::MAX;
         let b = &mut self.buf;
         b[0..8].copy_from_slice(&spec.tree_id.to_ne_bytes());
@@ -191,8 +194,8 @@ impl Searcher {
         b[32..40].copy_from_slice(&MAX.to_ne_bytes()); // max_offset
         b[40..48].copy_from_slice(&0u64.to_ne_bytes()); // min_transid
         b[48..56].copy_from_slice(&MAX.to_ne_bytes()); // max_transid
-        b[56..60].copy_from_slice(&spec.item_type.to_ne_bytes()); // min_type
-        b[60..64].copy_from_slice(&spec.item_type.to_ne_bytes()); // max_type
+        b[56..60].copy_from_slice(&min_type.to_ne_bytes()); // min_type
+        b[60..64].copy_from_slice(&spec.max_type.to_ne_bytes()); // max_type
         b[64..68].copy_from_slice(&u32::MAX.to_ne_bytes()); // nr_items: as many as fit
         b[68..72].copy_from_slice(&0u32.to_ne_bytes()); // unused
         for off in [72, 80, 88, 96] {
@@ -209,7 +212,8 @@ impl Searcher {
     {
         let spec = SearchSpec {
             tree_id: 0, // the subvolume the inode belongs to
-            item_type: BTRFS_EXTENT_DATA_KEY,
+            min_type: BTRFS_EXTENT_DATA_KEY,
+            max_type: BTRFS_EXTENT_DATA_KEY,
             min_objectid: ino,
             max_objectid: ino,
         };
@@ -234,9 +238,10 @@ impl Searcher {
         let cap = self.capacity();
         let mut n_seen = 0u64;
         let mut min_objectid = spec.min_objectid;
+        let mut min_type = spec.min_type;
         let mut min_offset = 0u64;
         loop {
-            self.set_key(spec, min_objectid, min_offset);
+            self.set_key(spec, min_objectid, min_type, min_offset);
             let rc = unsafe { ioctl(fd, BTRFS_IOC_TREE_SEARCH_V2, self.buf.as_mut_ptr()) };
             if rc < 0 {
                 return Err(io::Error::last_os_error());
@@ -245,9 +250,9 @@ impl Searcher {
 
             let items = &self.buf[SEARCH_ARGS_V2_SIZE..];
             let mut pos = 0usize;
-            // (objectid, offset) of the last item we fully delivered
-            let mut last_complete: Option<(u64, u64)> = None;
-            let mut truncated_at: Option<(u64, u64, usize)> = None;
+            // (objectid, type, offset) of the last item we fully delivered
+            let mut last_complete: Option<(u64, u32, u64)> = None;
+            let mut truncated_at: Option<(u64, u32, u64, usize)> = None;
             let mut count = 0usize;
             while count < nr_items {
                 if pos + SEARCH_HEADER_SIZE > cap {
@@ -256,15 +261,16 @@ impl Searcher {
                 let h = &items[pos..pos + SEARCH_HEADER_SIZE];
                 let obj = u64::from_ne_bytes(h[8..16].try_into().unwrap());
                 let key_off = u64::from_ne_bytes(h[16..24].try_into().unwrap());
+                let key_type = u32::from_ne_bytes(h[24..28].try_into().unwrap());
                 let len = u32::from_ne_bytes(h[28..32].try_into().unwrap()) as usize;
                 if pos + SEARCH_HEADER_SIZE + len > cap {
                     // Header landed but the payload was cut off: refetch this item whole.
-                    truncated_at = Some((obj, key_off, len));
+                    truncated_at = Some((obj, key_type, key_off, len));
                     break;
                 }
                 let payload = &items[pos + SEARCH_HEADER_SIZE..pos + SEARCH_HEADER_SIZE + len];
                 f(obj, key_off, payload);
-                last_complete = Some((obj, key_off));
+                last_complete = Some((obj, key_type, key_off));
                 n_seen += 1;
                 pos += SEARCH_HEADER_SIZE + len;
                 count += 1;
@@ -277,13 +283,18 @@ impl Searcher {
             let resume = match (truncated_at, last_complete) {
                 // Refetch the cut-off item; if it cannot fit in the whole buffer,
                 // there is no way to make progress, so step over it instead of looping.
-                (Some((obj, off, len)), _) if SEARCH_HEADER_SIZE + len <= cap => (obj, off),
-                (Some((obj, off, _)), _) => (obj, off + 1),
-                (None, Some((obj, off))) if no_room => (obj, off + 1),
+                (Some((obj, ty, off, len)), _) if SEARCH_HEADER_SIZE + len <= cap => {
+                    (obj, ty, off)
+                }
+                (Some((obj, ty, off, _)), _) => (obj, ty, off + 1),
+                (None, Some((obj, ty, off))) if no_room => (obj, ty, off + 1),
                 _ => return Ok(n_seen),
             };
             min_objectid = resume.0;
-            min_offset = match resume.1 {
+            // advancing the type too is what lets a whole-tree walk move past the
+            // last item of a type instead of asking for it again forever
+            min_type = resume.1;
+            min_offset = match resume.2 {
                 u64::MAX => return Ok(n_seen),
                 v => v,
             };
@@ -392,7 +403,8 @@ pub fn list_subvolumes(fd: i32) -> io::Result<Vec<RootItem>> {
     let mut searcher = Searcher::new(1 << 20);
     let spec = SearchSpec {
         tree_id: BTRFS_ROOT_TREE_OBJECTID,
-        item_type: BTRFS_ROOT_ITEM_KEY,
+        min_type: BTRFS_ROOT_ITEM_KEY,
+        max_type: BTRFS_ROOT_ITEM_KEY,
         min_objectid: 1,
         max_objectid: u64::MAX,
     };

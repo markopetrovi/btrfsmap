@@ -301,9 +301,21 @@ pub fn invoking_user() -> Option<(u32, u32, String)> {
 
 impl Cache {
     /// Snapshot a finished scan into the on-disk representation.
+    ///
+    /// The reference array is not part of the cache, so the fields that index it
+    /// are cleared - they only carry thread-dependent values, and nothing reads
+    /// them after attribution.
     pub fn from_tree(tree: &Tree) -> Cache {
+        let mut nodes = tree.nodes.clone();
+        for n in nodes.iter_mut() {
+            if n.kind == KIND_FILE {
+                n.extra = 0;
+            }
+            n.first_ref = 0;
+            n.nrefs = 0;
+        }
         Cache {
-            nodes: tree.nodes.clone(),
+            nodes,
             names: tree.names.clone(),
             dirs: tree.dirs.clone(),
             roots: tree.roots.clone(),

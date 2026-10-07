@@ -46,6 +46,8 @@ scan options:
   -b, --bytes              raw byte counts in the report
       --dump-subvols       print the subvolume inventory and its classification
       --save FILE          also write the scan to FILE (the GUI can open it)
+      --reproducible       omit timings and warnings from the saved scan, so two
+                           scans of the same tree produce byte-identical files
       --compress           compress the saved scan with zstd
       --progress           print progress while scanning
   -h, --help               this help
@@ -223,6 +225,7 @@ fn cmd_scan(args: &[String]) -> ExitCode {
     let mut raw = false;
     let mut dump_subvols = false;
     let mut compress = false;
+    let mut reproducible = false;
     let mut save: Option<PathBuf> = None;
 
     let mut i = 0;
@@ -277,6 +280,7 @@ fn cmd_scan(args: &[String]) -> ExitCode {
             "-b" | "--bytes" => raw = true,
             "--dump-subvols" => dump_subvols = true,
             "--compress" => compress = true,
+            "--reproducible" => reproducible = true,
             "--save" => {
                 i += 1;
                 match args.get(i) {
@@ -346,7 +350,13 @@ fn cmd_scan(args: &[String]) -> ExitCode {
     }
 
     if let Some(path) = save {
-        let c = cache::Cache::from_tree(&tree);
+        let mut c = cache::Cache::from_tree(&tree);
+        if reproducible {
+            c.scanned_at = 0;
+            c.stats.elapsed = std::time::Duration::ZERO;
+            c.stats.fd_fallback = 0;
+            c.warnings.clear();
+        }
         let res = if compress {
             c.write_compressed(&path)
         } else {
