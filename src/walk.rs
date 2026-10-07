@@ -70,6 +70,9 @@ pub struct ScanOptions {
     pub buf_size: usize,
     pub excludes: Vec<Vec<u8>>,
     pub progress: bool,
+    /// walk snapshot-class subvolumes' trees instead of taking their
+    /// references from the extent tree (their interiors stay browsable)
+    pub full_scan: bool,
     /// shared counters for a GUI; `scan` fills this in itself when absent
     pub live: Option<Arc<Progress>>,
 }
@@ -83,6 +86,7 @@ impl Default for ScanOptions {
             buf_size: 1 << 20,
             excludes: Vec::new(),
             progress: false,
+            full_scan: false,
             live: None,
         }
     }

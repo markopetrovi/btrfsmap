@@ -247,7 +247,7 @@ impl Searcher {
                 return Err(io::Error::last_os_error());
             }
             let nr_items = u32::from_ne_bytes(self.buf[64..68].try_into().unwrap()) as usize;
-            let dbg = std::env::var_os("CST_PAGE_DEBUG").is_some();
+            let _dbg = std::env::var_os("CST_PAGE_DEBUG").is_some();
 
             let items = &self.buf[SEARCH_ARGS_V2_SIZE..];
             let mut pos = 0usize;
@@ -359,6 +359,9 @@ pub const BTRFS_ROOT_TREE_OBJECTID: u64 = 1;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RootItem {
     pub treeid: u64,
+    /// logical address of the subvolume's fs-tree root node; the anchor the
+    /// extent tree's block references can be followed down from
+    pub bytenr: u64,
     pub flags: u64,
     pub uuid: [u8; 16],
     pub parent_uuid: [u8; 16],
@@ -368,6 +371,7 @@ pub struct RootItem {
 
 // Offsets inside the packed struct, checked against the C compiler.
 const OFF_ROOT_GENERATION: usize = 160;
+const OFF_ROOT_BYTENR: usize = 176;
 const OFF_ROOT_FLAGS: usize = 208;
 const OFF_ROOT_GENERATION_V2: usize = 239;
 const OFF_ROOT_UUID: usize = 247;
@@ -383,6 +387,7 @@ fn parse_root_item(p: &[u8], treeid: u64) -> Option<RootItem> {
     let u64_at = |off: usize| u64::from_le_bytes(p[off..off + 8].try_into().unwrap());
     let mut item = RootItem {
         treeid,
+        bytenr: u64_at(OFF_ROOT_BYTENR),
         flags: u64_at(OFF_ROOT_FLAGS),
         otime_sec: if p.len() >= OFF_ROOT_OTIME + 12 {
             u64_at(OFF_ROOT_OTIME)
@@ -692,6 +697,32 @@ where
     searcher.for_each_item(fd, &spec, f)
 }
 
+/// Enumerate just one item type of a subvolume's fs tree.
+///
+/// The kernel still walks the whole tree to find them, but only items inside
+/// the type range are copied out, so asking for `EXTENT_DATA` alone delivers
+/// one item per file-extent instead of every inode, directory entry and index
+/// item in the tree - which is most of what a full enumeration costs.
+pub fn for_each_fs_item_typed<F>(
+    fd: i32,
+    subvol_root_id: u64,
+    item_type: u32,
+    f: &mut F,
+) -> io::Result<u64>
+where
+    F: FnMut(u64, u32, u64, &[u8]),
+{
+    let mut searcher = Searcher::new(4 << 20);
+    let spec = SearchSpec {
+        tree_id: subvol_root_id,
+        min_type: item_type,
+        max_type: item_type,
+        min_objectid: BTRFS_FIRST_FREE_OBJECTID,
+        max_objectid: u64::MAX,
+    };
+    searcher.for_each_item(fd, &spec, f)
+}
+
 /// `(child_root, dirid, name)` for every subvolume that lives inside
 /// `parent_root` - found in the root tree, so no directory walk is needed to
 /// know where subvolumes are nested.
@@ -735,11 +766,28 @@ pub const BTRFS_BLOCK_GROUP_DATA: u64 = 1 << 0;
 pub const BTRFS_BLOCK_GROUP_METADATA: u64 = 1 << 2;
 
 /// A data extent's header: `btrfs_extent_item` is 24 bytes packed, with the
-/// reference count first and the block-group flags last.
+/// reference count first, the generation, and the extent flags last.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtentItemHdr {
     pub refs: u64,
+    pub generation: u64,
+    pub flags: u64,
+    /// a metadata (tree block) extent: what the scan counts against the tree
+    /// rather than against file data
     pub is_metadata: bool,
+}
+
+/// `BTRFS_EXTENT_FLAG_TREE_BLOCK`: the extent holds a tree block. This - not
+/// the block-group flags - is what marks an extent item as metadata, and it is
+/// also what decides whether a `btrfs_tree_block_info` follows the header.
+pub const BTRFS_EXTENT_FLAG_TREE_BLOCK: u64 = 1 << 1;
+/// the extent's refs are not a complete list of its referrers; the kernel does a
+/// full backref walk for these instead of trusting them
+pub const BTRFS_BLOCK_FLAG_FULL_BACKREF: u64 = 1 << 8;
+
+/// True for a `METADATA_ITEM` key, or an `EXTENT_ITEM` whose flags say tree block.
+pub fn is_metadata_extent(key_type: u32, hdr: &ExtentItemHdr) -> bool {
+    key_type == BTRFS_METADATA_ITEM_KEY || hdr.flags & BTRFS_EXTENT_FLAG_TREE_BLOCK != 0
 }
 
 pub fn parse_extent_item_hdr(p: &[u8]) -> Option<ExtentItemHdr> {
@@ -747,10 +795,13 @@ pub fn parse_extent_item_hdr(p: &[u8]) -> Option<ExtentItemHdr> {
         return None;
     }
     let refs = u64::from_le_bytes(p[0..8].try_into().unwrap());
+    let generation = u64::from_le_bytes(p[8..16].try_into().unwrap());
     let flags = u64::from_le_bytes(p[16..24].try_into().unwrap());
     Some(ExtentItemHdr {
         refs,
-        is_metadata: flags & BTRFS_BLOCK_GROUP_METADATA != 0,
+        generation,
+        flags,
+        is_metadata: flags & BTRFS_EXTENT_FLAG_TREE_BLOCK != 0,
     })
 }
 
@@ -765,44 +816,84 @@ pub const BTRFS_TREE_BLOCK_REF_KEY: u32 = 176;
 pub const BTRFS_EXTENT_OWNER_REF_KEY: u32 = 172;
 pub const BTRFS_SHARED_BLOCK_REF_KEY: u32 = 182;
 
-/// Call `f` for each inline reference of an extent item payload.
-pub fn for_each_inline_ref<F: FnMut(u32, &[u8])>(p: &[u8], f: &mut F) {
-    let mut off = 24usize; // sizeof(btrfs_extent_item)
-    while off + 9 <= p.len() {
-        let ty = p[off] as u32;
-        let body = match ty {
-            BTRFS_EXTENT_DATA_REF_KEY => {
-                if off + 9 + 28 > p.len() {
-                    return;
-                }
-                Some(&p[off + 9..off + 9 + 28])
-            }
-            // a shared data ref has a 4-byte count body; the others carry
-            // everything in the 9-byte header
-            BTRFS_EXTENT_OWNER_REF_KEY
-            | BTRFS_TREE_BLOCK_REF_KEY
-            | BTRFS_SHARED_BLOCK_REF_KEY
-            | BTRFS_SHARED_DATA_REF_KEY => {
-                if off + 9 + body_len(ty) > p.len() {
-                    return;
-                }
-                None
-            }
-            _ => return, // unknown layout: stop rather than guess
-        };
-        if let Some(b) = body {
-            f(ty, b);
-        }
-        off += 9 + body_len(ty);
+/// Size of one inline reference in bytes, from its own type byte.
+///
+/// This is btrfs-progs' `btrfs_extent_inline_ref_size()`: a data reference is
+/// **29**, not 37, because its `btrfs_extent_data_ref` starts *at the header's
+/// offset field* - those 8 bytes are shared with the reference header, not added
+/// to it. Reading it as 9 + 28 steps eight bytes too far on every data
+/// reference and lands the walk inside the next one, which is what made 113 of
+/// 200 sampled items "desynchronise on a zero byte".
+pub fn inline_ref_size(ty: u32) -> Option<usize> {
+    match ty {
+        BTRFS_TREE_BLOCK_REF_KEY | BTRFS_SHARED_BLOCK_REF_KEY | BTRFS_EXTENT_OWNER_REF_KEY => Some(9),
+        BTRFS_SHARED_DATA_REF_KEY => Some(13),
+        BTRFS_EXTENT_DATA_REF_KEY => Some(29),
+        _ => None,
     }
 }
 
-fn body_len(ty: u32) -> usize {
-    match ty {
-        BTRFS_EXTENT_DATA_REF_KEY => 28,
-        BTRFS_SHARED_DATA_REF_KEY => 4,
-        _ => 0,
+/// Where an extent item's inline references begin: after the 24-byte
+/// `btrfs_extent_item` and, for a tree-block `EXTENT_ITEM` (the fat, pre-skinny
+/// layout), after the `btrfs_tree_block_info` that follows it. A
+/// `METADATA_ITEM` is skinny - the block's level rides in the key offset
+/// instead - so its references start right after the header.
+pub fn inline_ref_start(key_type: u32, p: &[u8]) -> Option<usize> {
+    if p.len() < 24 {
+        return None;
     }
+    if key_type == BTRFS_METADATA_ITEM_KEY {
+        return Some(24);
+    }
+    let flags = u64::from_le_bytes(p[16..24].try_into().unwrap());
+    Some(if flags & BTRFS_EXTENT_FLAG_TREE_BLOCK != 0 {
+        24 + 18 // struct btrfs_tree_block_info: a disk key (17) plus level
+    } else {
+        24
+    })
+}
+
+/// Visit every inline reference of an extent item, in order, as
+/// `f(type, payload)`: the 8-byte offset for a block ref or owner ref, and for
+/// a data ref the 28-byte `btrfs_extent_data_ref` that the offset field starts.
+/// Returns false if the refs do not tile the item exactly - an unknown type,
+/// an overrun, or a trailing remainder - so callers can tell a complete parse
+/// from a guess.
+pub fn for_each_inline_ref<F: FnMut(u32, &[u8])>(key_type: u32, p: &[u8], f: &mut F) -> bool {
+    let Some(mut off) = inline_ref_start(key_type, p) else {
+        return false;
+    };
+    while off < p.len() {
+        let ty = p[off] as u32;
+        let Some(sz) = inline_ref_size(ty) else {
+            return false;
+        };
+        if off + sz > p.len() {
+            return false;
+        }
+        f(ty, &p[off + 1..off + sz]);
+        off += sz;
+    }
+    true
+}
+
+/// A shared reference to a data extent: which block holds the reference, and
+/// how many references that block holds. `btrfs_shared_data_ref` (a 4-byte
+/// count) sits *after* the 9-byte inline ref, so the payload is parent + count.
+#[derive(Debug, Clone, Copy)]
+pub struct SharedDataRef {
+    pub parent: u64,
+    pub count: u32,
+}
+
+pub fn parse_shared_data_ref(p: &[u8]) -> Option<SharedDataRef> {
+    if p.len() < 12 {
+        return None;
+    }
+    Some(SharedDataRef {
+        parent: u64::from_le_bytes(p[0..8].try_into().unwrap()),
+        count: u32::from_le_bytes(p[8..12].try_into().unwrap()),
+    })
 }
 
 /// One reference to a data extent: which subvolume, which inode, at which file

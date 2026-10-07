@@ -107,6 +107,24 @@ struct Collector {
     unreadable: u64,
     files: u64,
     dirs: u64,
+    /// walk every fs tree, including the snapshot-class subvolumes (the M2
+    /// behaviour: snapshot interiors stay browsable)
+    full_scan: bool,
+    /// snapshot-class subvolumes left un-walked: (root id, subvol index, path)
+    collapsed: Vec<(u64, u16, Vec<u8>)>,
+}
+
+impl Collector {
+    /// Should this nested subvolume be walked, or stood in for by a single
+    /// node whose references come from the extent tree?
+    ///
+    /// Only *snapshots* collapse - subvolumes whose `parent_uuid` still
+    /// resolves to another subvolume of this filesystem. A subvolume that
+    /// merely shares reflinked extents with another has its own tree, its own
+    /// inodes and its own names, and is walked like any other.
+    fn collapse(&self, subvol: u16) -> bool {
+        !self.full_scan && self.subvols[subvol as usize].is_snapshot()
+    }
 }
 
 impl Collector {
@@ -275,6 +293,265 @@ fn collect_subvolume(
     Ok(col)
 }
 
+// ---------------------------------------------------------------------------
+// The extent tree's block-reference graph
+// ---------------------------------------------------------------------------
+
+/// Which subvolumes reference each metadata block, as far as the extent tree
+/// records it.
+///
+/// A *data* extent's shared reference does not name a subvolume: it names the
+/// tree block that holds the file extent. The subvolumes that reference that
+/// extent are the subvolumes whose trees can reach that block, which is the
+/// transitive closure over two kinds of reference the extent tree does record:
+///
+/// * `tree block backref root R` - a block in root `R`'s tree points here;
+/// * `shared block backref parent P` - the block `P` points here, and `P`'s own
+///   references say who can reach `P`.
+///
+/// The closure is a good approximation rather than a certainty, and
+/// `--full-scan` is the exact answer - see the limits section of the README.
+pub struct BlockRefs {
+    /// block bytenr -> (start, len) into `refs`
+    index: HashMap<u64, (u32, u32)>,
+    /// kind 176 = "a block in root R's tree points here", 182 = "block P does"
+    refs: Vec<(u8, u64)>,
+    memo: HashMap<u64, Vec<u64>>,
+}
+
+impl BlockRefs {
+    fn insert(&mut self, bytenr: u64, kind: u8, value: u64) {
+        let e = self.index.entry(bytenr).or_insert((self.refs.len() as u32, 0));
+        self.refs.push((kind, value));
+        e.1 += 1;
+    }
+
+    /// Every root that can reach `bytenr`, memoised: the block graph is a DAG
+    /// whose interior is small, so this runs once per distinct block.
+    fn roots_of(&mut self, bytenr: u64) -> Vec<u64> {
+        if let Some(v) = self.memo.get(&bytenr) {
+            return v.clone();
+        }
+        let mut out: Vec<u64> = Vec::new();
+        // an in-progress marker: a cycle would otherwise recurse forever
+        self.memo.insert(bytenr, Vec::new());
+        if let Some(&(start, len)) = self.index.get(&bytenr) {
+            for i in start..start + len {
+                let (kind, value) = self.refs[i as usize];
+                match kind {
+                    176 => out.push(value),
+                    182 => {
+                        if value != bytenr {
+                            out.extend(self.roots_of(value));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        self.memo.insert(bytenr, out.clone());
+        out
+    }
+}
+
+/// Read the block-reference graph: one pass over the extent tree, keeping the
+/// references of every metadata extent.
+fn collect_block_refs(fd: i32, g: &mut BlockRefs) -> io::Result<()> {
+    btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, key_off, payload| {
+        match ty {
+            btrfs::BTRFS_EXTENT_ITEM_KEY | btrfs::BTRFS_METADATA_ITEM_KEY => {
+                let Some(h) = btrfs::parse_extent_item_hdr(payload) else {
+                    return;
+                };
+                if !btrfs::is_metadata_extent(ty, &h) {
+                    return;
+                }
+                btrfs::for_each_inline_ref(ty, payload, &mut |ty, body| {
+                    let value = u64::from_le_bytes(body[..8].try_into().unwrap());
+                    match ty {
+                        btrfs::BTRFS_TREE_BLOCK_REF_KEY => g.insert(bytenr, 176, value),
+                        btrfs::BTRFS_SHARED_BLOCK_REF_KEY => g.insert(bytenr, 182, value),
+                        _ => {}
+                    }
+                });
+            }
+            // the same two, for blocks with more references than an item holds
+            btrfs::BTRFS_TREE_BLOCK_REF_KEY => g.insert(bytenr, 176, key_off),
+            btrfs::BTRFS_SHARED_BLOCK_REF_KEY => g.insert(bytenr, 182, key_off),
+            _ => {}
+        }
+    })?;
+    Ok(())
+}
+
+/// Record one extent's collapsed holders: the extent, and every snapshot-class
+/// subvolume that references it.
+fn flush_collapsed(
+    bytenr: u64,
+    len: u64,
+    is_data: bool,
+    holders: &mut Vec<u32>,
+    keys: &HashMap<u32, (u32, u16, u64)>,
+    extents: &mut ExtentMap,
+    out: &mut Vec<(u32, u32)>,
+    added: &mut u64,
+    unresolved: &mut (u64, u64),
+) {
+    if holders.is_empty() {
+        if is_data && !extents.contains_key(&((bytenr >> 12) as u32)) {
+            // In the extent tree, referenced by something, and nothing resolved
+            // to a subvolume this scan knows. Usually that is a subvolume
+            // outside the scanned tree - which the walk would not have counted
+            // either - but see the limits section of the README for what it
+            // costs when it is not.
+            unresolved.0 += 1;
+            unresolved.1 += len;
+        }
+        return;
+    }
+    holders.sort_unstable();
+    holders.dedup();
+    let page = (bytenr >> 12) as u32;
+    // An extent no walked tree references is new here, and the extent tree is
+    // then the only place its size is known. `disk` is exact (the item's key
+    // offset is the length); `ram` is not recorded there at all, so a
+    // snapshot-only extent reports its compressed size as its uncompressed one.
+    if let std::collections::hash_map::Entry::Vacant(v) = extents.entry(page) {
+        v.insert(ExtentInfo {
+            disk: len,
+            ram: len,
+            win_btime: u32::MAX,
+            win_btime_ns: u16::MAX,
+            win_otime: u64::MAX,
+            win_count: 0,
+            assigned: 0,
+        });
+        *added += 1;
+    }
+    // The window decides ownership, and a walker sets it as it goes; these
+    // references need the same treatment or the extent ends up with a window no
+    // node's key matches and nobody owns it.
+    let e = extents.get_mut(&page).unwrap();
+    for &n in holders.iter() {
+        let key = *keys.get(&n).unwrap_or(&(u32::MAX, u16::MAX, 0));
+        let best = (e.win_btime, e.win_btime_ns, e.win_otime);
+        if key < best || e.win_count == 0 {
+            e.win_btime = key.0;
+            e.win_btime_ns = key.1;
+            e.win_otime = key.2;
+            e.win_count = 1;
+        } else if key == best {
+            e.win_count += 1;
+        }
+    }
+    for &n in holders.iter() {
+        out.push((n, page));
+    }
+    holders.clear();
+}
+
+/// Attribute collapsed subvolumes' extents straight from the extent tree.
+///
+/// Extent-tree keys order by (bytenr, type, offset), so an extent's own item
+/// and any reference that did not fit inline arrive together and in order: the
+/// whole attribution streams in one pass, with no reference array to build and
+/// nothing to sort by key afterwards.
+fn collect_collapsed_refs(
+    fd: i32,
+    nodes: &HashMap<u64, u32>,
+    keys: &HashMap<u32, (u32, u16, u64)>,
+    g: &mut BlockRefs,
+    extents: &mut ExtentMap,
+) -> io::Result<Vec<(u32, u32)>> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    let mut added = 0u64;
+    let mut unresolved = (0u64, 0u64);
+    let mut holders: Vec<u32> = Vec::new();
+    let mut cur_bytenr = u64::MAX;
+    let mut cur_len = 0u64;
+    let mut cur_data = false;
+
+    btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, key_off, payload| {
+        if bytenr != cur_bytenr {
+            flush_collapsed(
+                cur_bytenr, cur_len, cur_data, &mut holders, keys, extents, &mut out,
+                &mut added, &mut unresolved,
+            );
+            cur_bytenr = bytenr;
+            cur_data = false;
+            cur_len = key_off; // an EXTENT_ITEM's key offset is its length
+        }
+        match ty {
+            btrfs::BTRFS_EXTENT_ITEM_KEY | btrfs::BTRFS_METADATA_ITEM_KEY => {
+                let Some(h) = btrfs::parse_extent_item_hdr(payload) else {
+                    return;
+                };
+                if btrfs::is_metadata_extent(ty, &h) {
+                    return;
+                }
+                cur_data = true;
+                btrfs::for_each_inline_ref(ty, payload, &mut |ty, body| match ty {
+                    btrfs::BTRFS_EXTENT_DATA_REF_KEY => {
+                        // the very first field is the referencing subvolume
+                        let root = u64::from_le_bytes(body[..8].try_into().unwrap());
+                        if let Some(&n) = nodes.get(&root) {
+                            holders.push(n);
+                        }
+                    }
+                    btrfs::BTRFS_SHARED_DATA_REF_KEY => {
+                        // a shared reference names the tree block that holds the
+                        // file extent; the subvolumes are the roots that reach it
+                        if let Some(s) = btrfs::parse_shared_data_ref(body) {
+                            for r in g.roots_of(s.parent) {
+                                if let Some(&n) = nodes.get(&r) {
+                                    holders.push(n);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                });
+            }
+            // references that did not fit in the extent item live as their own
+            // items at the same bytenr
+            btrfs::BTRFS_EXTENT_DATA_REF_KEY => {
+                if payload.len() >= 28 {
+                    let root = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                    if let Some(&n) = nodes.get(&root) {
+                        holders.push(n);
+                    }
+                }
+            }
+            btrfs::BTRFS_SHARED_DATA_REF_KEY => {
+                // keyed (bytenr, type, parent): the parent block is the offset
+                for r in g.roots_of(key_off) {
+                    if let Some(&n) = nodes.get(&r) {
+                        holders.push(n);
+                    }
+                }
+            }
+            _ => {}
+        }
+    })?;
+    flush_collapsed(
+        cur_bytenr, cur_len, cur_data, &mut holders, keys, extents, &mut out, &mut added,
+        &mut unresolved,
+    );
+    if added > 0 {
+        eprintln!("note: {added} extents are held by snapshots alone");
+    }
+    if unresolved.0 > 0 {
+        eprintln!(
+            "note: {} extents ({} bytes) resolved to no subvolume in this scan",
+            unresolved.0,
+            unresolved.1
+        );
+    }
+    Ok(out)
+}
+
 /// Where a scan starts: one entry per path given on the command line.
 pub struct Root {
     pub path: Vec<u8>,
@@ -287,7 +564,72 @@ pub struct Root {
 ///
 /// Node indices come out in the same order the file backend produces: breadth
 /// first, children sorted by name. That is what makes the two comparable at all.
-fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>) {
+/// Append the single node that stands in for a collapsed subvolume.
+///
+/// It is a directory node with no children: the scan knows the subvolume is
+/// there and how much it holds, but not what is inside it. Its `btime` is the
+/// maximum, which is the truthful statement that the ages of the files inside
+/// are unknown - the effect is that it loses every tie against a walked holder
+/// and only wins extents no walked subvolume references, which is its share of
+/// the data its snapshots keep alive.
+fn push_collapsed_node(
+    tree: &mut Tree,
+    c: &mut Collector,
+    subvol: u16,
+    parent_node: u32,
+    name: &[u8],
+    depth: u16,
+) -> u32 {
+    let idx = tree.nodes.len() as u32;
+    let s = &tree.subvols[subvol as usize];
+    let mut flags = FLAG_SUBVOL | FLAG_COLLAPSED | FLAG_SNAP_CLASS;
+    if s.is_snapshot() {
+        flags |= FLAG_SNAPSHOT;
+    }
+    if s.is_readonly() {
+        flags |= FLAG_READONLY;
+    }
+    let name_off = tree.names.len() as u32;
+    tree.names.extend_from_slice(name);
+    let extra = tree.dirs.len() as u32;
+    tree.dirs.push(DirExtra {
+        subvol,
+        depth,
+        ..Default::default()
+    });
+    c.dirs += 1;
+    // The age this node carries into the ownership rule. It stands for every
+    // file inside, whose own birth times are unknown - but a *read-only*
+    // subvolume's files cannot have been created after it was: they are
+    // inherited from what it is a snapshot of. So its own creation time is an
+    // upper bound, and using it is sound in the direction that matters - it can
+    // claim an extent only where the file backend would have given it to one of
+    // its files too. A writable subvolume (a container layer keeps its
+    // `parent_uuid`) can create files at any time, so it claims nothing on age
+    // and takes only what no walked holder references.
+    let (btime, btime_ns) = if flags & FLAG_READONLY != 0 {
+        (
+            s.otime.min(u32::MAX as u64) as u32,
+            0,
+        )
+    } else {
+        (u32::MAX, u16::MAX)
+    };
+    tree.nodes.push(Node {
+        parent: parent_node,
+        name_off,
+        name_len: name.len() as u16,
+        kind: KIND_DIR,
+        flags,
+        extra,
+        btime,
+        btime_ns,
+        ..Default::default()
+    });
+    idx
+}
+
+fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32>) {
     let mut tree = Tree {
         nodes: Vec::new(),
         names: Vec::new(),
@@ -349,6 +691,8 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>) {
     }
     let mut inode_copies: HashMap<(usize, u64), u32> = HashMap::new();
     let mut root_nodes: Vec<u32> = Vec::new();
+    // root id -> the node that stands for it
+    let mut collapsed_nodes: HashMap<u64, u32> = HashMap::new();
 
     // A directory must own a *contiguous* run of nodes, because everything
     // downstream (children slices, the rollup) assumes it. So each directory is
@@ -476,7 +820,7 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>) {
         let first_child = tree.nodes.len() as u32;
         // gather this directory's children first: pushing nodes borrows the
         // collector mutably, so nothing may hold a borrow of its entries
-        let mut kids: Vec<(usize, u64, Vec<u8>, u8)> = Vec::new();
+        let mut kids: Vec<(usize, u64, Vec<u8>, u8, Option<u16>)> = Vec::new();
         {
             let entries = &c.subs[ci].entries;
             let names = &c.subs[ci].names;
@@ -484,7 +828,7 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>) {
             let hi = entries.partition_point(|e| e.parent <= inode);
             for e in &entries[lo..hi] {
             let child_name = names[e.name_off as usize..e.name_off as usize + e.name_len as usize].to_vec();
-            let (child_ci, child_inode, child_flags) = if e.loc_type == 132 {
+            let (child_ci, child_inode, child_flags, collapsed) = if e.loc_type == 132 {
                 // a directory entry pointing at another subvolume's root
                 let nested = c.subs[ci]
                     .nested
@@ -492,6 +836,14 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>) {
                     .find(|(_, dirid, name)| *dirid == inode && name.as_slice() == child_name.as_slice());
                 match nested {
                     Some((root_id, _, _)) => {
+                        // a collapsed subvolume has no collected tree: its node
+                        // is a single directory standing for the whole subtree
+                        if let Some(&(_, subvol, _)) =
+                            c.collapsed.iter().find(|(r, _, _)| r == root_id)
+                        {
+                            kids.push((usize::MAX, 0, child_name, 0, Some(subvol)));
+                            continue;
+                        }
                         match c
                             .subs
                             .iter()
@@ -506,7 +858,7 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>) {
                                 if s.is_readonly() {
                                     f |= FLAG_READONLY;
                                 }
-                                (child_ci, btrfs::BTRFS_FIRST_FREE_OBJECTID, f)
+                                (child_ci, btrfs::BTRFS_FIRST_FREE_OBJECTID, f, None)
                             }
                             None => continue,
                         }
@@ -514,12 +866,23 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>) {
                     None => continue,
                 }
             } else {
-                (ci, e.child, 0)
+                (ci, e.child, 0, None)
             };
-            kids.push((child_ci, child_inode, child_name, child_flags));
+            kids.push((child_ci, child_inode, child_name, child_flags, collapsed));
         }
         }
-        for (child_ci, child_inode, child_name, child_flags) in kids {
+        for (child_ci, child_inode, child_name, child_flags, collapsed) in kids {
+            // depth comes from the parent, which is already placed
+            let depth = if node_idx == 0 {
+                1
+            } else {
+                tree.dirs[tree.nodes[node_idx as usize].extra as usize].depth + 1
+            };
+            if let Some(subvol) = collapsed {
+                let idx = push_collapsed_node(&mut tree, c, subvol, node_idx, &child_name, depth);
+                collapsed_nodes.insert(tree.subvols[subvol as usize].id, idx);
+                continue;
+            }
             let Ok(pos) = c.subs[child_ci].recs.binary_search_by_key(&child_inode, |r| r.inode) else {
                 continue;
             };
@@ -528,12 +891,6 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>) {
                 btrfs::S_IFDIR => KIND_DIR,
                 btrfs::S_IFREG => KIND_FILE,
                 _ => continue, // symlinks and specials, as in the file backend
-            };
-            // depth comes from the parent, which is already placed
-            let depth = if node_idx == 0 {
-                1
-            } else {
-                tree.dirs[tree.nodes[node_idx as usize].extra as usize].depth + 1
             };
             let idx = push_node(&mut tree, c, child_ci, child_inode, node_idx, &child_name, child_flags, rec, kind, &mut final_refs, &mut inode_copies);
             if kind == KIND_DIR {
@@ -553,7 +910,7 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>) {
         node.nchildren = n;
     }
 
-    (tree, final_refs)
+    (tree, final_refs, collapsed_nodes)
 }
 
 impl Collected {
@@ -638,6 +995,13 @@ fn collect_all(
                 continue;
             }
             let child_subvol = c.intern_subvol(&info, inventory, &child_path);
+            if c.collapse(child_subvol) {
+                // No fs tree walk: its references come from the extent tree, so
+                // its subtree is not browsable - the trade the collapsed mode
+                // is built on.
+                c.collapsed.push((*child_root, child_subvol, child_path));
+                continue;
+            }
             work.push((*child_root, child_subvol, child_path));
         }
         c.subs.push(col);
@@ -659,6 +1023,8 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         unreadable: 0,
         files: 0,
         dirs: 0,
+        full_scan: opts.full_scan,
+        collapsed: Vec::new(),
     };
 
     // inventory of every subvolume, for snapshot classification
@@ -688,8 +1054,70 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         collect_all(&mut c, fd, &inventory, root)?;
     }
 
-    let (mut tree, final_refs) = build(&mut c, &roots);
+    let (mut tree, final_refs, collapsed_nodes) = build(&mut c, &roots);
     // the assembled array, whose references name their owner node
+    let mut final_refs = final_refs;
+
+    // Snapshot-class subvolumes were not walked, so their references - and the
+    // extents only they still hold - come from the extent tree instead.
+    if !collapsed_nodes.is_empty() {
+        let started = std::time::Instant::now();
+        let mut g = BlockRefs {
+            index: HashMap::new(),
+            refs: Vec::new(),
+            memo: HashMap::new(),
+        };
+        collect_block_refs(fd, &mut g)?;
+        let blocks = g.index.len();
+        // the age each collapsed node carries into the ownership rule
+        let keys: HashMap<u32, (u32, u16, u64)> = collapsed_nodes
+            .values()
+            .map(|&n| {
+                let node = tree.nodes[n as usize];
+                let d = &tree.dirs[node.extra as usize];
+                (n, (node.btime, node.btime_ns, tree.subvols[d.subvol as usize].otime))
+            })
+            .collect();
+        let mut pairs = collect_collapsed_refs(fd, &collapsed_nodes, &keys, &mut g, &mut c.extents)?;
+        drop(g);
+        let nrefs = pairs.len();
+        // A node's references have to be one contiguous run of the array, so
+        // group by node before appending: extens are visited in bytenr order,
+        // which is not node order.
+        pairs.sort_unstable();
+        let mut i = 0usize;
+        while i < pairs.len() {
+            let node = pairs[i].0;
+            let start = final_refs.len() as u32;
+            while i < pairs.len() && pairs[i].0 == node {
+                final_refs.push(((pairs[i].1 as u64) << 32) | node as u64);
+                i += 1;
+            }
+            let n = &mut tree.nodes[node as usize];
+            n.first_ref = start;
+            n.nrefs = final_refs.len() as u32 - start;
+        }
+        eprintln!(
+            "collapsed {} subvolumes: {nrefs} references resolved through {blocks} tree blocks in {:.1}s",
+            collapsed_nodes.len(),
+            started.elapsed().as_secs_f64()
+        );
+        if std::env::var_os("CST_DEBUG_EXT").is_some() {
+            let mut per: HashMap<u32, u64> = HashMap::new();
+            for (n, _) in pairs.iter() {
+                *per.entry(*n).or_insert(0) += 1;
+            }
+            let mut v: Vec<(u32, u64)> = per.into_iter().collect();
+            v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+            for (n, c) in v.iter().take(12) {
+                let d = &tree.dirs[tree.nodes[*n as usize].extra as usize];
+                let id = tree.subvols[d.subvol as usize].id;
+                eprintln!("  node {n} (subvol {id}): {c} refs");
+            }
+            eprintln!("  collapsed nodes receiving nothing: {}", collapsed_nodes.len() - v.len());
+        }
+    }
+
     let mut ref_blocks = vec![final_refs];
     // deterministic subvolume numbering, same as the file backend
     {
@@ -766,41 +1194,62 @@ pub fn probe_extent_tree(fd: i32) -> io::Result<(u64, u64, u64, u64, u64, Vec<(u
     let mut refs = 0u64;
     let mut shared = 0u64;
     let mut metadata_extents = 0u64;
+    let mut bad = 0u64;
+    let mut owner = 0u64;
     let mut per_root: HashMap<u64, u64> = HashMap::new();
     let mut cur_data = false;
-    btrfs::for_each_extent_tree_item(fd, &mut |_bytenr, ty, len, payload| match ty {
-        btrfs::BTRFS_EXTENT_ITEM_KEY => match btrfs::parse_extent_item_hdr(payload) {
-            Some(h) if !h.is_metadata => {
-                cur_data = true;
-                extents += 1;
-                bytes += len;
-                if extents < 201 && std::env::var_os("CST_DUMP_EXT").is_some() {
-                    println!("{} {} {} {}", _bytenr, len, payload.len(),
-                        payload.iter().map(|b| format!("{b:02x}")).collect::<String>());
-                }
-                // the single-reference case is stored inline in this very item
-                btrfs::for_each_inline_ref(payload, &mut |_ty, body| {
+    if std::env::var_os("CST_DUMP_EXT").is_some() {
+        extents = 1; // dump mode: the first items, raw, for external checking
+    }
+    btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, len, payload| match ty {
+        btrfs::BTRFS_EXTENT_ITEM_KEY | btrfs::BTRFS_METADATA_ITEM_KEY => {
+            let Some(h) = btrfs::parse_extent_item_hdr(payload) else {
+                return;
+            };
+            if btrfs::is_metadata_extent(ty, &h) {
+                cur_data = false;
+                metadata_extents += 1;
+                return;
+            }
+            cur_data = true;
+            extents += 1;
+            bytes += len;
+            if std::env::var_os("CST_DUMP_EXT").is_some() && extents < 201 {
+                println!(
+                    "{} {} {} {}",
+                    bytenr,
+                    len,
+                    payload.len(),
+                    payload.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                );
+            }
+            // every reference of a single-ref extent lives in this item
+            let complete = btrfs::for_each_inline_ref(ty, payload, &mut |ty, body| match ty {
+                btrfs::BTRFS_EXTENT_DATA_REF_KEY => {
                     if let Some(r) = btrfs::parse_data_ref(body) {
-                        if r.root > 100_000 && std::env::var_os("CST_DEBUG_EXT").is_some() {
-                            eprintln!(
-                                "  [bad] bytenr {_bytenr} len {len} item_len {} root {} ino {} count {} hex {}",
-                                payload.len(), r.root, r.inode, r.count,
-                                payload.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                            );
-                        }
                         refs += r.count as u64;
                         *per_root.entry(r.root).or_insert(0) += r.count as u64;
                     }
-                });
+                }
+                btrfs::BTRFS_SHARED_DATA_REF_KEY => {
+                    if let Some(s) = btrfs::parse_shared_data_ref(body) {
+                        shared += 1;
+                        let _ = s;
+                    }
+                }
+                btrfs::BTRFS_EXTENT_OWNER_REF_KEY => owner += 1,
+                _ => {}
+            });
+            if !complete {
+                bad += 1;
+                if std::env::var_os("CST_DEBUG_EXT").is_some() {
+                    eprintln!(
+                        "  [desync] bytenr {bytenr} len {len} item_len {} hex {}",
+                        payload.len(),
+                        payload.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    );
+                }
             }
-            _ => {
-                cur_data = false;
-                metadata_extents += 1;
-            }
-        },
-        btrfs::BTRFS_METADATA_ITEM_KEY => {
-            cur_data = false;
-            metadata_extents += 1;
         }
         btrfs::BTRFS_EXTENT_DATA_REF_KEY => {
             if cur_data {
@@ -817,7 +1266,134 @@ pub fn probe_extent_tree(fd: i32) -> io::Result<(u64, u64, u64, u64, u64, Vec<(u
         }
         _ => {}
     })?;
+    if extents > 0 && std::env::var_os("CST_DUMP_EXT").is_some() {
+        extents -= 1;
+    }
+    if bad > 0 {
+        eprintln!("extent items that did not parse cleanly: {bad}");
+    }
+    eprintln!("owner refs: {owner}");
     let mut roots: Vec<(u64, u64)> = per_root.into_iter().collect();
     roots.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     Ok((extents, bytes, refs, shared, metadata_extents, roots))
+}
+
+/// Development aid: for a sample of data extents, what the block-reference
+/// graph resolves their references to - to be diffed against the kernel's own
+/// `LOGICAL_INO` answer for the same bytenrs.
+pub fn probe_resolve(fd: i32, sample: usize) -> io::Result<()> {
+    let mut g = BlockRefs {
+        index: HashMap::new(),
+        refs: Vec::new(),
+        memo: HashMap::new(),
+    };
+    collect_block_refs(fd, &mut g)?;
+    eprintln!("block graph: {} blocks, {} references", g.index.len(), g.refs.len());
+
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = 0usize;
+    let mut cur = u64::MAX;
+    let mut cur_len = 0u64;
+    let mut cur_refs: Vec<(u32, u64)> = Vec::new();
+    let mut flush = |cur: u64, len: u64, refs: &Vec<(u32, u64)>, out: &mut Vec<String>| {
+        if refs.is_empty() {
+            return;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for &(ty, v) in refs.iter() {
+            if ty == 178 {
+                parts.push(format!("dref {v}"));
+            } else {
+                parts.push(format!("parent {v}"));
+            }
+        }
+        out.push(format!("{cur} {len} {}", parts.join(" ")));
+    };
+    btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, key_off, payload| {
+        if bytenr != cur {
+            if cur_refs.len() > 0 && seen % sample == 0 {
+                flush(cur, cur_len, &cur_refs, &mut out);
+            }
+            if cur_refs.len() > 0 {
+                seen += 1;
+            }
+            cur = bytenr;
+            cur_len = key_off;
+            cur_refs.clear();
+        }
+        match ty {
+            btrfs::BTRFS_EXTENT_ITEM_KEY | btrfs::BTRFS_METADATA_ITEM_KEY => {
+                let Some(h) = btrfs::parse_extent_item_hdr(payload) else {
+                    return;
+                };
+                if btrfs::is_metadata_extent(ty, &h) {
+                    return;
+                }
+                btrfs::for_each_inline_ref(ty, payload, &mut |ty, body| match ty {
+                    btrfs::BTRFS_EXTENT_DATA_REF_KEY => {
+                        let root = u64::from_le_bytes(body[..8].try_into().unwrap());
+                        cur_refs.push((178, root));
+                    }
+                    btrfs::BTRFS_SHARED_DATA_REF_KEY => {
+                        if let Some(s) = btrfs::parse_shared_data_ref(body) {
+                            cur_refs.push((184, s.parent));
+                        }
+                    }
+                    _ => {}
+                });
+            }
+            _ => {}
+        }
+    })?;
+    flush(cur, cur_len, &cur_refs, &mut out);
+    for line in &out {
+        let f: Vec<&str> = line.split(' ').collect();
+        let bytenr: u64 = f[0].parse().unwrap();
+        let mut roots: Vec<u64> = Vec::new();
+        let mut i = 2;
+        while i + 1 < f.len() {
+            let value: u64 = f[i + 1].parse().unwrap();
+            if f[i] == "dref" {
+                roots.push(value);
+            } else {
+                roots.extend(g.roots_of(value));
+            }
+            i += 2;
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        println!("{} {} {:?}", f[0], f[1], roots);
+    }
+    Ok(())
+}
+
+/// Development aid: what a type-restricted sweep of a subvolume costs against
+/// the full enumeration the M2 walk does. This is the number that decides how
+/// expensive "collapse the snapshots" is.
+pub fn probe_sweep(fd: i32, root_id: u64) -> io::Result<()> {
+    let t = std::time::Instant::now();
+    let (mut items, mut bytes) = (0u64, 0u64);
+    btrfs::for_each_fs_item(fd, root_id, &mut |_o, _t, _k, p| {
+        items += 1;
+        bytes += p.len() as u64;
+    })?;
+    let full = t.elapsed();
+    let t = std::time::Instant::now();
+    let (mut eitems, mut ebytes) = (0u64, 0u64);
+    btrfs::for_each_fs_item_typed(fd, root_id, btrfs::BTRFS_EXTENT_DATA_KEY, &mut |_o, ty, _k, p| {
+        if ty == btrfs::BTRFS_EXTENT_DATA_KEY {
+            eitems += 1;
+            ebytes += p.len() as u64;
+        }
+    })?;
+    let typed = t.elapsed();
+    println!(
+        "subvolume {root_id}: full sweep {items} items {:.1} MiB in {:.2}s; EXTENT_DATA only {eitems} items {:.1} MiB in {:.2}s ({:.0}% of the time)",
+        bytes as f64 / 1048576.0,
+        full.as_secs_f64(),
+        ebytes as f64 / 1048576.0,
+        typed.as_secs_f64(),
+        100.0 * typed.as_secs_f64() / full.as_secs_f64().max(1e-9)
+    );
+    Ok(())
 }

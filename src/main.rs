@@ -45,6 +45,9 @@ scan options:
       --top N              entries per level (default 12)
       --files N            biggest files to list (default 0)
   -b, --bytes              raw byte counts in the report
+      --full-scan          walk snapshot-class subvolumes too, so their
+                           interiors stay browsable (default: a snapshot is a
+                           single node holding its subtree's aggregate)
       --dump-subvols       print the subvolume inventory and its classification
       --save FILE          also write the scan to FILE (the GUI can open it)
       --reproducible       omit timings and warnings from the saved scan, so two
@@ -71,6 +74,54 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("resolve-probe") => match args.get(1) {
+            Some(p) => {
+                let f = match std::fs::File::open(p) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("{p}: {e}");
+                        return ExitCode::from(1);
+                    }
+                };
+                let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
+                let sample: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+                match metadata::probe_resolve(fd, sample.max(1)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("resolve probe failed: {e}");
+                        ExitCode::from(1)
+                    }
+                }
+            }
+            None => {
+                eprintln!("resolve-probe needs a path inside the filesystem");
+                ExitCode::from(2)
+            }
+        },
+        Some("sweep-probe") => match args.get(1) {
+            Some(p) => {
+                let f = match std::fs::File::open(p) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("{p}: {e}");
+                        return ExitCode::from(1);
+                    }
+                };
+                let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
+                match btrfs::get_subvol_info(fd).and_then(|i| metadata::probe_sweep(fd, i.treeid)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("sweep probe failed: {e}");
+                        ExitCode::from(1)
+                    }
+                }
+            }
+            None => {
+                eprintln!("sweep-probe needs a subvolume path");
+                ExitCode::from(2)
+            }
+        },
+        Some("diff") => cmd_diff(&args[1..]),
         Some("check") => match args.get(1) {
             Some(f) => cmd_check(&PathBuf::from(f)),
             None => {
@@ -130,6 +181,89 @@ fn cmd_extent_probe(path: &PathBuf) -> ExitCode {
     }
 }
 
+/// Development aid: where two scans of the same tree disagree, by path.
+/// Nodes inside a collapsed subvolume are skipped, since the collapsed scan
+/// deliberately has nothing there.
+fn cmd_diff(args: &[String]) -> ExitCode {
+    let (Some(a), Some(b)) = (args.first(), args.get(1)) else {
+        eprintln!("diff needs two caches: compsize-tree diff A.cst B.cst [--top N]");
+        return ExitCode::from(2);
+    };
+    let load = |p: &String| -> Result<model::Tree, String> {
+        cache::Cache::load_auto(&PathBuf::from(p))
+            .map(|c| c.into_tree())
+            .map_err(|e| format!("{p}: {e}"))
+    };
+    let (ta, tb) = match (load(a), load(b)) {
+        (Ok(x), Ok(y)) => (x, y),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let top: usize = args
+        .iter()
+        .position(|s| s == "--top")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+
+    let collect = |t: &model::Tree| {
+        let mut out: std::collections::HashMap<Vec<u8>, (u64, u64)> = Default::default();
+        let mut stack: Vec<u32> = t.roots.clone();
+        while let Some(id) = stack.pop() {
+            let n = t.node(id);
+            if n.flags & model::FLAG_COLLAPSED != 0 {
+                continue; // the collapsed side has no interior by design
+            }
+            out.insert(
+                t.path_of(id),
+                (n.owned, t.dir(id).compsize),
+            );
+            stack.extend(t.child_ids(id));
+        }
+        out
+    };
+    let (ma, mb) = (collect(&ta), collect(&tb));
+    let mut diffs: Vec<(i64, Vec<u8>, (u64, u64), (u64, u64))> = Vec::new();
+    for (path, va) in &ma {
+        if let Some(vb) = mb.get(path) {
+            let d = va.0 as i64 - vb.0 as i64;
+            if d != 0 {
+                diffs.push((d, path.clone(), *va, *vb));
+            }
+        }
+    }
+    diffs.sort_by_key(|(d, _, _, _)| -d.abs());
+    let sum = |m: &std::collections::HashMap<Vec<u8>, (u64, u64)>| -> (u64, u64) {
+        m.values().fold((0, 0), |a, v| (a.0 + v.0, a.1 + v.1))
+    };
+    let (sa, sb) = (sum(&ma), sum(&mb));
+    println!(
+        "compared paths (live subtrees): owned {} vs {} ({:+}), compsize {} vs {} ({:+})",
+        sa.0, sb.0, sb.0 as i64 - sa.0 as i64, sa.1, sb.1, sb.1 as i64 - sa.1 as i64
+    );
+    println!(
+        "whole tree: owned {} vs {} ({:+})",
+        ta.node(ta.roots[0]).owned,
+        tb.node(tb.roots[0]).owned,
+        tb.node(tb.roots[0]).owned as i64 - ta.node(ta.roots[0]).owned as i64
+    );
+    println!("{} paths compared, {} differ", ma.len(), diffs.len());
+    for (d, path, va, vb) in diffs.iter().take(top) {
+        println!(
+            "  {:>13}  owned {:>12} vs {:>12}  compsize {:>12} vs {:>12}  {}",
+            d,
+            va.0,
+            vb.0,
+            va.1,
+            vb.1,
+            String::from_utf8_lossy(path)
+        );
+    }
+    ExitCode::SUCCESS
+}
+
 fn cmd_check(path: &PathBuf) -> ExitCode {
     let started = Instant::now();
     let cache = match cache::Cache::load_auto(path) {
@@ -154,6 +288,10 @@ fn cmd_check(path: &PathBuf) -> ExitCode {
             .map(|r| String::from_utf8_lossy(r).into_owned())
             .collect::<Vec<_>>()
             .join(", ")
+    );
+    println!(
+        "  {} extents, {} references, {} files, {} dirs",
+        stats.extents, stats.refs, stats.files, stats.dirs
     );
     println!(
         "  root {}: owned {}, compsize {}, freeable {}, referenced {}, uncompressed {}",
@@ -319,6 +457,7 @@ fn cmd_scan(args: &[String]) -> ExitCode {
                 }
             }
             "-b" | "--bytes" => raw = true,
+            "--full-scan" => opts.full_scan = true,
             "--dump-subvols" => dump_subvols = true,
             "--compress" => compress = true,
             "--reproducible" => reproducible = true,
@@ -354,13 +493,14 @@ fn cmd_scan(args: &[String]) -> ExitCode {
     }
 
     let started = Instant::now();
-    // development switch while the metadata backend is being brought up; the
-    // file walker stays the default until the two agree byte for byte
-    let use_metadata = std::env::var("CST_BACKEND").map(|v| v == "metadata").unwrap_or(false);
-    let scan_result = if use_metadata {
-        metadata::scan_tree(&opts)
-    } else {
+    // Reading the trees is the default: it is byte-identical to the file walk
+    // (the cowdiff gate) and 2.5x faster. CST_BACKEND=files selects the file
+    // walker, which is what the gate compares against and what `report` uses.
+    let backend = std::env::var("CST_BACKEND").unwrap_or_default();
+    let scan_result = if backend == "files" {
         walk::scan_tree(&opts)
+    } else {
+        metadata::scan_tree(&opts)
     };
     let (tree, stats) = match scan_result {
         Ok(v) => v,

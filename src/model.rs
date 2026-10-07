@@ -26,6 +26,10 @@ pub const FLAG_SUBVOL: u8 = 1 << 1; // directory is a subvolume root
 pub const FLAG_SNAPSHOT: u8 = 1 << 2; // that subvolume is a snapshot (has parent_uuid)
 pub const FLAG_READONLY: u8 = 1 << 3; // subvolume is read-only
 pub const FLAG_SNAP_CLASS: u8 = 1 << 4; // node lives inside a snapshot-class subvolume
+/// a snapshot-class subvolume that was *not* walked: the node stands for the
+/// whole subtree. Its references come from the extent tree, so its interior is
+/// not browsable and its own metrics are the subtree's aggregate.
+pub const FLAG_COLLAPSED: u8 = 1 << 5;
 
 pub const NO_NODE: u32 = u32::MAX;
 
@@ -211,7 +215,7 @@ impl Tree {
             e.assigned = 0;
         }
         for i in 0..self.nodes.len() {
-            let (kind, nrefs, first_ref, block, inline_disk, inline_ram, btime, btime_ns, parent) = {
+            let (kind, nrefs, first_ref, block, inline_disk, inline_ram, btime, btime_ns, parent, flags) = {
                 let n = &self.nodes[i];
                 (
                     n.kind,
@@ -223,12 +227,32 @@ impl Tree {
                     n.btime,
                     n.btime_ns,
                     n.parent,
+                    n.flags,
                 )
             };
-            if kind != KIND_FILE {
+            let collapsed = flags & FLAG_COLLAPSED != 0;
+            if kind != KIND_FILE && !collapsed {
                 continue;
             }
-            let ctime = {
+            // A file's `extra` is its reference block; a directory's is its
+            // dir index - so a collapsed subvolume, which is a directory, still
+            // needs `extra` to find its own subvolume. Its references were
+            // appended to the one shared reference block.
+            let ref_block = if collapsed { 0 } else { block };
+            let ctime = if collapsed {
+                // A collapsed subvolume stands in for every file it holds, so
+                // its key cannot be any one file's birth time. It carries
+                // `u32::MAX` instead, which is the honest statement: nothing is
+                // known about the age of the files inside, so it owns only what
+                // no walked (live) holder claims. Among collapsed subvolumes
+                // the key then ties on birth time and the *subvolume* ages
+                // decide - which is exactly what the file backend does for a
+                // snapshot, whose files are shared with its parent and
+                // therefore tie on birth time too.
+                *subvol_otime
+                    .get(self.dirs[block].subvol as usize)
+                    .unwrap_or(&0)
+            } else {
                 let p = &self.nodes[parent as usize];
                 let sv = if p.kind == KIND_DIR {
                     self.dirs[p.extra as usize].subvol
@@ -240,7 +264,7 @@ impl Tree {
             // Inline payloads are private to this file and need no splitting.
             let mut owned = inline_disk;
             let mut uncomp = inline_ram;
-            for r in &refs[block][first_ref..first_ref + nrefs] {
+            for r in &refs[ref_block][first_ref..first_ref + nrefs] {
                 let Some(e) = extents.get_mut(&((*r >> 32) as u32)) else {
                     continue;
                 };

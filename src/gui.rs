@@ -275,6 +275,9 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         } else if d.flags & FLAG_SUBVOL != 0 {
             t.push_str("subvolume");
         }
+        if d.flags & FLAG_COLLAPSED != 0 {
+            t.push_str(" · not walked");
+        }
         if d.is_dir && d.freeable < d.owned {
             if !t.is_empty() {
                 t.push(' ');
@@ -790,16 +793,25 @@ impl Ui {
             let mut snap_owned = 0u64;
             let mut snap_free = 0u64;
             let mut n = 0u64;
+            let mut collapsed = 0u64;
             for i in 0..tree.nodes.len() as u32 {
                 let nd = tree.node(i);
                 if nd.kind == KIND_DIR && nd.flags & FLAG_SNAPSHOT != 0 {
                     snap_owned += nd.owned;
                     snap_free += tree.dir(i).freeable;
                     n += 1;
+                    if nd.flags & FLAG_COLLAPSED != 0 {
+                        collapsed += 1;
+                    }
                 }
             }
             if n > 0 {
-                format!(" · snapshots: {n} hold {}, {} freeable", human(snap_owned), human(snap_free))
+                let tail = if collapsed > 0 {
+                    format!(" ({collapsed} not walked: aggregate only)")
+                } else {
+                    String::new()
+                };
+                format!(" · snapshots: {n} hold {}, {} freeable{tail}", human(snap_owned), human(snap_free))
             } else {
                 String::new()
             }

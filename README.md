@@ -73,6 +73,23 @@ One pass, then per-directory metrics. The scan itself never needs a cache: the t
 lives in memory for the report, and `serve` reads it back from a saved cache only so
 that browsing later does not mean re-walking 37M files.
 
+The scan reads the filesystem's own trees instead of the files - `INODE_ITEM`,
+`DIR_INDEX` and `EXTENT_DATA` out of each subvolume's fs tree, subvolume nesting out
+of the root tree - which needs no `statx` and no per-file ioctl and is about 2.5x
+faster than the file walk for the same numbers.
+
+**Snapshots are not walked.** A subvolume whose `parent_uuid` still resolves to
+another subvolume of this filesystem is left as a single node holding its subtree's
+aggregate (`owned`, `compsize`, `freeable`, `uncompressed`); its references come from
+the extent tree instead, which is one pass over the whole filesystem no matter how
+many snapshots there are. Inside it there is nothing to browse, and its `referenced`
+- the logical size of the files in it - is not known, because that is only recorded
+per file. On a `/home` with 30 snapper snapshots and ~90 container layers this is the
+difference between ~160 s (and ~280 s through the files) and ~20 s warm, 36 s cold.
+`--full-scan` walks them after all, for the interiors and for `referenced`, and it is
+the exact answer; the collapsed scan lands within 1.5% of it on that tree, for the
+reasons in [Limits](#limits).
+
 With `--save` the cache goes to `$XDG_CACHE_HOME/compsize-tree/<roots>.cst`
 (`~/.cache/...` by default, named after the scanned roots so scans do not clobber each
 other) and is chowned to the invoking user, which is what lets `serve` run unprivileged.
@@ -89,6 +106,7 @@ The UI footer reports the cache size and offers to delete it.
 | `--buffer BYTES` | kernel search buffer per thread (default 1 MiB; larger is faster on files with millions of extents) |
 | `--depth N`, `--top N`, `--files N` | how much of the text report to print |
 | `-b, --bytes` | raw byte counts instead of human units |
+| `--full-scan` | walk snapshot-class subvolumes too (default: one node per snapshot, aggregates only) |
 | `--progress` | live file/dir counters |
 | `--dump-subvols` | print the subvolume inventory with snapshot classification |
 
@@ -117,12 +135,62 @@ the extent layer: `compsize-tree report -b /some/dir` and
 extent files where this implementation is ~5x faster thanks to a larger search
 buffer.
 
+## Verifying a change
+
+The file walker is the reference implementation: what the tree reader produces has
+to match it byte for byte. Scan the same tree with both and compare the caches:
+
+```
+sudo compsize-tree scan --full-scan --save /tmp/a.cst --reproducible PATH
+sudo CST_BACKEND=files compsize-tree scan --save /tmp/b.cst --reproducible PATH
+cmp /tmp/a.cst /tmp/b.cst
+```
+
+`--reproducible` drops timings and warnings, which is what makes two scans of an
+unchanged tree byte-identical. Pass `--full-scan` on both sides when the tree has
+snapshot-class subvolumes: the collapsed scan is deliberately a different, aggregate
+tree, so it is compared on its numbers instead (see Limits).
+
+`compsize-tree diff A.cst B.cst [--top N]` prints where two scans disagree, by path,
+largest first. `extent-probe PATH` reports what one pass over the extent tree sees -
+data extents, references, metadata extents, and how many items' inline references
+failed to parse (the count has to be zero). `resolve-probe PATH N` prints, for every
+Nth data extent, the subvolumes the block-reference graph resolves its shared
+references to, to be diffed against the kernel's own answer from
+`btrfs inspect-internal logical-resolve`.
+
 ## Limits
 
 * Sizes are relative to the scanned roots: an extent shared with a subvolume
   that was not walked is credited here. `scan` warns when it can see snapshots
   of a scanned subvolume outside the scanned paths. Scanning `/` (the default)
   avoids this entirely.
+* **A collapsed snapshot's numbers are an aggregate, and a close one rather than
+  an exact one.** Its references come from the extent tree, which records which
+  tree blocks reference an extent but not always *which subvolumes reach those
+  blocks*: a block can name a single owner root plus a few parent blocks while
+  many more subvolumes see it through a parent that is itself shared. That is
+  what `FULL_BACKREF` on disk means, and why the kernel's own `LOGICAL_INO` has
+  to read tree blocks one at a time (~150 us per extent) instead of trusting the
+  references. Two consequences, both measured against `--full-scan` on a `/home`
+  with 30 snapper snapshots and ~90 container layers (607 GiB owned):
+  * a collapsed subvolume's ownership key is its own creation time, not its
+    files' birth times, which are not recorded anywhere the extent tree reaches.
+    A read-only subvolume's files cannot be newer than it is, so that bound is
+    sound in the direction that matters, but an extent shared with a live file
+    whose inode is *newer* than the snapshot's copy goes to the live file where
+    the file backend gives it to the snapshot: **4.7 GiB** of it there;
+  * extents that only snapshots hold, and whose referencing blocks the extent
+    tree cannot link back to a subvolume, are not counted at all: **14 GiB**
+    there. `note:` lines on stderr report how many.
+  Net effect: `owned(/home)` came out **597 GiB against the exact 607 GiB**.
+  `--full-scan` is the exact answer when that matters.
+* A collapsed snapshot's `uncompressed` is its compressed size for the extents
+  only it holds - the extent tree has no uncompressed size. Its `referenced` is
+  0 for the same reason: the logical sizes live in the files, which were not
+  read. Subvolumes that are only reachable through a collapsed snapshot (deleted
+  from the live tree since) are not discovered, so the subvolume count can be a
+  few lower than the file backend's.
 * A scan is a snapshot in time; files changing during it are counted once, as
   seen.
 * Non-btrfs filesystems inside the tree (loop mounts, overlayfs, `/boot`) are

@@ -403,6 +403,9 @@ fn dir_tags(tree: &Tree, id: u32) -> String {
     } else if n.flags & FLAG_SUBVOL != 0 {
         tags.push("subvolume".into());
     }
+    if n.flags & FLAG_COLLAPSED != 0 {
+        tags.push("not walked".into());
+    }
     if n.flags & FLAG_READONLY != 0 {
         tags.push("ro".into());
     }
@@ -519,6 +522,16 @@ pub fn render_tree_report(tree: &Tree, stats: &ScanStats, opt: &TreeReportOption
             human(owned),
             human(free)
         ));
+        let collapsed = snaps
+            .iter()
+            .filter(|&&s| tree.node(s).flags & FLAG_COLLAPSED != 0)
+            .count();
+        if collapsed > 0 {
+            out.push_str(&format!(
+                "  {collapsed} of them were not walked: the node holds their subtree's aggregate\n  (owned, compsize, freeable) and nothing below them is browsable. \
+                 --full-scan\n  walks them to get their interiors and their `referenced`.\n"
+            ));
+        }
         let mut sorted = snaps.clone();
         sorted.sort_by_key(|&s| std::cmp::Reverse(tree.node(s).owned));
         for s in sorted.iter().take(opt.top.min(8)) {
