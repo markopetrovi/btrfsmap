@@ -396,6 +396,68 @@ pub fn size(bytes: u64, raw: bool) -> String {
     }
 }
 
+/// Which number the chart and the list are showing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Metric {
+    Owned,
+    Freeable,
+    Compsize,
+    Referenced,
+    Uncompressed,
+}
+
+impl Metric {
+    pub const ALL: [Metric; 5] = [
+        Metric::Owned,
+        Metric::Freeable,
+        Metric::Compsize,
+        Metric::Referenced,
+        Metric::Uncompressed,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Metric::Owned => "owned",
+            Metric::Freeable => "freeable",
+            Metric::Compsize => "compsize",
+            Metric::Referenced => "referenced",
+            Metric::Uncompressed => "uncompressed",
+        }
+    }
+
+    /// Short explanation, shown under the selector.
+    pub fn help(self) -> &'static str {
+        match self {
+            Metric::Owned => "fair share of physical extents - live data owns what it references, snapshots own only what the live tree no longer holds; adds up",
+            Metric::Freeable => "what would actually be freed by deleting this subtree",
+            Metric::Compsize => "every extent referenced anywhere below, counted once - what compsize prints for that path",
+            Metric::Referenced => "what the files claim, the number du and baobab show",
+            Metric::Uncompressed => "deduplicated bytes before compression",
+        }
+    }
+
+    /// The value for a node. Per-file reach/exclusive are not stored, so a file
+    /// shows its owned share for those two.
+    pub fn value(self, tree: &Tree, id: u32) -> u64 {
+        let n = tree.node(id);
+        if n.kind == KIND_FILE {
+            return match self {
+                Metric::Referenced => n.referenced,
+                Metric::Uncompressed => n.uncomp,
+                _ => n.owned,
+            };
+        }
+        let d = tree.dir(id);
+        match self {
+            Metric::Owned => n.owned,
+            Metric::Freeable => d.freeable,
+            Metric::Compsize => d.compsize,
+            Metric::Referenced => n.referenced,
+            Metric::Uncompressed => d.uncomp_reach,
+        }
+    }
+}
+
 pub fn human(bytes: u64) -> String {
     const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     if bytes < 1024 {

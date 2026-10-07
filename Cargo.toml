@@ -1,19 +1,20 @@
 [package]
 name = "compsize-tree"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "One-pass, extent-accurate btrfs disk usage with a baobab-style GUI"
+description = "Extent-accurate btrfs disk usage in one pass, with a GTK4 browser"
 license = "GPL-2.0-or-later"
 
 [[bin]]
 name = "compsize-tree"
 path = "src/main.rs"
 
-# No dependencies: raw ioctl(2) bindings, own JSON writer, own HTTP server.
 [dependencies]
+gtk4 = { version = "0.11", features = ["v4_10"] }
+pangocairo = "0.22"
+zstd = "0.13"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"

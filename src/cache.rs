@@ -7,7 +7,7 @@ use crate::model::*;
 use crate::walk::ScanStats;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 8] = b"CSTREE\x01\n";
@@ -80,6 +80,16 @@ impl Cache {
         {
             let f = File::create(&tmp)?;
             let mut w = BufWriter::with_capacity(8 << 20, f);
+            self.write_to(&mut w)?;
+            w.flush()?;
+        }
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    fn write_to<W: Write>(&self, sink: &mut W) -> io::Result<()> {
+        let mut w = &mut *sink;
+        {
             w.write_all(MAGIC)?;
             put_u32(&mut w, VERSION)?;
             put_u64(&mut w, layout_fingerprint())?;
@@ -136,9 +146,7 @@ impl Cache {
             for r in &self.scanned_roots {
                 put_bytes(&mut w, r)?;
             }
-            w.flush()?;
         }
-        fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -288,25 +296,34 @@ pub fn invoking_user() -> Option<(u32, u32, String)> {
 }
 
 impl Cache {
-    /// Write through the `zstd` binary: 3-4x smaller on disk, and `load`
-    /// transparently decompresses it again.
-    pub fn write_compressed(&self, path: &Path) -> io::Result<()> {
-        let plain = path.with_extension("plain.tmp");
-        self.write(&plain)?;
-        let out = std::process::Command::new("zstd")
-            .args(["-q", "-f", "-3", "-o"])
-            .arg(path.with_extension("zst.tmp"))
-            .arg(&plain)
-            .status();
-        let _ = fs::remove_file(&plain);
-        match out {
-            Ok(s) if s.success() => {
-                fs::rename(path.with_extension("zst.tmp"), path)?;
-                Ok(())
-            }
-            Ok(s) => Err(io::Error::other(format!("zstd exited with {s}"))),
-            Err(e) => Err(io::Error::other(format!("cannot run zstd: {e}"))),
+    /// Snapshot a finished scan into the on-disk representation.
+    pub fn from_tree(tree: &Tree) -> Cache {
+        Cache {
+            nodes: tree.nodes.clone(),
+            names: tree.names.clone(),
+            dirs: tree.dirs.clone(),
+            roots: tree.roots.clone(),
+            root: tree.root,
+            subvols: tree.subvols.clone(),
+            stats: tree.stats.clone(),
+            warnings: tree.warnings.clone(),
+            scanned_roots: tree.scanned_roots.clone(),
+            scanned_at: tree.scanned_at,
         }
+    }
+
+    /// Compress on the way to disk, in-process: 4-5x smaller, and `load_auto`
+    /// decompresses it again transparently.
+    pub fn write_compressed(&self, path: &Path) -> io::Result<()> {
+        let tmp = path.with_extension("tmp");
+        {
+            let f = File::create(&tmp)?;
+            let mut enc = zstd::stream::write::Encoder::new(BufWriter::with_capacity(8 << 20, f), 3)?;
+            self.write_to(&mut enc)?;
+            enc.finish()?.flush()?;
+        }
+        fs::rename(&tmp, path)?;
+        Ok(())
     }
 
     /// Read either a plain or a zstd-compressed cache.
@@ -314,124 +331,20 @@ impl Cache {
         let mut magic = [0u8; 4];
         {
             let mut f = File::open(path)?;
-            use std::io::Read as _;
             if f.read(&mut magic)? < 4 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "cache too short"));
             }
         }
         if magic == [0x28, 0xb5, 0x2f, 0xfd] {
-            // zstd frame: stream the decompressed bytes straight into the parser
-            let mut child = std::process::Command::new("zstd")
-                .args(["-q", "-d", "-c"])
-                .arg(path)
-                .stdout(std::process::Stdio::piped())
-                .spawn()?;
-            let out = child.stdout.take().expect("piped");
-            let r = io::BufReader::with_capacity(8 << 20, out);
-            let c = Cache::read_from(r);
-            let _ = child.wait();
-            c
+            let dec = zstd::stream::read::Decoder::new(File::open(path)?)?;
+            Cache::read_from(io::BufReader::with_capacity(8 << 20, dec))
         } else {
             Cache::load(path)
         }
     }
 }
 
-
-/// Cache directory, honouring XDG_CACHE_HOME.
-pub fn dir() -> PathBuf {
-    if let Ok(d) = std::env::var("XDG_CACHE_HOME") {
-        if !d.is_empty() {
-            return PathBuf::from(d).join("compsize-tree");
-        }
-    }
-    let home = invoking_user()
-        .map(|(_, _, h)| PathBuf::from(h))
-        .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".cache/compsize-tree")
-}
-
-/// One cache per scanned root set, so scans do not clobber each other.
-pub fn default_path(roots: &[Vec<u8>]) -> PathBuf {
-    let mut slug = String::new();
-    for r in roots {
-        if !slug.is_empty() {
-            slug.push('+');
-        }
-        for b in r {
-            slug.push(match b {
-                b'/' => '_',
-                b if b.is_ascii_alphanumeric() || *b == b'.' || *b == b'-' || *b == b'_' => *b as char,
-                _ => '_',
-            });
-        }
-    }
-    if slug.is_empty() {
-        slug = "scan".into();
-    }
-    if slug.len() > 60 {
-        slug.truncate(60);
-    }
-    dir().join(format!("{slug}.cst"))
-}
-
-#[derive(Clone)]
-pub struct CacheFile {
-    pub name: String,
-    pub bytes: u64,
-    pub mtime: u64,
-}
-
-/// Every cache on disk, newest first - this is what the UI reports and cleans.
-pub fn list() -> Vec<CacheFile> {
-    let mut out = Vec::new();
-    let Ok(rd) = fs::read_dir(dir()) else { return out };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|x| x.to_str()) != Some("cst") {
-            continue;
-        }
-        let Ok(md) = e.metadata() else { continue };
-        out.push(CacheFile {
-            name: e.file_name().to_string_lossy().into_owned(),
-            bytes: md.len(),
-            mtime: md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        });
-    }
-    out.sort_by_key(|c| std::cmp::Reverse(c.mtime));
-    out
-}
-
-pub fn newest() -> Option<PathBuf> {
-    list().first().map(|c| dir().join(&c.name))
-}
-
-/// Delete one cache (or all of them). Only ever touches `*.cst` directly inside
-/// the cache directory - names are validated, never joined blindly.
-pub fn delete(name: Option<&str>) -> io::Result<usize> {
-    let mut n = 0;
-    for c in list() {
-        if let Some(want) = name {
-            if c.name != want {
-                continue;
-            }
-        }
-        if c.name.contains('/') || !c.name.ends_with(".cst") {
-            continue;
-        }
-        if fs::remove_file(dir().join(&c.name)).is_ok() {
-            n += 1;
-        }
-    }
-    Ok(n)
-}
-
+/// Bytes on disk, for the UI status line.
 pub fn size_of(path: &Path) -> u64 {
     fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }

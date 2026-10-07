@@ -1,17 +1,22 @@
 # compsize-tree
 
 Extent-accurate disk usage for btrfs: **one pass** over the tree gives every
-directory's true size, and a local web UI shows it the way baobab would - if
-baobab understood reflinks, snapshots and compression.
+directory's true size, and a GTK4 browser shows it the way baobab would - if baobab
+understood reflinks, snapshots and compression.
 
 ```
-sudo compsize-tree scan --save /home   # one pass, ~5 min for 37M files
-compsize-tree serve                    # browse it (no root needed, opens a browser)
+sudo compsize-tree                     # the app: scan a path, or open a saved scan
+sudo compsize-tree scan /home          # headless: one pass, per-directory metrics
 ```
 
-`scan` alone just measures and prints - nothing is written to disk. `--save` keeps the
-result as a cache so a later `serve` does not have to re-walk the tree (the UI shows how
-much the cache occupies and can delete it again).
+The graphical browser (GTK4) starts with no arguments. From there you can pick a
+directory to scan - with live progress and a cancel button - or open a scan saved
+earlier, and save the current one wherever you like through a normal file dialog.
+Nothing is written to disk unless you ask for it, and there is no cache directory:
+a saved scan is just a file you choose the location of.
+
+Scanning needs root (the kernel's extent ioctl requires CAP_SYS_ADMIN), so start the
+app with `sudo compsize-tree`; opening a saved scan works unprivileged.
 
 ## Why `du`/baobab are wrong here, and compsize is tedious
 
@@ -47,7 +52,15 @@ compsize number even though 190 snapshots reference the same extents.
 
 ## Commands
 
-### `scan` (needs root - the extent ioctl requires CAP_SYS_ADMIN)
+### the app (no arguments, or `view FILE`)
+
+Needs root to scan. The window has a lazily-loaded file list, a sunburst ring chart
+(click a wedge to descend, hover for details) that switches to a treemap, a metric
+selector, badges for snapshot and shared entries, and a status line summarising the
+scan. Files: `Open…` loads a saved scan, `Save scan…` writes the current one
+(zstd-compressed when it helps), both through native file dialogs.
+
+### `scan` (needs root)
 
 ```
 sudo compsize-tree scan [options] PATH...
@@ -68,8 +81,8 @@ The UI footer reports the cache size and offers to delete it.
 | `-j, --threads N` | worker threads (default: CPUs) |
 | `-L, --follow-symlinks` | follow symlinks found while walking (off: matches compsize) |
 | `--exclude PATH` | skip a path prefix; extents shared with it will look exclusive to what remains |
-| `--cache PATH` | where to write the cache (also how you keep it off a full disk) |
-| `--compress` | write the cache through `zstd` (3-4x smaller; `serve` streams it back) |
+| `--save FILE` | also write the scan to FILE, so the app can open it later |
+| `--compress` | compress the saved scan (3-5x smaller) |
 | `--buffer BYTES` | kernel search buffer per thread (default 1 MiB; larger is faster on files with millions of extents) |
 | `--depth N`, `--top N`, `--files N` | how much of the text report to print |
 | `-b, --bytes` | raw byte counts instead of human units |
@@ -136,7 +149,7 @@ buffer.
 
 ## Implementation notes
 
-No dependencies (std only). Per file it asks the kernel for the inode's
+The scanner is std-only Rust; the browser is GTK4 (gtk4-rs). Per file it asks the kernel for the inode's
 `EXTENT_DATA` items with `BTRFS_IOC_TREE_SEARCH_V2`, exactly like compsize,
 and reads the packed `btrfs_file_extent_item` layout directly. Subvolume
 identity comes from `BTRFS_IOC_GET_SUBVOL_INFO` at `st_dev` boundaries plus a

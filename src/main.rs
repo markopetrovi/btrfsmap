@@ -1,15 +1,15 @@
-//! compsize-tree: extent-accurate btrfs disk usage in one pass.
+//! compsize-tree: extent-accurate btrfs disk usage.
 //!
-//! Subcommands:
-//!   report  - compsize-compatible table for the given paths (verification tool)
-//!   scan    - one-pass scan of a whole tree, with per-directory metrics
-//!   serve   - local web UI over a scan
+//! GUI (no arguments): open a saved scan or scan a path.
+//! CLI: `scan` for a headless pass, `report` for compsize-compatible output.
 
 mod btrfs;
 mod cache;
+mod chart;
+mod gui;
+mod listmodel;
 mod model;
 mod report;
-mod server;
 mod walk;
 
 use std::ffi::CString;
@@ -24,60 +24,58 @@ extern "C" {
 }
 
 const USAGE: &str = "\
-usage: compsize-tree <command> [options] [paths...]
+usage: compsize-tree [command] [options] [paths...]
+
+With no command, the graphical browser starts: open a saved scan or pick a path to scan.
 
 commands:
-  report [options] PATH...   print a compsize-compatible usage table
-  scan   [options] PATH...   one pass, then per-directory metrics
-  serve  [options]           browse a saved scan in a local web UI
-
-report options:
-  -b, --bytes              print raw byte counts instead of human-readable sizes
-      --buffer BYTES       kernel search buffer per thread (default 1048576)
+  scan [options] PATH...   one pass, per-directory metrics on stdout
+  report [-b] PATH...      compsize-compatible table (the verification mode)
+  view FILE.cst            open a saved scan in the graphical browser
+  check FILE.cst           load a saved scan and print what it holds (no GUI)
 
 scan options:
   -j, --threads N          worker threads (default: number of CPUs)
   -L, --follow-symlinks    follow symlinks found while walking
       --exclude PATH       skip this path prefix (repeatable; makes shared
-                           extents below it look exclusive - it is reported)
+                           extents below it look exclusive to what remains)
       --buffer BYTES       kernel search buffer per thread (default 1048576)
       --depth N            directory levels to print (default 2)
       --top N              entries per level (default 12)
       --files N            biggest files to list (default 0)
   -b, --bytes              raw byte counts in the report
       --dump-subvols       print the subvolume inventory and its classification
-      --save               keep the scan as a cache so a later `serve` does not
-                           have to re-walk the disk (nothing is written without
-                           it; the scan itself never needs the cache)
-      --cache PATH         write the cache to PATH (implies --save)
-      --compress           write the cache through zstd (3-4x smaller, needs
-                           the zstd binary; serve decompresses it)
+      --save FILE          also write the scan to FILE (the GUI can open it)
+      --compress           compress the saved scan with zstd
       --progress           print progress while scanning
-  -h, --help               this help
-
-serve options:
-      --cache PATH         cache to serve (default: the newest one in
-                           ~/.cache/compsize-tree)
-      --port N             port on 127.0.0.1 (default 8787, else a free one)
-      --open               also launch the browser (off by default)
   -h, --help               this help
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some(cmd) = args.first() else {
-        eprint!("{USAGE}");
-        return ExitCode::from(2);
-    };
-    match cmd.as_str() {
-        "report" => cmd_report(&args[1..]),
-        "scan" => cmd_scan(&args[1..]),
-        "serve" => cmd_serve(&args[1..]),
-        "-h" | "--help" | "help" => {
+    match args.first().map(|s| s.as_str()) {
+        None => gui::run(None),
+        Some("-h") | Some("--help") | Some("help") => {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
-        other => {
+        Some("scan") => cmd_scan(&args[1..]),
+        Some("report") => cmd_report(&args[1..]),
+        Some("check") => match args.get(1) {
+            Some(f) => cmd_check(&PathBuf::from(f)),
+            None => {
+                eprintln!("check needs a file: compsize-tree check FILE.cst");
+                ExitCode::from(2)
+            }
+        },
+        Some("view") => match args.get(1) {
+            Some(f) => gui::run(Some(PathBuf::from(f))),
+            None => {
+                eprintln!("view needs a file: compsize-tree view FILE.cst");
+                ExitCode::from(2)
+            }
+        },
+        Some(other) => {
             eprintln!("compsize-tree: unknown command '{other}'\n");
             eprint!("{USAGE}");
             ExitCode::from(2)
@@ -85,33 +83,63 @@ fn main() -> ExitCode {
     }
 }
 
-fn fmt_uuid(u: &[u8; 16]) -> String {
-    if *u == [0u8; 16] {
-        return "-".into();
-    }
-    let mut s = String::with_capacity(36);
-    for (i, b) in u.iter().enumerate() {
-        if matches!(i, 4 | 6 | 8 | 10) {
-            s.push('-');
-        }
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+pub fn is_root() -> bool {
+    unsafe { geteuid() == 0 }
 }
 
-/// Give the invoking user (not root) access to the cache and its directory.
-fn hand_over(path: &std::path::Path) {
-    let Some((uid, gid, _home)) = cache::invoking_user() else { return };
-    for p in [path.parent(), Some(path)].into_iter().flatten() {
-        if let Ok(c) = CString::new(p.as_os_str().as_bytes()) {
-            unsafe { chown(c.as_ptr(), uid, gid) };
+fn cmd_check(path: &PathBuf) -> ExitCode {
+    let started = Instant::now();
+    let cache = match cache::Cache::load_auto(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}: {e}", path.display());
+            return ExitCode::from(1);
         }
-    }
+    };
+    let tree = cache.into_tree();
+    let root = tree.roots.first().copied().unwrap_or(tree.root);
+    let stats = tree.stats.clone();
+    println!(
+        "{}: {} nodes, {} dirs, {} files, {} subvolumes, scanned {}",
+        path.display(),
+        tree.nodes.len(),
+        tree.dirs.len(),
+        stats.files,
+        stats.subvolumes,
+        tree.scanned_roots
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "  root {}: owned {}, compsize {}, freeable {}, referenced {}, uncompressed {}",
+        String::from_utf8_lossy(&tree.path_of(root)),
+        model::human(tree.node(root).owned),
+        model::human(tree.dir(root).compsize),
+        model::human(tree.dir(root).freeable),
+        model::human(tree.node(root).referenced),
+        model::human(tree.dir(root).uncomp_reach),
+    );
+    println!("  loaded in {:.1}s", started.elapsed().as_secs_f64());
+    ExitCode::SUCCESS
 }
 
-fn need_root() {
-    if unsafe { geteuid() } != 0 {
+fn need_root() -> bool {
+    let root = unsafe { geteuid() } == 0;
+    if !root {
         eprintln!("warning: the btrfs extent ioctl needs root; run with sudo");
+    }
+    root
+}
+
+/// Hand a file we wrote as root to the user who invoked us.
+pub fn hand_over(path: &std::path::Path) {
+    let Some((uid, gid, _home)) = cache::invoking_user() else {
+        return;
+    };
+    if let Ok(c) = CString::new(path.as_os_str().as_bytes()) {
+        unsafe { chown(c.as_ptr(), uid, gid) };
     }
 }
 
@@ -123,6 +151,10 @@ fn parse_usize(flag: &str, v: Option<&String>) -> Result<usize, ExitCode> {
             Err(ExitCode::from(2))
         }
     }
+}
+
+pub fn fmt_bytes(x: u64) -> String {
+    model::human(x)
 }
 
 // ---------------------------------------------------------------------------
@@ -183,18 +215,15 @@ fn cmd_report(args: &[String]) -> ExitCode {
     }
 }
 
-// ---------------------------------------------------------------------------
-
 fn cmd_scan(args: &[String]) -> ExitCode {
     let mut opts = walk::ScanOptions::default();
     let mut depth = 2usize;
     let mut top = 12usize;
-    let mut raw = false;
     let mut files = 0usize;
+    let mut raw = false;
     let mut dump_subvols = false;
     let mut compress = false;
-    let mut save = false;
-    let mut cache_path: Option<PathBuf> = None;
+    let mut save: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -238,7 +267,6 @@ fn cmd_scan(args: &[String]) -> ExitCode {
                     Err(c) => return c,
                 }
             }
-            "-b" | "--bytes" => raw = true,
             "--files" => {
                 i += 1;
                 match parse_usize("--files", args.get(i)) {
@@ -246,19 +274,19 @@ fn cmd_scan(args: &[String]) -> ExitCode {
                     Err(c) => return c,
                 }
             }
+            "-b" | "--bytes" => raw = true,
             "--dump-subvols" => dump_subvols = true,
-            "--cache" => {
+            "--compress" => compress = true,
+            "--save" => {
                 i += 1;
                 match args.get(i) {
-                    Some(p) => cache_path = Some(PathBuf::from(p)),
+                    Some(p) => save = Some(PathBuf::from(p)),
                     None => {
-                        eprintln!("--cache needs a path");
+                        eprintln!("--save needs a file");
                         return ExitCode::from(2);
                     }
                 }
             }
-            "--compress" => compress = true,
-            "--save" => save = true,
             "--progress" => opts.progress = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -277,9 +305,7 @@ fn cmd_scan(args: &[String]) -> ExitCode {
     }
     need_root();
     if !opts.excludes.is_empty() {
-        eprintln!(
-            "note: --exclude makes extents shared with excluded paths look exclusive to what remains"
-        );
+        eprintln!("note: --exclude makes extents shared with excluded paths look exclusive");
     }
 
     let started = Instant::now();
@@ -290,6 +316,13 @@ fn cmd_scan(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let ropt = report::TreeReportOptions {
+        depth,
+        top,
+        raw,
+        files,
+    };
+    print!("{}", report::render_tree_report(&tree, &stats, &ropt));
     if dump_subvols {
         let seen: std::collections::HashSet<u64> = tree.subvols.iter().map(|s| s.id).collect();
         println!("inventory: {} subvolumes", tree.inventory.len());
@@ -305,136 +338,46 @@ fn cmd_scan(args: &[String]) -> ExitCode {
             );
         }
     }
-    let ropt = report::TreeReportOptions {
-        depth,
-        top,
-        raw,
-        files,
-    };
-    print!("{}", report::render_tree_report(&tree, &stats, &ropt));
     if !tree.warnings.is_empty() {
         eprintln!("\n{} warnings, first {}:", tree.warnings.len(), tree.warnings.len().min(10));
         for w in tree.warnings.iter().take(10) {
             eprintln!("  {w}");
         }
     }
-    if !save && cache_path.is_none() {
-        eprintln!("scan not saved (add --save to keep it for compsize-tree serve)");
-        eprintln!("total {:.1}s", started.elapsed().as_secs_f64());
-        return ExitCode::SUCCESS;
-    }
-    let path = cache_path.unwrap_or_else(|| cache::default_path(&opts.roots));
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let c = cache::Cache {
-        nodes: tree.nodes.clone(),
-        names: tree.names.clone(),
-        dirs: tree.dirs.clone(),
-        roots: tree.roots.clone(),
-        root: tree.root,
-        subvols: tree.subvols.clone(),
-        stats: tree.stats.clone(),
-        warnings: tree.warnings.clone(),
-        scanned_roots: tree.scanned_roots.clone(),
-        scanned_at: tree.scanned_at,
-    };
-    let est = c.nodes.len() * std::mem::size_of::<model::Node>()
-        + c.names.len()
-        + c.dirs.len() * std::mem::size_of::<model::DirExtra>();
-    let write_res = if compress {
-        c.write_compressed(&path)
-    } else {
-        c.write(&path)
-    };
-    match write_res {
-        Ok(()) => {
-            hand_over(&path);
-            let on_disk = cache::size_of(&path);
-            eprintln!(
-                "cache: {} ({:.2} GiB on disk) - browse with: compsize-tree serve",
-                path.display(),
-                on_disk as f64 / (1024.0 * 1024.0 * 1024.0)
-            );
-            if !compress && est > 1 << 30 {
-                eprintln!("       (--compress writes it 3-4x smaller)");
+
+    if let Some(path) = save {
+        let c = cache::Cache::from_tree(&tree);
+        let res = if compress {
+            c.write_compressed(&path)
+        } else {
+            c.write(&path)
+        };
+        match res {
+            Ok(()) => {
+                hand_over(&path);
+                eprintln!(
+                    "saved {} ({:.2} GiB)",
+                    path.display(),
+                    cache::size_of(&path) as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
             }
+            Err(e) => eprintln!("could not save {}: {e}", path.display()),
         }
-        Err(e) => eprintln!(
-            "could not write cache {} ({e}) - need about {:.1} GiB free; use --cache elsewhere",
-            path.display(),
-            est as f64 / (1024.0 * 1024.0 * 1024.0)
-        ),
     }
     eprintln!("total {:.1}s", started.elapsed().as_secs_f64());
     ExitCode::SUCCESS
 }
 
-fn cmd_serve(args: &[String]) -> ExitCode {
-    let mut cache_path: Option<PathBuf> = None;
-    let mut port = 8787u16;
-    let mut open = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--cache" => {
-                i += 1;
-                match args.get(i) {
-                    Some(p) => cache_path = Some(PathBuf::from(p)),
-                    None => {
-                        eprintln!("--cache needs a path");
-                        return ExitCode::from(2);
-                    }
-                }
-            }
-            "--port" => {
-                i += 1;
-                match args.get(i).and_then(|v| v.parse().ok()) {
-                    Some(n) => port = n,
-                    None => {
-                        eprintln!("--port needs a number");
-                        return ExitCode::from(2);
-                    }
-                }
-            }
-            "--open" => open = true,
-            "-h" | "--help" => {
-                print!("{USAGE}");
-                return ExitCode::SUCCESS;
-            }
-            s if s.starts_with('-') && s.len() > 1 => {
-                eprintln!("compsize-tree: unknown option '{s}'");
-                return ExitCode::from(2);
-            }
-            s => cache_path = Some(PathBuf::from(s)),
-        }
-        i += 1;
+pub fn fmt_uuid(u: &[u8; 16]) -> String {
+    if *u == [0u8; 16] {
+        return "-".into();
     }
-    let path = match cache_path.or_else(cache::newest) {
-        Some(p) => p,
-        None => {
-            eprintln!(
-                "no cache in {} - save one with: sudo compsize-tree scan --save /",
-                cache::dir().display()
-            );
-            return ExitCode::from(1);
+    let mut s = String::with_capacity(36);
+    for (i, b) in u.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            s.push('-');
         }
-    };
-    let c = match cache::Cache::load_auto(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("cannot read cache {}: {e}", path.display());
-            eprintln!("save one with: sudo compsize-tree scan --save /");
-            return ExitCode::from(1);
-        }
-    };
-    let tree = c.into_tree();
-    let cache_bytes = cache::size_of(&path);
-    match server::run(tree, port, open, path.display().to_string(), cache_bytes) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("server error: {e}");
-            ExitCode::from(1)
-        }
+        s.push_str(&format!("{b:02x}"));
     }
+    s
 }

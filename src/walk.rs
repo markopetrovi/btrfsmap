@@ -19,7 +19,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,35 @@ const ENOTTY: i32 = 25;
 const EINVAL: i32 = 22;
 const EOPNOTSUPP: i32 = 95;
 
+/// Live counters the GUI polls while a scan runs in the background.
+#[derive(Default)]
+pub struct Progress {
+    pub files: AtomicU64,
+    pub dirs: AtomicU64,
+    pub refs: AtomicU64,
+    pub cancel: AtomicBool,
+    pub running: AtomicBool,
+    pub current: Mutex<Vec<u8>>,
+}
+
+impl Progress {
+    pub fn snapshot(&self) -> (u64, u64, u64, bool, String) {
+        (
+            self.files.load(Ordering::Relaxed),
+            self.dirs.load(Ordering::Relaxed),
+            self.refs.load(Ordering::Relaxed),
+            self.running.load(Ordering::Relaxed),
+            String::from_utf8_lossy(&self.current.lock().unwrap()).into_owned(),
+        )
+    }
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone)]
 pub struct ScanOptions {
     pub roots: Vec<Vec<u8>>,
@@ -41,6 +70,8 @@ pub struct ScanOptions {
     pub buf_size: usize,
     pub excludes: Vec<Vec<u8>>,
     pub progress: bool,
+    /// shared counters for a GUI; `scan` fills this in itself when absent
+    pub live: Option<Arc<Progress>>,
 }
 
 impl Default for ScanOptions {
@@ -52,6 +83,7 @@ impl Default for ScanOptions {
             buf_size: 1 << 20,
             excludes: Vec::new(),
             progress: false,
+            live: None,
         }
     }
 }
@@ -93,10 +125,9 @@ struct Shared {
     inventory: Vec<btrfs::RootItem>,
     visited_dirs: Mutex<HashSet<(u64, u64)>>,
     warnings: Mutex<Vec<String>>,
-    files: AtomicU64,
-    dirs: AtomicU64,
     unreadable: AtomicU64,
     nonbtrfs: AtomicU64,
+    prog: Arc<Progress>,
 }
 
 impl Shared {
@@ -292,6 +323,21 @@ fn scan_file(
 }
 
 fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkItem) {
+    if shared.prog.cancelled() {
+        store_slot(shared, item.dir_id, DirResult {
+            entries: Vec::new(),
+            names: Vec::new(),
+            subvol: item.subvol,
+        });
+        return;
+    }
+    {
+        let mut cur = shared.prog.current.lock().unwrap();
+        cur.clear();
+        let p = &item.path;
+        let keep = p.len().min(120);
+        cur.extend_from_slice(&p[..keep]);
+    }
     let mut result = DirResult {
         entries: Vec::new(),
         names: Vec::new(),
@@ -308,7 +354,7 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
             return;
         }
     };
-    shared.dirs.fetch_add(1, Ordering::Relaxed);
+    shared.prog.dirs.fetch_add(1, Ordering::Relaxed);
 
     for entry in rd {
         let entry = match entry {
@@ -416,6 +462,9 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
                 flags |= FLAG_SNAP_CLASS;
             }
 
+            if shared.prog.cancelled() {
+                continue;
+            }
             let dir_id = shared.next_dir_id.fetch_add(1, Ordering::Relaxed);
             shared.push_work(WorkItem {
                 dir_id,
@@ -446,7 +495,7 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
             node.name_off = name_off;
             node.name_len = name.len() as u16;
             result.entries.push(node);
-            shared.files.fetch_add(1, Ordering::Relaxed);
+            shared.prog.files.fetch_add(1, Ordering::Relaxed);
         }
     }
     store_slot(shared, item.dir_id, result);
@@ -506,11 +555,14 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
         subvols: Mutex::new(Vec::new()),
         visited_dirs: Mutex::new(HashSet::new()),
         warnings: Mutex::new(Vec::new()),
-        files: AtomicU64::new(0),
-        dirs: AtomicU64::new(0),
         unreadable: AtomicU64::new(0),
         nonbtrfs: AtomicU64::new(0),
+        prog: opts
+            .live
+            .clone()
+            .unwrap_or_else(|| Arc::new(Progress::default())),
     });
+    shared.prog.running.store(true, Ordering::SeqCst);
 
     // The synthetic root's entries are the paths given on the command line.
     let mut root_result = DirResult {
@@ -617,8 +669,8 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
                     eprintln!(
                         "  {:>7.0}s  {} files, {} dirs",
                         t0.elapsed().as_secs_f64(),
-                        shared.files.load(Ordering::Relaxed),
-                        shared.dirs.load(Ordering::Relaxed),
+                        shared.prog.files.load(Ordering::Relaxed),
+                        shared.prog.dirs.load(Ordering::Relaxed),
                     );
                 }
             }))
@@ -710,8 +762,8 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
     }
 
     let stats = ScanStats {
-        files: shared.files.load(Ordering::Relaxed),
-        dirs: shared.dirs.load(Ordering::Relaxed),
+        files: shared.prog.files.load(Ordering::Relaxed),
+        dirs: shared.prog.dirs.load(Ordering::Relaxed),
         extents: 0,
         refs: refs.iter().map(|r| r.len() as u64).sum(),
         subvolumes: subvols.len() as u64,
@@ -719,6 +771,7 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
         unreadable: shared.unreadable.load(Ordering::Relaxed),
         elapsed: started.elapsed(),
     };
+    shared.prog.running.store(false, Ordering::SeqCst);
     Ok(RawScan {
         inventory: inventory_items,
         slots,
