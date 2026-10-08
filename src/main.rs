@@ -46,6 +46,7 @@ scan options:
       --full-scan          walk snapshot-class subvolumes too, so their
                            interiors stay browsable (default: a snapshot is a
                            single node holding its subtree's aggregate)
+      --progress           print live file/dir counters while scanning
       --dump-subvols       print the subvolume inventory and its classification
       --save FILE          also write the scan to FILE (the GUI can open it)
       --reproducible       omit timings and warnings from the saved scan, so two
@@ -353,6 +354,7 @@ fn cmd_scan(args: &[String]) -> ExitCode {
     let mut files = 0usize;
     let mut raw = false;
     let mut dump_subvols = false;
+    let mut progress = false;
     let mut compress = false;
     let mut reproducible = false;
     let mut save: Option<PathBuf> = None;
@@ -394,6 +396,7 @@ fn cmd_scan(args: &[String]) -> ExitCode {
             "-b" | "--bytes" => raw = true,
             "--full-scan" => opts.full_scan = true,
             "--dump-subvols" => dump_subvols = true,
+            "--progress" => progress = true,
             "--compress" => compress = true,
             "--reproducible" => reproducible = true,
             "--save" => {
@@ -426,6 +429,45 @@ fn cmd_scan(args: &[String]) -> ExitCode {
         eprintln!("note: --exclude makes extents shared with excluded paths look exclusive");
     }
 
+    // --progress reads the same counters the GUI polls; the scan feeds the same
+    // Progress. The printer's lifetime is the scan's, not the reader's internal
+    // running flag, so it cannot stop early.
+    let mut printer: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )> = None;
+    if progress {
+        let p = std::sync::Arc::new(scan::Progress::default());
+        opts.live = Some(p.clone());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let t = std::thread::spawn(move || {
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let (files, dirs, refs, _running, current) = p.snapshot();
+                let line = format!(
+                    "{files} files, {dirs} dirs, {refs} refs{}{}",
+                    if p.cancelled() { ", cancelling" } else { "" },
+                    if current.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {current}")
+                    }
+                );
+                if tty {
+                    eprint!("\r  {line:<100}");
+                } else {
+                    eprintln!("  {line}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            if tty {
+                eprintln!();
+            }
+        });
+        printer = Some((stop, t));
+    }
+
     let started = Instant::now();
     // Reading the trees is the implementation: it is byte-identical to the
     // retired file walker and about 2.5x faster.
@@ -436,6 +478,10 @@ fn cmd_scan(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if let Some((stop, t)) = printer {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = t.join();
+    }
     let ropt = report::TreeReportOptions {
         depth,
         top,

@@ -294,6 +294,9 @@ fn collect_subvolume(
                 if item.disk_bytenr == 0 {
                     return; // hole
                 }
+                if let Some(l) = live {
+                    l.refs.fetch_add(1, Ordering::Relaxed);
+                }
                 let page = (item.disk_bytenr >> 12) as u32;
                 if (item.disk_bytenr >> 12) > u32::MAX as u64 {
                     overflow = true;
