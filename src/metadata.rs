@@ -1158,6 +1158,16 @@ fn collect_all(
             // nothing else can attribute them - the extent tree names a
             // subvolume the scan would never have interned.
             for (child_root, _dirid, name) in btrfs::subvolumes_inside(fd, root_id)? {
+                // Only what this scan has not already accounted for. A snapshot
+                // of a subvolume holds copies of that subvolume's directory
+                // entries, so the root tree lists everything nested in the
+                // original as a child of every snapshot of it too - and those
+                // are the same subvolumes, already walked or collapsed from
+                // where they really live. Taking them again would hang each
+                // subtree under every snapshot.
+                if c.subvols.iter().any(|s| s.id == child_root) {
+                    continue;
+                }
                 let Some(r) = inventory.iter().find(|r| r.treeid == child_root) else {
                     continue;
                 };
