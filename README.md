@@ -174,11 +174,18 @@ references to, to be diffed against the kernel's own answer from
   to read tree blocks one at a time (~150 us per extent) instead of trusting the
   references. What that costs was measured against `--full-scan` on a `/home`
   with 30 snapper snapshots and ~90 container layers: about **13,600 extents,
-  9.8 GiB**, all of them held by a collapsed subvolume whose extent-tree
-  references name no subvolume the scan knows. The loss lands entirely in the
-  snapshot aggregates - every walked subtree's number is identical between the
-  two modes, and so is `owned(root)` minus those bytes.
-  `--full-scan` is the exact answer when that matters.
+  9.8 GiB**, and the loss lands entirely in the snapshot aggregates - every
+  walked subtree's number is identical between the two modes, and so is
+  `owned(root)` minus those bytes. They are *not* the extents the scan reports
+  as unresolvable, which is what one would expect: asking the kernel
+  (`LOGICAL_INO`, which does the full backref walk the extent tree cannot) about
+  the **245,000 largest unresolved extents found not one belonging to a
+  collapsed subvolume**. The mechanism is still open, and `--full-scan` is the
+  exact answer when it matters.
+* `CST_RESOLVE_SECONDS=<n>` spends up to n seconds asking the kernel about the
+  largest unresolved extents - the exact route, for a filesystem where the
+  missing ones are the big ones. Default 0: it costs ~80-400 us per extent and
+  found nothing on the tree above, so it is a knob rather than a default.
 * The ownership rule treats a *snapshot-class* subvolume as one voice: its
   references carry no file birth time (unknown, with the subvolume's creation
   time as the tie-break), so a snapshot owns what the live trees have let go of
