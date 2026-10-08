@@ -74,6 +74,7 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("diff") => cmd_diff(&args[1..]),
         Some("check") => match args.get(1) {
             Some(f) => cmd_check(&PathBuf::from(f)),
             None => {
