@@ -37,8 +37,6 @@ struct InodeRec {
     btime: u32,
     btime_ns: u16,
     referenced: u64,
-    inline_disk: u16,
-    inline_ram: u16,
     first_ref: u32,
     nrefs: u32,
 }
@@ -282,12 +280,8 @@ fn collect_subvolume(
                     return;
                 };
                 if item.kind == BTRFS_FILE_EXTENT_INLINE {
-                    rec.inline_disk = rec
-                        .inline_disk
-                        .saturating_add(item.disk_num_bytes.min(u16::MAX as u64) as u16);
-                    rec.inline_ram = rec
-                        .inline_ram
-                        .saturating_add(item.ram_bytes.min(u16::MAX as u64) as u16);
+                    // The payload lives in metadata, not in an extent: it is
+                    // what the file claims, and nothing a subtree owns.
                     rec.referenced += item.ram_bytes;
                     return;
                 }
@@ -838,8 +832,6 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
             btime: rec.btime,
             btime_ns: rec.btime_ns,
             referenced: rec.referenced,
-            inline_disk: rec.inline_disk,
-            inline_ram: rec.inline_ram,
             first_ref,
             nrefs: rec.nrefs,
             ..Default::default()
@@ -1503,38 +1495,6 @@ fn debug_ownership_stats(
         }
     }
 
-    // Inline extents live in the fs tree, not in the extent tree, so only a
-    // mode that walks a subvolume's tree can see its inline bytes: how much
-    // rides on that is worth knowing before trusting a cross-mode difference.
-    {
-        let mut walked = (0u64, 0u64, 0u64);
-        let mut snaps = (0u64, 0u64, 0u64);
-        for (i, nd) in tree.nodes.iter().enumerate() {
-            if nd.kind != crate::model::KIND_FILE || (nd.inline_disk == 0 && nd.inline_ram == 0) {
-                continue;
-            }
-            let (_, _, _, sv) = node_key(tree, i as u32, subvol_otime);
-            let t = if tree.subvols[sv as usize].snapshot {
-                &mut snaps
-            } else {
-                &mut walked
-            };
-            t.0 += 1;
-            t.1 += nd.inline_disk as u64;
-            t.2 += nd.inline_ram as u64;
-        }
-        eprintln!(
-            "[own] inline: walked subvolumes {} files, {:.3} GiB disk, {:.3} GiB ram; \
-             snapshot-class {} files, {:.3} GiB disk, {:.3} GiB ram",
-            walked.0,
-            walked.1 as f64 / 1073741824.0,
-            walked.2 as f64 / 1073741824.0,
-            snaps.0,
-            snaps.1 as f64 / 1073741824.0,
-            snaps.2 as f64 / 1073741824.0
-        );
-    }
-
     // Are the credited bytes reachable from the roots the report walks? A node
     // that no root's traversal reaches holds owned bytes that never roll into
     // the scanned root's total.
@@ -1632,14 +1592,19 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     let started = std::time::Instant::now();
     // Per-phase timing on stderr: which part of a scan the seconds go to.
     let mut t_phase = std::time::Instant::now();
+    // Development aid, silent unless CST_TIME is set: where a scan's time goes,
+    // phase by phase, on stderr.
+    let show_phases = std::env::var_os("CST_TIME").is_some();
     macro_rules! phase {
         ($name:expr) => {{
-            eprintln!(
-                "[time] {:<24} {:8.2}s (total {:.2}s)",
-                $name,
-                t_phase.elapsed().as_secs_f64(),
-                started.elapsed().as_secs_f64()
-            );
+            if show_phases {
+                eprintln!(
+                    "[time] {:<24} {:8.2}s (total {:.2}s)",
+                    $name,
+                    t_phase.elapsed().as_secs_f64(),
+                    started.elapsed().as_secs_f64()
+                );
+            }
             t_phase = std::time::Instant::now();
         }};
     }
@@ -1976,124 +1941,4 @@ pub fn probe_extent_tree(fd: i32) -> io::Result<(u64, u64, u64, u64, u64, Vec<(u
     let mut roots: Vec<(u64, u64)> = per_root.into_iter().collect();
     roots.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     Ok((extents, bytes, refs, shared, metadata_extents, roots))
-}
-
-/// Development aid: for a sample of data extents, what the block-reference
-/// graph resolves their references to - to be diffed against the kernel's own
-/// `LOGICAL_INO` answer for the same bytenrs.
-pub fn probe_resolve(fd: i32, sample: usize, only: &[u64]) -> io::Result<()> {
-    let mut g = BlockRefs {
-        index: HashMap::new(),
-        refs: Vec::new(),
-        memo: HashMap::new(),
-    };
-    collect_block_refs(fd, &mut g)?;
-    eprintln!("block graph: {} blocks, {} references", g.index.len(), g.refs.len());
-
-    let mut out: Vec<String> = Vec::new();
-    let mut seen = 0usize;
-    let mut cur = u64::MAX;
-    let mut cur_len = 0u64;
-    let mut cur_refs: Vec<(u32, u64)> = Vec::new();
-    let mut flush = |cur: u64, len: u64, refs: &Vec<(u32, u64)>, out: &mut Vec<String>| {
-        if refs.is_empty() {
-            return;
-        }
-        let mut parts: Vec<String> = Vec::new();
-        for &(ty, v) in refs.iter() {
-            if ty == 178 {
-                parts.push(format!("dref {v}"));
-            } else {
-                parts.push(format!("parent {v}"));
-            }
-        }
-        out.push(format!("{cur} {len} {}", parts.join(" ")));
-    };
-    btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, key_off, payload| {
-        if bytenr != cur {
-            let wanted = only.is_empty() || only.contains(&cur);
-            if cur_refs.len() > 0 && (wanted || (only.is_empty() && seen % sample == 0)) {
-                flush(cur, cur_len, &cur_refs, &mut out);
-            }
-            if cur_refs.len() > 0 {
-                seen += 1;
-            }
-            cur = bytenr;
-            cur_len = key_off;
-            cur_refs.clear();
-        }
-        match ty {
-            btrfs::BTRFS_EXTENT_ITEM_KEY | btrfs::BTRFS_METADATA_ITEM_KEY => {
-                let Some(h) = btrfs::parse_extent_item_hdr(payload) else {
-                    return;
-                };
-                if btrfs::is_metadata_extent(ty, &h) {
-                    return;
-                }
-                btrfs::for_each_inline_ref(ty, payload, &mut |ty, body| match ty {
-                    btrfs::BTRFS_EXTENT_DATA_REF_KEY => {
-                        let root = u64::from_le_bytes(body[..8].try_into().unwrap());
-                        cur_refs.push((178, root));
-                    }
-                    btrfs::BTRFS_SHARED_DATA_REF_KEY => {
-                        if let Some(s) = btrfs::parse_shared_data_ref(body) {
-                            cur_refs.push((184, s.parent));
-                        }
-                    }
-                    _ => {}
-                });
-            }
-            _ => {}
-        }
-    })?;
-    flush(cur, cur_len, &cur_refs, &mut out);
-    for line in &out {
-        let f: Vec<&str> = line.split(' ').collect();
-        let mut roots: Vec<u64> = Vec::new();
-        let mut i = 2;
-        while i + 1 < f.len() {
-            let value: u64 = f[i + 1].parse().unwrap();
-            if f[i] == "dref" {
-                roots.push(value);
-            } else {
-                roots.extend(g.roots_of(value));
-            }
-            i += 2;
-        }
-        roots.sort_unstable();
-        roots.dedup();
-        println!("{} {} {:?}", f[0], f[1], roots);
-    }
-    Ok(())
-}
-
-/// Development aid: what a type-restricted sweep of a subvolume costs against
-/// the full enumeration the M2 walk does. This is the number that decides how
-/// expensive "collapse the snapshots" is.
-pub fn probe_sweep(fd: i32, root_id: u64) -> io::Result<()> {
-    let t = std::time::Instant::now();
-    let (mut items, mut bytes) = (0u64, 0u64);
-    btrfs::for_each_fs_item(fd, root_id, &mut |_o, _t, _k, p| {
-        items += 1;
-        bytes += p.len() as u64;
-    })?;
-    let full = t.elapsed();
-    let t = std::time::Instant::now();
-    let (mut eitems, mut ebytes) = (0u64, 0u64);
-    btrfs::for_each_fs_item_typed(fd, root_id, btrfs::BTRFS_EXTENT_DATA_KEY, &mut |_o, ty, _k, p| {
-        if ty == btrfs::BTRFS_EXTENT_DATA_KEY {
-            eitems += 1;
-            ebytes += p.len() as u64;
-        }
-    })?;
-    let typed = t.elapsed();
-    println!(
-        "subvolume {root_id}: full sweep {items} items {:.1} MiB in {:.2}s; EXTENT_DATA only {eitems} items {:.1} MiB in {:.2}s ({:.0}% of the time)",
-        bytes as f64 / 1048576.0,
-        full.as_secs_f64(),
-        ebytes as f64 / 1048576.0,
-        typed.as_secs_f64(),
-        100.0 * typed.as_secs_f64() / full.as_secs_f64().max(1e-9)
-    );
-    Ok(())
 }

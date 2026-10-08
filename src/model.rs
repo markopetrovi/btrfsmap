@@ -35,7 +35,7 @@ pub const NO_NODE: u32 = u32::MAX;
 
 const _: () = {
     assert!(std::mem::size_of::<Node>() == 72);
-    assert!(std::mem::size_of::<DirExtra>() == 64);
+    assert!(std::mem::size_of::<DirExtra>() == 48);
 };
 
 #[derive(Clone, Copy, Default)]
@@ -54,10 +54,15 @@ pub struct Node {
     pub referenced: u64,
     pub uncomp: u64,
     pub name_len: u16,
-    pub inline_disk: u16,
+    /// declared where inline payload sizes used to live: they are metadata, not
+    /// data, and are no longer part of the model. Kept as declared padding so
+    /// the layout stays fixed and compiler padding (which is not zeroed) never
+    /// reaches the cache file.
+    pub _pad2: u16,
     pub kind: u8,
     pub flags: u8,
-    pub inline_ram: u16,
+    /// the other half of the same, where the inline ram size was
+    pub _pad3: u16,
     /// inode creation time (unix seconds): with the subvolume's age this is the
     /// ownership key - the oldest holder of an extent owns it
     pub btime: u32,
@@ -83,8 +88,6 @@ pub struct DirExtra {
     pub nfiles: u64,
     pub ndirs: u64,
     /// inline extents live in metadata and are always private to one file.
-    pub inline_disk_sub: u64,
-    pub inline_ram_sub: u64,
     pub subvol: u16,
     pub depth: u16,
     pub _pad: u32,
@@ -221,15 +224,13 @@ impl Tree {
             e.assigned = 0;
         }
         for i in 0..self.nodes.len() {
-            let (kind, nrefs, first_ref, block, inline_disk, inline_ram, btime, btime_ns, parent, flags) = {
+            let (kind, nrefs, first_ref, block, btime, btime_ns, parent, flags) = {
                 let n = &self.nodes[i];
                 (
                     n.kind,
                     n.nrefs as usize,
                     n.first_ref as usize,
                     n.extra as usize,
-                    n.inline_disk as u64,
-                    n.inline_ram as u64,
                     n.btime,
                     n.btime_ns,
                     n.parent,
@@ -267,9 +268,11 @@ impl Tree {
                 };
                 *subvol_otime.get(sv as usize).unwrap_or(&0)
             };
-            // Inline payloads are private to this file and need no splitting.
-            let mut owned = inline_disk;
-            let mut uncomp = inline_ram;
+            // Inline payloads are metadata, not data: they are not part of
+            // what a subtree owns or would free, they only show up in what the
+            // file claims (`referenced`, which the walk counts).
+            let mut owned = 0u64;
+            let mut uncomp = 0u64;
             for r in &refs[ref_block][first_ref..first_ref + nrefs] {
                 let Some(e) = extents.get_mut(&((*r >> 32) as u32)) else {
                     continue;
@@ -445,21 +448,12 @@ impl Tree {
                 let pd = &mut self.dirs[p.extra as usize];
                 pd.nfiles += cd.nfiles;
                 pd.ndirs += cd.ndirs + 1;
-                pd.inline_disk_sub += cd.inline_disk_sub + child.inline_disk as u64;
-                pd.inline_ram_sub += cd.inline_ram_sub + child.inline_ram as u64;
+
             } else {
                 let pd = &mut self.dirs[p.extra as usize];
                 pd.nfiles += 1;
-                pd.inline_disk_sub += child.inline_disk as u64;
-                pd.inline_ram_sub += child.inline_ram as u64;
+
             }
-        }
-        // inline payloads are private, so they also count as reach and as
-        // freeable for every directory above them
-        for d in self.dirs.iter_mut() {
-            d.compsize += d.inline_disk_sub;
-            d.freeable += d.inline_disk_sub;
-            d.uncomp_reach += d.inline_ram_sub;
         }
     }
 }

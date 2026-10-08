@@ -319,8 +319,6 @@ fn scan_file(
     };
 
     let mut referenced = 0u64;
-    let mut inline_disk = 0u32;
-    let mut inline_ram = 0u32;
     let mut overflow = false;
 
     let Worker {
@@ -332,10 +330,8 @@ fn scan_file(
     let first_ref = refs.len() as u32;
     let res = searcher.for_each_extent(fd, ino, &mut |item: &ExtentItem| {
         if item.kind == BTRFS_FILE_EXTENT_INLINE {
-            // Inline payloads live in metadata, are never shared, and compsize
-            // counts them per file: add them straight to this file.
-            inline_disk = inline_disk.saturating_add(item.disk_num_bytes as u32);
-            inline_ram = inline_ram.saturating_add(item.ram_bytes as u32);
+            // The payload lives in metadata, not in an extent: what the file
+            // claims, and nothing a subtree owns.
             referenced += item.ram_bytes;
             return;
         }
@@ -399,8 +395,6 @@ fn scan_file(
         btime,
         btime_ns,
         referenced,
-        inline_disk: inline_disk.min(u16::MAX as u32) as u16,
-        inline_ram: inline_ram.min(u16::MAX as u32) as u16,
         kind: KIND_FILE,
         flags,
         ..Default::default()

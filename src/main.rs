@@ -74,60 +74,6 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Some("resolve-probe") => match args.get(1) {
-            Some(p) => {
-                let f = match std::fs::File::open(p) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("{p}: {e}");
-                        return ExitCode::from(1);
-                    }
-                };
-                let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
-                let sample: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-                let only: Vec<u64> = args
-                    .iter()
-                    .skip(2)
-                    .filter_map(|s| s.parse::<u64>().ok())
-                    .filter(|v| *v > 1_000_000)
-                    .collect();
-                match metadata::probe_resolve(fd, sample.max(1), &only) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        eprintln!("resolve probe failed: {e}");
-                        ExitCode::from(1)
-                    }
-                }
-            }
-            None => {
-                eprintln!("resolve-probe needs a path inside the filesystem");
-                ExitCode::from(2)
-            }
-        },
-        Some("sweep-probe") => match args.get(1) {
-            Some(p) => {
-                let f = match std::fs::File::open(p) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("{p}: {e}");
-                        return ExitCode::from(1);
-                    }
-                };
-                let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
-                match btrfs::get_subvol_info(fd).and_then(|i| metadata::probe_sweep(fd, i.treeid)) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        eprintln!("sweep probe failed: {e}");
-                        ExitCode::from(1)
-                    }
-                }
-            }
-            None => {
-                eprintln!("sweep-probe needs a subvolume path");
-                ExitCode::from(2)
-            }
-        },
-        Some("diff") => cmd_diff(&args[1..]),
         Some("check") => match args.get(1) {
             Some(f) => cmd_check(&PathBuf::from(f)),
             None => {

@@ -165,21 +165,22 @@ references to, to be diffed against the kernel's own answer from
   that was not walked is credited here. `scan` warns when it can see snapshots
   of a scanned subvolume outside the scanned paths. Scanning `/` (the default)
   avoids this entirely.
-* **A collapsed snapshot's numbers are an aggregate, exact apart from the
-  inline data of the subvolumes that are not walked.** Its references and
-  extents come from the extent tree, which records everything a collapsed
-  subvolume holds - subvolumes nested inside it included, since those are found
-  through the root tree (`ROOT_BACKREF`) and their own trees are read - with
-  one exception: an extent item does not exist for an *inline* payload, a file
-  small enough to live in its inode's own tree block, so it cannot be recovered
-  from the extent tree at all. On the tree measured (`/home`) that is
-  **8.4 GiB of 606 GiB**, and subtracting those bytes from the full scan's
-  `owned` reproduces the collapsed figure; the same inline
-  bytes account for most of the uncompressed gap (679 GiB collapsed against
-  702 GiB with `--full-scan`), the rest being the `ram = len` fallback on
-  snapshot-only extents. Apart from that, the fast scan's aggregate is exact:
-  every walked subtree's numbers are the same in both modes. Use `--full-scan`
-  when the interiors of the collapsed subvolumes matter.
+* **Inline payloads are not counted.** A file small enough to live inside its
+  own inode's item - an *inline* extent - is stored in metadata, not in a data
+  extent, so there is no extent item for it anywhere. It is not data usage, and
+  counting it would mean also counting xattrs and directory items, which is
+  metadata accounting this tool does not do. Inline bytes therefore appear only
+  in `referenced` (what the file claims), never in `owned`, `compsize`,
+  `freeable` or `uncompressed`. The one place they are counted as usage is
+  `report`, which reproduces `compsize` byte for byte and compsize counts them.
+
+  Everything else in a collapsed subvolume *is* accounted for: its references
+  come from the extent tree, and subvolumes nested inside it are found through
+  the root tree (`ROOT_BACKREF`) and have their own trees read. So the fast
+  scan's aggregate is exact apart from the interiors being unbrowsable, and the
+  two modes agree - on the tree measured (`/home`), `owned` came out within
+  140 KB of each other at 597 GiB. Use `--full-scan` when the interiors of the
+  collapsed subvolumes matter.
 * `CST_RESOLVE_SECONDS=<n>` spends up to n seconds asking the kernel about the
   largest unresolved extents - the exact route, for a filesystem where the
   missing ones are the big ones. Default 0: it costs ~80-400 us per extent and

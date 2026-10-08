@@ -1,3 +1,4 @@
 /target
 /.scratch
 docs/*handoff*.md
+.claude/

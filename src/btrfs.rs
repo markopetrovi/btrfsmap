@@ -247,7 +247,6 @@ impl Searcher {
                 return Err(io::Error::last_os_error());
             }
             let nr_items = u32::from_ne_bytes(self.buf[64..68].try_into().unwrap()) as usize;
-            let _dbg = std::env::var_os("CST_PAGE_DEBUG").is_some();
 
             let items = &self.buf[SEARCH_ARGS_V2_SIZE..];
             let mut pos = 0usize;
