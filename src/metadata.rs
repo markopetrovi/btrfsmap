@@ -717,7 +717,16 @@ fn push_collapsed_node(
     idx
 }
 
-fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32>) {
+fn build(
+    c: &mut Collector,
+    roots: &[Root],
+    excludes: &[Vec<u8>],
+) -> (Tree, Vec<u64>, HashMap<u64, u32>) {
+    // `--exclude` is a path prefix, as in the file walker: an excluded node is
+    // not placed and its subtree is not descended, so its references never
+    // enter the map and extents it shares look exclusive to what remains. The
+    // paths are only built when there is something to compare against.
+    let filter = !excludes.is_empty();
     let mut tree = Tree {
         nodes: Vec::new(),
         names: Vec::new(),
@@ -786,9 +795,10 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
     // visited once and its children appended as one batch, then the child
     // directories are visited in turn - which is the order the file backend's
     // BFS produces, children sorted by name.
-    let mut dirs: VecDeque<(usize, u64, u32)> = VecDeque::new();
+    // (collected subvolume, inode, node, path - the last empty unless filtering)
+    let mut dirs: VecDeque<(usize, u64, u32, Vec<u8>)> = VecDeque::new();
     // synthetic root's children: the paths given on the command line
-    let mut root_queue: Vec<(usize, u64, Vec<u8>, u8)> = Vec::new();
+    let mut root_queue: Vec<(usize, u64, Vec<u8>, u8, Vec<u8>)> = Vec::new();
     for root in roots {
         let Some(ci) = c.subs.iter().position(|s| s.subvol == root.subvol) else {
             continue;
@@ -808,7 +818,8 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
         if s.is_readonly() {
             flags |= FLAG_READONLY;
         }
-        root_queue.push((ci, root.inode, name, flags));
+        let path = if filter { root.path.clone() } else { Vec::new() };
+        root_queue.push((ci, root.inode, name, flags, path));
     }
 
     // helper closure: append one node
@@ -860,7 +871,7 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
     // append the roots as the synthetic root's batch
     {
         let first = tree.nodes.len() as u32;
-        for (ci, inode, name, flags) in root_queue {
+        for (ci, inode, name, flags, root_path) in root_queue {
             let Ok(pos) = c.subs[ci].recs.binary_search_by_key(&inode, |r| r.inode) else {
                 continue;
             };
@@ -880,7 +891,8 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
                     ..Default::default()
                 });
                 tree.nodes[idx as usize].extra = extra;
-                dirs.push_back((ci, inode, idx));
+                let p = if filter { root_path.clone() } else { Vec::new() };
+                dirs.push_back((ci, inode, idx, p));
             }
         }
         let n = tree.nodes.len() as u32 - first;
@@ -890,11 +902,11 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
         tree.roots = root_nodes.clone();
     }
 
-    while let Some((ci, inode, node_idx)) = dirs.pop_front() {
+    while let Some((ci, inode, node_idx, dir_path)) = dirs.pop_front() {
         let first_child = tree.nodes.len() as u32;
         // gather this directory's children first: pushing nodes borrows the
         // collector mutably, so nothing may hold a borrow of its entries
-        let mut kids: Vec<(usize, u64, Vec<u8>, u8, Option<u16>)> = Vec::new();
+        let mut kids: Vec<(usize, u64, Vec<u8>, u8, Option<u16>, Vec<u8>)> = Vec::new();
         {
             let entries = &c.subs[ci].entries;
             let names = &c.subs[ci].names;
@@ -915,7 +927,20 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
                         if let Some(&(_, subvol, _)) =
                             c.collapsed.iter().find(|(r, _, _)| r == root_id)
                         {
-                            kids.push((usize::MAX, 0, child_name, 0, Some(subvol)));
+                            let child_path = if filter {
+                                let mut p = dir_path.clone();
+                                if !p.ends_with(b"/") {
+                                    p.push(b'/');
+                                }
+                                p.extend_from_slice(&child_name);
+                                if excluded(&p, excludes) {
+                                    continue;
+                                }
+                                p
+                            } else {
+                                Vec::new()
+                            };
+                            kids.push((usize::MAX, 0, child_name, 0, Some(subvol), child_path));
                             continue;
                         }
                         match c
@@ -942,10 +967,23 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
             } else {
                 (ci, e.child, 0, None)
             };
-            kids.push((child_ci, child_inode, child_name, child_flags, collapsed));
+            let child_path = if filter {
+                let mut p = dir_path.clone();
+                if !p.ends_with(b"/") {
+                    p.push(b'/');
+                }
+                p.extend_from_slice(&child_name);
+                if excluded(&p, excludes) {
+                    continue;
+                }
+                p
+            } else {
+                Vec::new()
+            };
+            kids.push((child_ci, child_inode, child_name, child_flags, collapsed, child_path));
         }
         }
-        for (child_ci, child_inode, child_name, child_flags, collapsed) in kids {
+        for (child_ci, child_inode, child_name, child_flags, collapsed, child_path) in kids {
             // depth comes from the parent, which is already placed
             let depth = if node_idx == 0 {
                 1
@@ -996,7 +1034,17 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
                         ..Default::default()
                     });
                     tree.nodes[gidx as usize].extra = gd;
-                    dirs.push_back((child_ci, inode, gidx));
+                    let gp = if filter {
+                        let mut p = child_path.clone();
+                        if !p.ends_with(b"/") {
+                            p.push(b'/');
+                        }
+                        p.extend_from_slice(&gname);
+                        p
+                    } else {
+                        Vec::new()
+                    };
+                    dirs.push_back((child_ci, inode, gidx, gp));
                 }
                 let n = tree.nodes.len() as u32 - first;
                 tree.nodes[idx as usize].first_child = first;
@@ -1021,7 +1069,7 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
                     ..Default::default()
                 });
                 tree.nodes[idx as usize].extra = extra;
-                dirs.push_back((child_ci, child_inode, idx));
+                dirs.push_back((child_ci, child_inode, idx, child_path));
             }
         }
         let n = tree.nodes.len() as u32 - first_child;
@@ -1693,7 +1741,7 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     }
     phase!("collect_all (fs-tree walks)");
 
-    let (mut tree, final_refs, collapsed_nodes) = build(&mut c, &roots);
+    let (mut tree, final_refs, collapsed_nodes) = build(&mut c, &roots, &opts.excludes);
     tree.inventory = inv.clone();
     // the assembled array, whose references name their owner node
     let mut final_refs = final_refs;

@@ -100,7 +100,7 @@ The UI footer reports the cache size and offers to delete it.
 |---|---|
 | `-j, --threads N` | worker threads (default: CPUs) |
 | `-L, --follow-symlinks` | follow symlinks found while walking (off: matches compsize) |
-| `--exclude PATH` | skip a path prefix; extents shared with it will look exclusive to what remains |
+| `--exclude PATH` | skip a path prefix; extents shared with it will look exclusive to what remains. Excluding a whole subvolume also skips *reading* it, which inside a snapshot is the difference between a sweep and nothing |
 | `--save FILE` | also write the scan to FILE, so the app can open it later |
 | `--compress` | compress the saved scan (3-5x smaller) |
 | `--buffer BYTES` | kernel search buffer per thread (default 1 MiB; larger is faster on files with millions of extents) |
@@ -152,6 +152,13 @@ cmp /tmp/a.cst /tmp/b.cst
 unchanged tree byte-identical. Pass `--full-scan` on both sides when the tree has
 snapshot-class subvolumes: the collapsed scan is deliberately a different, aggregate
 tree, so it is compared on its numbers instead (see Limits).
+
+With `--exclude`, the two implementations agree on every number the report shows and
+on the tree they build, but not byte for byte: the tree reader reads a subvolume's
+items in one sweep, so an excluded directory inside one has already been read - its
+nodes and references are dropped, and the extents it alone held come out unowned, but
+its internal extent count still says the scan saw them. Excluding a whole subvolume is
+exact, because it is skipped before anything is read.
 
 `compsize-tree diff A.cst B.cst [--top N]` prints where two scans disagree, by path,
 largest first. `extent-probe PATH` reports what one pass over the extent tree sees -
