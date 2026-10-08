@@ -4,7 +4,7 @@
 //! Written by `scan` (running as root), read by `serve` (unprivileged).
 
 use crate::model::*;
-use crate::walk::ScanStats;
+use crate::scan::ScanStats;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;

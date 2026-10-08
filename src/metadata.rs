@@ -19,9 +19,10 @@ use crate::btrfs::{
     self, BTRFS_DIR_INDEX_KEY, BTRFS_EXTENT_DATA_KEY, BTRFS_FILE_EXTENT_INLINE, BTRFS_INODE_ITEM_KEY,
 };
 use crate::model::*;
-use crate::walk::{ScanOptions, ScanStats};
+use crate::scan::{Progress, ScanOptions, ScanStats};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::ffi::OsStrExt;
+use std::sync::atomic::Ordering;
 use std::io;
 
 pub const DT_DIR: u8 = 4;
@@ -198,6 +199,7 @@ fn collect_subvolume(
     root_id: u64,
     subvol: u16,
     scope: Option<&HashSet<u64>>,
+    live: Option<&Progress>,
 ) -> io::Result<Collected> {
     let in_scope = |inode: u64| scope.map(|s| s.contains(&inode)).unwrap_or(true);
     // References from inside a snapshot-class subvolume carry no birth time -
@@ -241,6 +243,14 @@ fn collect_subvolume(
                 };
                 if same {
                     return;
+                }
+                // Live counters for a GUI: one per inode, so the counts move as
+                // the tree is read rather than only when a subvolume ends.
+                if let Some(l) = live {
+                    match item.mode & btrfs::S_IFMT {
+                        btrfs::S_IFDIR => l.dirs.fetch_add(1, Ordering::Relaxed),
+                        _ => l.files.fetch_add(1, Ordering::Relaxed),
+                    };
                 }
                 cur = Some(InodeRec {
                     inode: obj,
@@ -1068,6 +1078,7 @@ fn collect_all(
     inventory: &[btrfs::RootItem],
     start: &Root,
     excludes: &[Vec<u8>],
+    live: Option<&Progress>,
 ) -> io::Result<()> {
     // (root id, subvol index, path, whether to read its fs tree). A collapsed
     // subvolume is still *visited*, to find what lives inside it - just not
@@ -1076,6 +1087,16 @@ fn collect_all(
         vec![(start.info.treeid, start.subvol, start.path.clone(), true)];
     let mut done: Vec<u64> = Vec::new();
     while let Some((root_id, subvol, path, read_tree)) = work.pop() {
+        // A GUI can cancel between subvolumes; the reads themselves cannot be
+        // interrupted, since the kernel answers each fs-tree search whole.
+        if let Some(l) = live {
+            if l.cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
+            let mut cur = l.current.lock().unwrap();
+            cur.clear();
+            cur.extend_from_slice(&path[..path.len().min(160)]);
+        }
         if done.contains(&root_id) {
             continue;
         }
@@ -1135,7 +1156,7 @@ fn collect_all(
                 None
             };
         let t_sub = std::time::Instant::now();
-        let col = collect_subvolume(c, fd, root_id, subvol, scope.as_ref())?;
+        let col = collect_subvolume(c, fd, root_id, subvol, scope.as_ref(), live)?;
         if std::env::var_os("CST_TIME_SUBVOL").is_some() {
             let s = &c.subvols[subvol as usize];
             eprintln!(
@@ -1586,8 +1607,8 @@ fn debug_ownership_stats(
     }
 }
 
-/// Scan by reading the trees: identical results to `walk::scan_tree`, without
-/// visiting a single file.
+/// Scan by reading the trees: byte-identical to the retired file walker,
+/// without visiting a single file.
 pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     let started = std::time::Instant::now();
     // Per-phase timing on stderr: which part of a scan the seconds go to.
@@ -1609,6 +1630,10 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         }};
     }
     let mut stats = ScanStats::default();
+    let live = opts.live.clone();
+    if let Some(l) = &live {
+        l.running.store(true, Ordering::SeqCst);
+    }
     let mut c = Collector {
         extents: ExtentMap::new(),
         refs: Vec::new(),
@@ -1649,7 +1674,7 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     phase!("inventory + roots");
     let t_collect = std::time::Instant::now();
     for root in &roots {
-        collect_all(&mut c, fd, &inv, root, &opts.excludes)?;
+        collect_all(&mut c, fd, &inv, root, &opts.excludes, live.as_deref())?;
     }
     if std::env::var_os("CST_TIME_SUBVOL").is_some() {
         eprintln!(
@@ -1818,6 +1843,9 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     phase!("attribute_reach");
     tree.rollup();
     phase!("rollup");
+    if let Some(l) = &live {
+        l.running.store(false, Ordering::SeqCst);
+    }
     Ok((tree, stats))
 }
 

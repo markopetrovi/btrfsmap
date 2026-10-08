@@ -138,11 +138,13 @@ buffer.
 ## Verifying a change
 
 The file walker is the reference implementation: what the tree reader produces has
-to match it byte for byte. Scan the same tree with both and compare the caches:
+to match it byte for byte. It no longer ships in this tree - the
+`deprecated-files-backend` branch keeps it, and its binary is kept around as the
+gate. Scan the same tree with both and compare the caches:
 
 ```
 sudo compsize-tree scan --full-scan --save /tmp/a.cst --reproducible PATH
-sudo CST_BACKEND=files compsize-tree scan --save /tmp/b.cst --reproducible PATH
+sudo /tmp/cst-old-files scan --save /tmp/b.cst --reproducible PATH
 cmp /tmp/a.cst /tmp/b.cst
 ```
 
@@ -192,8 +194,9 @@ references to, to be diffed against the kernel's own answer from
   Its files' birth times are deliberately ignored there: a reflink copy and a
   rename are enough to hand a live file a younger inode, which would otherwise
   move ownership of data that never went anywhere to a snapshot. The rule is the
-  same in all three walkers, so the file backend and the tree reader agree.
-* The file backend finds a handful of files the tree reader does not (4 of
+  same in the file walker and the tree reader, so the reference scan and this
+  one agree.
+* The file walker finds a handful of files the tree reader does not (4 of
   /home's 38M, 78 MB): they live in a subvolume the root-tree backref walk does
   not reach. It shows up as a `~78 MB` difference in `owned` for one subtree,
   and it predates the collapsed scan.
@@ -204,13 +207,15 @@ references to, to be diffed against the kernel's own answer from
 * A scan is a snapshot in time; files changing during it are counted once, as
   seen.
 * Non-btrfs filesystems inside the tree (loop mounts, overlayfs, `/boot`) are
-  detected and skipped, and counted in the summary. So is a *different* btrfs
-  filesystem mounted inside the scanned tree: extent addresses are only unique
-  within one filesystem, so mixing two would corrupt the dedup. The check uses
-  the btrfs superblock UUID (`BTRFS_IOC_FS_INFO`), which is per filesystem and
-  stable - not `statfs`'s `f_fsid`, which varies per subvolume. Scanning such a
-  filesystem works by starting the scan there, and the summary says how many
-  were skipped.
+  never entered: the scan follows btrfs fs trees, and those hold only this
+  filesystem's own files, so nothing under such a mount is read or counted.
+  That is also what keeps a *different* btrfs filesystem mounted inside the
+  scanned tree out of the dedup: its subvolumes are not in this filesystem's
+  root tree, and extent addresses are only unique within one filesystem.
+  Scanning such a filesystem works by starting the scan there. (The retired
+  file walker had to detect this with `BTRFS_IOC_FS_INFO`, since it walked
+  paths rather than trees; those stats are still in the cache layout and read
+  zero.)
 * A subvolume reachable through more than one mount point is walked once, so
   its files do not gain a second reference.
 * Symlinks are skipped unless `--follow-symlinks`; hardlinked paths are counted
@@ -238,13 +243,17 @@ references to, to be diffed against the kernel's own answer from
 
 ## Implementation notes
 
-The scanner is std-only Rust; the browser is GTK4 (gtk4-rs). Per file it asks the kernel for the inode's
-`EXTENT_DATA` items with `BTRFS_IOC_TREE_SEARCH_V2`, exactly like compsize,
-and reads the packed `btrfs_file_extent_item` layout directly. One `statx` per file supplies the
-inode, mtime and birth time the ownership rule needs; that replaced `fstat`, and the ioctl reuses the
-containing directory's descriptor (it only needs *a* descriptor from the file's subvolume, since the
-inode number travels in the search key), so a file costs two syscalls instead of four. Subvolume
-identity comes from `BTRFS_IOC_GET_SUBVOL_INFO` at `st_dev` boundaries plus a
-root-tree scan for the UUID inventory, so snapshots are recognised
-structurally rather than by path convention. Compression, inline extents,
-prealloc and holes are all accounted the way compsize accounts them.
+The scanner is std-only Rust; the browser is GTK4 (gtk4-rs). The scan reads the
+filesystem's own trees with `BTRFS_IOC_TREE_SEARCH_V2`: `INODE_ITEM` (mode,
+size, mtime and birth time), `DIR_INDEX` (the directory structure) and
+`EXTENT_DATA` (the extents) out of each subvolume's fs tree, and the root tree's
+`ROOT_ITEM` records for the UUID inventory - so no file is `statx`ed, opened or
+even named by the kernel on its behalf. Subvolume identity comes from
+`BTRFS_IOC_GET_SUBVOL_INFO`, so snapshots are recognised structurally rather
+than by path convention. Compression, inline extents, prealloc and holes are all
+accounted the way compsize accounts them.
+
+`report` keeps the file walk: it is the compsize-compatible verifier, so it
+works one path at a time, asks the kernel for that inode's `EXTENT_DATA` items
+and reads the packed `btrfs_file_extent_item` layout directly, exactly like
+compsize.

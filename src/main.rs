@@ -11,7 +11,7 @@ mod listmodel;
 mod metadata;
 mod model;
 mod report;
-mod walk;
+mod scan;
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
@@ -350,7 +350,7 @@ fn cmd_report(args: &[String]) -> ExitCode {
 }
 
 fn cmd_scan(args: &[String]) -> ExitCode {
-    let mut opts = walk::ScanOptions::default();
+    let mut opts = scan::ScanOptions::default();
     let mut depth = 2usize;
     let mut top = 12usize;
     let mut files = 0usize;
@@ -446,16 +446,9 @@ fn cmd_scan(args: &[String]) -> ExitCode {
     }
 
     let started = Instant::now();
-    // Reading the trees is the default: it is byte-identical to the file walk
-    // (the cowdiff gate) and 2.5x faster. CST_BACKEND=files selects the file
-    // walker, which is what the gate compares against and what `report` uses.
-    let backend = std::env::var("CST_BACKEND").unwrap_or_default();
-    let scan_result = if backend == "files" {
-        walk::scan_tree(&opts)
-    } else {
-        metadata::scan_tree(&opts)
-    };
-    let (tree, stats) = match scan_result {
+    // Reading the trees is the implementation: it is byte-identical to the
+    // retired file walker and about 2.5x faster.
+    let (tree, stats) = match metadata::scan_tree(&opts) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("scan failed: {e}");

@@ -358,9 +358,6 @@ pub const BTRFS_ROOT_TREE_OBJECTID: u64 = 1;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RootItem {
     pub treeid: u64,
-    /// logical address of the subvolume's fs-tree root node; the anchor the
-    /// extent tree's block references can be followed down from
-    pub bytenr: u64,
     pub flags: u64,
     pub uuid: [u8; 16],
     pub parent_uuid: [u8; 16],
@@ -370,7 +367,6 @@ pub struct RootItem {
 
 // Offsets inside the packed struct, checked against the C compiler.
 const OFF_ROOT_GENERATION: usize = 160;
-const OFF_ROOT_BYTENR: usize = 176;
 const OFF_ROOT_FLAGS: usize = 208;
 const OFF_ROOT_GENERATION_V2: usize = 239;
 const OFF_ROOT_UUID: usize = 247;
@@ -386,7 +382,6 @@ fn parse_root_item(p: &[u8], treeid: u64) -> Option<RootItem> {
     let u64_at = |off: usize| u64::from_le_bytes(p[off..off + 8].try_into().unwrap());
     let mut item = RootItem {
         treeid,
-        bytenr: u64_at(OFF_ROOT_BYTENR),
         flags: u64_at(OFF_ROOT_FLAGS),
         otime_sec: if p.len() >= OFF_ROOT_OTIME + 12 {
             u64_at(OFF_ROOT_OTIME)
@@ -428,130 +423,11 @@ pub fn list_subvolumes(fd: i32) -> io::Result<Vec<RootItem>> {
 }
 
 // ---------------------------------------------------------------------------
-// statx: one call per file that yields inode, mode, mtime and birth time
+// inode modes: what an INODE_ITEM's `mode` word is classified by
 // ---------------------------------------------------------------------------
-
-extern "C" {
-    fn statx(dirfd: i32, pathname: *const i8, flags: i32, mask: u32, buf: *mut Statx) -> i32;
-}
-
-pub const AT_FDCWD: i32 = -100;
-pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
-const STATX_BASIC_STATS: u32 = 0x7ff;
-pub const STATX_BTIME: u32 = 0x800;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct StatxTimestamp {
-    tv_sec: i64,
-    tv_nsec: u32,
-    _reserved: i32,
-}
-
-/// struct statx, 256 bytes; offsets checked against the C compiler.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Statx {
-    mask: u32,
-    blksize: u32,
-    attributes: u64,
-    nlink: u32,
-    uid: u32,
-    gid: u32,
-    mode: u16,
-    _spare0: u16,
-    ino: u64,
-    size: u64,
-    blocks: u64,
-    attributes_mask: u64,
-    atime: StatxTimestamp,
-    btime: StatxTimestamp,
-    ctime: StatxTimestamp,
-    mtime: StatxTimestamp,
-    rdev_major: u32,
-    rdev_minor: u32,
-    dev_major: u32,
-    dev_minor: u32,
-    mnt_id: u64,
-    dio_mem_align: u32,
-    dio_offset_align: u32,
-    _spare3: [u64; 12],
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct StatInfo {
-    pub ino: u64,
-    /// S_IFMT bits
-    pub mode: u16,
-    pub mtime: u64,
-    /// inode creation time; the ownership rule's primary key
-    pub btime: u64,
-    /// sub-second part, in nanoseconds
-    pub btime_ns: u32,
-    pub has_btime: bool,
-    pub dev: u64,
-}
 
 pub const S_IFMT: u16 = 0o170000;
 pub const S_IFREG: u16 = 0o100000;
-
-/// `path` must be NUL-terminated.
-pub fn stat_path(path: &[u8], nofollow: bool) -> io::Result<StatInfo> {
-    let mut st: Statx = unsafe { std::mem::zeroed() };
-    let flags = if nofollow { AT_SYMLINK_NOFOLLOW } else { 0 };
-    let rc = unsafe {
-        statx(
-            AT_FDCWD,
-            path.as_ptr() as *const i8,
-            flags,
-            STATX_BASIC_STATS | STATX_BTIME,
-            &mut st,
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(StatInfo {
-        ino: st.ino,
-        mode: st.mode,
-        mtime: st.mtime.tv_sec.max(0) as u64,
-        btime: st.btime.tv_sec.max(0) as u64,
-        btime_ns: st.btime.tv_nsec.min(999_999_999),
-        has_btime: st.mask & STATX_BTIME != 0,
-        // st_dev as the rest of the system encodes it (new_encode_dev)
-        dev: ((st.dev_major as u64) << 20) | (st.dev_minor as u64 & 0x000f_ffff),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// FS_INFO: which filesystem is this, really
-// ---------------------------------------------------------------------------
-
-const FS_INFO_SIZE: usize = 1024;
-const OFF_FS_INFO_FSID: usize = 16;
-const OFF_FS_INFO_METADATA_UUID: usize = 64;
-const BTRFS_IOC_FS_INFO: u64 = ioc(IOC_READ, BTRFS_IOCTL_MAGIC, 31, FS_INFO_SIZE as u64);
-
-/// Identity of the filesystem an fd belongs to: the fsid stored in the btrfs
-/// superblock, plus its metadata_uuid when that feature is in use. This is the
-/// same UUID `btrfs filesystem show` prints; it is per *filesystem*, identical
-/// for every subvolume of it, and persisted on disk.
-///
-/// Deliberately not statfs(2)'s f_fsid: that is a derived value which differs
-/// between subvolumes of one filesystem and whose computation has changed
-/// between kernels, so it identifies neither the volume nor anything stable.
-pub fn fs_identity(fd: i32) -> io::Result<([u8; 16], [u8; 16])> {
-    let mut buf = [0u8; FS_INFO_SIZE];
-    let rc = unsafe { ioctl(fd, BTRFS_IOC_FS_INFO, buf.as_mut_ptr()) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut fsid = [0u8; 16];
-    fsid.copy_from_slice(&buf[OFF_FS_INFO_FSID..OFF_FS_INFO_FSID + 16]);
-    let mut meta = [0u8; 16];
-    meta.copy_from_slice(&buf[OFF_FS_INFO_METADATA_UUID..OFF_FS_INFO_METADATA_UUID + 16]);
-    Ok((fsid, meta))
-}
 
 /// 8-4-4-4-12, the way btrfs-progs prints a UUID.
 pub fn fmt_uuid(uuid: &[u8; 16]) -> String {
@@ -563,15 +439,6 @@ pub fn fmt_uuid(uuid: &[u8; 16]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
-}
-
-/// The filesystem's name for humans: its metadata UUID when set, else the fsid.
-pub fn fmt_fsid(id: &([u8; 16], [u8; 16])) -> String {
-    if id.1 != [0u8; 16] {
-        fmt_uuid(&id.1)
-    } else {
-        fmt_uuid(&id.0)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -690,32 +557,6 @@ where
         tree_id: subvol_root_id,
         min_type: 0,
         max_type: u32::MAX,
-        min_objectid: BTRFS_FIRST_FREE_OBJECTID,
-        max_objectid: u64::MAX,
-    };
-    searcher.for_each_item(fd, &spec, f)
-}
-
-/// Enumerate just one item type of a subvolume's fs tree.
-///
-/// The kernel still walks the whole tree to find them, but only items inside
-/// the type range are copied out, so asking for `EXTENT_DATA` alone delivers
-/// one item per file-extent instead of every inode, directory entry and index
-/// item in the tree - which is most of what a full enumeration costs.
-pub fn for_each_fs_item_typed<F>(
-    fd: i32,
-    subvol_root_id: u64,
-    item_type: u32,
-    f: &mut F,
-) -> io::Result<u64>
-where
-    F: FnMut(u64, u32, u64, &[u8]),
-{
-    let mut searcher = Searcher::new(4 << 20);
-    let spec = SearchSpec {
-        tree_id: subvol_root_id,
-        min_type: item_type,
-        max_type: item_type,
         min_objectid: BTRFS_FIRST_FREE_OBJECTID,
         max_objectid: u64::MAX,
     };

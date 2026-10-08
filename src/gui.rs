@@ -4,7 +4,7 @@
 use crate::chart::{Chart, View};
 use crate::listmodel::{DirListModel, RowData};
 use crate::model::*;
-use crate::walk::{self, Progress, ScanOptions, ScanStats};
+use crate::scan::{Progress, ScanOptions, ScanStats};
 use gtk4 as gtk;
 use gtk::prelude::*;
 use gtk::{gio, glib};
@@ -603,7 +603,7 @@ impl Ui {
                 live: Some(progress.clone()),
                 ..Default::default()
             };
-            let msg = match walk::scan_tree(&opts) {
+            let msg = match crate::metadata::scan_tree(&opts) {
                 Ok((tree, stats)) => Msg::Scanned(Ok((tree, stats))),
                 Err(e) => Msg::Scanned(Err(e.to_string())),
             };

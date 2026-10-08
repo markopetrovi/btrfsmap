@@ -3,11 +3,11 @@
 //!
 //! This is deliberately serial and mirrors compsize.c's `do_recursive_search`
 //! (same open flags, same errno policy, same dedup key, same counters). The
-//! parallel walker and the per-directory model build on the same primitives.
+//! per-directory model is built on the same primitives.
 
 use crate::btrfs::{self, ExtentItem, Searcher, BTRFS_FILE_EXTENT_INLINE, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK};
 use crate::model::*;
-use crate::walk::ScanStats;
+use crate::scan::ScanStats;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
