@@ -149,7 +149,7 @@ pub struct Tree {
     pub subvols: Vec<Subvol>,
     pub inventory: Vec<crate::btrfs::RootItem>,
     pub warnings: Vec<String>,
-    pub stats: crate::walk::ScanStats,
+    pub stats: crate::scan::ScanStats,
     pub scanned_at: u64,
     pub scanned_roots: Vec<Vec<u8>>,
 }
