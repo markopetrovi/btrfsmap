@@ -199,7 +199,6 @@ fn collect_subvolume(
     fd: i32,
     root_id: u64,
     subvol: u16,
-    subvol_otime: u64,
     scope: Option<&HashSet<u64>>,
 ) -> io::Result<Collected> {
     let in_scope = |inode: u64| scope.map(|s| s.contains(&inode)).unwrap_or(true);
@@ -303,8 +302,10 @@ fn collect_subvolume(
                 if rec.first_ref == 0 && rec.nrefs == 0 {
                     rec.first_ref = c.refs.len() as u32;
                 }
-                let key = (rec.btime, rec.btime_ns, subvol_otime);
-                let e = c.extents.entry(page).or_insert_with(|| ExtentInfo {
+                // The window is set later, from the references that reach the
+                // shared block (`set_windows`): the inodes collected here are
+                // candidates, not holders - only what build() places can hold.
+                c.extents.entry(page).or_insert_with(|| ExtentInfo {
                     disk: item.disk_num_bytes,
                     ram: item.ram_bytes,
                     win_btime: u32::MAX,
@@ -313,15 +314,6 @@ fn collect_subvolume(
                     win_count: 0,
                     assigned: 0,
                 });
-                let best = (e.win_btime, e.win_btime_ns, e.win_otime);
-                if key < best {
-                    e.win_btime = key.0;
-                    e.win_btime_ns = key.1;
-                    e.win_otime = key.2;
-                    e.win_count = 1;
-                } else if key == best {
-                    e.win_count += 1;
-                }
                 c.refs.push((page as u64) << 32);
                 rec.nrefs += 1;
                 rec.referenced += item.num_bytes;
@@ -439,7 +431,6 @@ fn flush_collapsed(
     len: u64,
     is_data: bool,
     holders: &mut Vec<u32>,
-    keys: &HashMap<u32, (u32, u16, u64)>,
     extents: &mut ExtentMap,
     out: &mut Vec<(u32, u32)>,
     added: &mut u64,
@@ -495,43 +486,9 @@ fn flush_collapsed(
             stats.contested.1 += len;
         }
     }
-    // The window decides ownership, and a walker sets it as it goes; these
-    // references need the same treatment or the extent ends up with a window no
-    // node's key matches and nobody owns it.
-    let e = extents.get_mut(&page).unwrap();
-    let dbg = std::env::var("CST_DEBUG_BYTENR")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|v| v == bytenr)
-        .unwrap_or(false);
-    if dbg {
-        eprintln!(
-            "  [dbg] bytenr {bytenr} len {len} window before ({}, {}, {}) count {} holders {}",
-            e.win_btime, e.win_btime_ns, e.win_otime, e.win_count, holders.len()
-        );
-        for &n in holders.iter() {
-            eprintln!("    holder node {n}: key {:?}", keys.get(&n));
-        }
-    }
-    for &n in holders.iter() {
-        let key = *keys.get(&n).unwrap_or(&(u32::MAX, u16::MAX, 0));
-        let best = (e.win_btime, e.win_btime_ns, e.win_otime);
-        if key < best || e.win_count == 0 {
-            e.win_btime = key.0;
-            e.win_btime_ns = key.1;
-            e.win_otime = key.2;
-            e.win_count = 1;
-        } else if key == best {
-            e.win_count += 1;
-        }
-    }
-    if dbg {
-        let e = extents.get(&page).unwrap();
-        eprintln!(
-            "  [dbg] window after ({}, {}, {}) count {}",
-            e.win_btime, e.win_btime_ns, e.win_otime, e.win_count
-        );
-    }
+    // The window is set later, from the references that reach the shared block
+    // (`set_windows`), so nothing here has to weigh a collapsed subvolume's age
+    // against a file's: the ownership pass does that from the keys themselves.
     for &n in holders.iter() {
         out.push((n, page));
     }
@@ -567,7 +524,6 @@ pub struct CollapseStats {
 fn collect_collapsed_refs(
     fd: i32,
     nodes: &HashMap<u64, u32>,
-    keys: &HashMap<u32, (u32, u16, u64)>,
     in_scan: &HashSet<u64>,
     inventory: &HashSet<u64>,
     g: &mut BlockRefs,
@@ -591,7 +547,7 @@ fn collect_collapsed_refs(
     btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, key_off, payload| {
         if bytenr != cur_bytenr {
             flush_collapsed(
-                cur_bytenr, cur_len, cur_data, &mut holders, keys, extents, &mut out,
+                cur_bytenr, cur_len, cur_data, &mut holders, extents, &mut out,
                 &mut added, &mut stats, named_in_scan, named_gone,
             );
             cur_bytenr = bytenr;
@@ -673,7 +629,7 @@ fn collect_collapsed_refs(
         }
     })?;
     flush_collapsed(
-        cur_bytenr, cur_len, cur_data, &mut holders, keys, extents, &mut out, &mut added,
+        cur_bytenr, cur_len, cur_data, &mut holders, extents, &mut out, &mut added,
         &mut stats, named_in_scan, named_gone,
     );
     stats.added.0 = added;
@@ -809,7 +765,6 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
                 .cmp(&(b.parent, &names[b.name_off as usize..b.name_off as usize + b.name_len as usize]))
         });
     }
-    let mut inode_copies: HashMap<(usize, u64), u32> = HashMap::new();
     let mut root_nodes: Vec<u32> = Vec::new();
     // root id -> the node that stands for it
     let mut collapsed_nodes: HashMap<u64, u32> = HashMap::new();
@@ -849,33 +804,22 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
         tree: &mut Tree,
         c: &mut Collector,
         ci: usize,
-        inode: u64,
         parent_node: u32,
         name: &[u8],
         mut flags: u8,
         rec: InodeRec,
         kind: u8,
         final_refs: &mut Vec<u64>,
-        inode_copies: &mut HashMap<(usize, u64), u32>,
     ) -> u32 {
         let idx = tree.nodes.len() as u32;
         if c.subs[ci].subvol_snapshot(&tree.subvols) {
             flags |= FLAG_SNAP_CLASS;
         }
-        let copies = inode_copies.entry((ci, inode)).or_insert(0);
-        *copies += 1;
         let a = rec.first_ref as usize;
         let b = a + rec.nrefs as usize;
         let first_ref = final_refs.len() as u32;
         for r in &c.refs[a..b] {
             final_refs.push(*r | idx as u64); // low half: owner node index
-        }
-        if *copies > 1 {
-            for r in &c.refs[a..b] {
-                if let Some(e) = c.extents.get_mut(&((*r >> 32) as u32)) {
-                    e.win_count += 1;
-                }
-            }
         }
         if kind == KIND_DIR {
             c.dirs += 1;
@@ -916,7 +860,7 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
                 btrfs::S_IFREG => KIND_FILE,
                 _ => continue,
             };
-            let idx = push_node(&mut tree, c, ci, inode, 0, &name, flags, rec, kind, &mut final_refs, &mut inode_copies);
+            let idx = push_node(&mut tree, c, ci, 0, &name, flags, rec, kind, &mut final_refs);
             root_nodes.push(idx);
             if kind == KIND_DIR {
                 let extra = tree.dirs.len() as u32;
@@ -1032,8 +976,8 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
                     };
                     let rec = c.subs[child_ci].recs[pos];
                     let gidx = push_node(
-                        &mut tree, c, child_ci, inode, idx, &gname, f, rec, KIND_DIR,
-                        &mut final_refs, &mut inode_copies,
+                        &mut tree, c, child_ci, idx, &gname, f, rec, KIND_DIR,
+                        &mut final_refs,
                     );
                     let gd = tree.dirs.len() as u32;
                     tree.dirs.push(DirExtra {
@@ -1058,7 +1002,7 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
                 btrfs::S_IFREG => KIND_FILE,
                 _ => continue, // symlinks and specials, as in the file backend
             };
-            let idx = push_node(&mut tree, c, child_ci, child_inode, node_idx, &child_name, child_flags, rec, kind, &mut final_refs, &mut inode_copies);
+            let idx = push_node(&mut tree, c, child_ci, node_idx, &child_name, child_flags, rec, kind, &mut final_refs);
             if kind == KIND_DIR {
                 let extra = tree.dirs.len() as u32;
                 tree.dirs.push(DirExtra {
@@ -1190,7 +1134,6 @@ fn collect_all(
             }
             continue;
         }
-        let otime = c.subvols[subvol as usize].otime;
         // Which subvolume a scan started in is a question about the subvolume,
         // not about the spelling of the path it was given.
         let scope =
@@ -1199,7 +1142,20 @@ fn collect_all(
             } else {
                 None
             };
-        let col = collect_subvolume(c, fd, root_id, subvol, otime, scope.as_ref())?;
+        let t_sub = std::time::Instant::now();
+        let col = collect_subvolume(c, fd, root_id, subvol, scope.as_ref())?;
+        if std::env::var_os("CST_TIME_SUBVOL").is_some() {
+            let s = &c.subvols[subvol as usize];
+            eprintln!(
+                "[time]   subvol {} ({}) walked in {:.2}s: {} files, {} dirs, {} recs",
+                s.id,
+                String::from_utf8_lossy(&path),
+                t_sub.elapsed().as_secs_f64(),
+                col.files,
+                col.dirs,
+                col.recs.len()
+            );
+        }
         for (child_root, dirid, name) in &col.nested {
             // the nested subvolume is reachable as a directory of this one, so
             // its identity is one open() away - no need to decode root items
@@ -1233,10 +1189,460 @@ fn excluded(path: &[u8], excludes: &[Vec<u8>]) -> bool {
     excludes.iter().any(|ex| path.starts_with(ex))
 }
 
+/// The key `attribute_owned` compares an extent's window against, for one node.
+/// Mirrors model.rs exactly - the window is now built from it (see
+/// `set_windows`), so a drift here would misattribute bytes silently.
+/// `(node btime, node btime_ns, the subvolume's creation time)`.
+fn node_key(tree: &Tree, i: u32, subvol_otime: &[u64]) -> (u32, u16, u64, u16) {
+    let n = &tree.nodes[i as usize];
+    let collapsed = n.flags & FLAG_COLLAPSED != 0;
+    let subvol = if collapsed {
+        tree.dirs[n.extra as usize].subvol
+    } else {
+        let p = &tree.nodes[n.parent as usize];
+        if p.kind == KIND_DIR {
+            tree.dirs[p.extra as usize].subvol
+        } else {
+            0
+        }
+    };
+    (
+        n.btime,
+        n.btime_ns,
+        *subvol_otime.get(subvol as usize).unwrap_or(&0),
+        subvol,
+    )
+}
+
+/// Give every extent the window its holders set: the smallest key among the
+/// references that reached the shared block, and how many of them carry it.
+///
+/// It has to be derived from these references and not from the inodes the walk
+/// collected. An extent is split between the references the ownership pass can
+/// see, so a holder that never became a node - an unlinked inode, a file whose
+/// directory entry is gone, anything the walk saw but build() did not place -
+/// must not set a window either. Otherwise its key is the window, no reference
+/// in the block matches it, and the placed holders' shares are credited to
+/// nobody.
+fn set_windows(tree: &Tree, refs: &[u64], extents: &mut ExtentMap, subvol_otime: &[u64]) {
+    for r in refs {
+        let Some(e) = extents.get_mut(&((*r >> 32) as u32)) else {
+            continue;
+        };
+        let (btime, btime_ns, ctime, _) = node_key(tree, *r as u32, subvol_otime);
+        let key = (btime, btime_ns, ctime);
+        let best = (e.win_btime, e.win_btime_ns, e.win_otime);
+        if key < best || e.win_count == 0 {
+            e.win_btime = btime;
+            e.win_btime_ns = btime_ns;
+            e.win_otime = ctime;
+            e.win_count = 1;
+        } else if key == best {
+            e.win_count += 1;
+        }
+    }
+}
+
+/// Development aid for the ownership pass: after `attribute_owned` has run,
+/// `e.assigned` is how many (node, reference) pairs matched the extent's
+/// window - zero means the extent is in the map, is referenced, and is owned by
+/// nobody. Counts those, and prints the window and the referencing nodes'
+/// keys for the bytenrs named in CST_DEBUG_BYTENR / CST_DEBUG_BYTENR_FILE.
+fn debug_ownership(
+    tree: &Tree,
+    extents: &ExtentMap,
+    ref_blocks: &[Vec<u64>],
+    subvol_otime: &[u64],
+) {
+    let mut wanted: HashSet<u32> = HashSet::new();
+    if let Ok(list) = std::env::var("CST_DEBUG_BYTENR") {
+        for t in list.split(',') {
+            if let Ok(b) = t.trim().parse::<u64>() {
+                wanted.insert((b >> 12) as u32);
+            }
+        }
+    }
+    if let Ok(path) = std::env::var("CST_DEBUG_BYTENR_FILE") {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines() {
+                if let Ok(b) = line.trim().parse::<u64>() {
+                    wanted.insert((b >> 12) as u32);
+                }
+            }
+        }
+    }
+
+    // node index per page, for the pages asked about
+    let mut refs_of: HashMap<u32, Vec<u32>> = HashMap::new();
+    // every page any node references at all
+    let mut referenced: HashSet<u32> = HashSet::new();
+    for r in ref_blocks[0].iter() {
+        let page = (*r >> 32) as u32;
+        referenced.insert(page);
+        if wanted.contains(&page) {
+            refs_of.entry(page).or_default().push(*r as u32);
+        }
+    }
+
+    let mut unclaimed: Vec<&u32> = Vec::new();
+    let mut unclaimed_bytes = 0u64;
+    let mut no_refs: Vec<&u32> = Vec::new();
+    let mut no_refs_bytes = 0u64;
+    for (p, e) in extents.iter() {
+        if e.assigned != 0 {
+            continue;
+        }
+        if referenced.contains(p) {
+            unclaimed.push(p);
+            unclaimed_bytes += e.disk;
+        } else {
+            no_refs.push(p);
+            no_refs_bytes += e.disk;
+        }
+    }
+    eprintln!(
+        "[own] extents {} ({} referenced):\n\
+         [own]   owned by nobody, referenced by a node: {} extents, {:.2} GiB\n\
+         [own]   owned by nobody, referenced by no node: {} extents, {:.2} GiB",
+        extents.len(),
+        referenced.len(),
+        unclaimed.len(),
+        unclaimed_bytes as f64 / 1073741824.0,
+        no_refs.len(),
+        no_refs_bytes as f64 / 1073741824.0
+    );
+    let mut unclaimed_sorted: Vec<u32> = unclaimed.iter().map(|p| **p).collect();
+    unclaimed_sorted.sort_unstable();
+    if !unclaimed_sorted.is_empty() {
+        let show: Vec<u64> = unclaimed_sorted
+            .iter()
+            .take(8)
+            .map(|p| (*p as u64) << 12)
+            .collect();
+        eprintln!("[own]   smallest unowned bytenrs: {show:?}");
+    }
+    if let Ok(path) = std::env::var("CST_DEBUG_OWN_DUMP") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            let mut buf = String::new();
+            for p in unclaimed_sorted.iter() {
+                buf.push_str(&format!("{}\n", (*p as u64) << 12));
+            }
+            let _ = f.write_all(buf.as_bytes());
+            eprintln!("[own]   wrote {} unowned bytenrs to {path}", unclaimed_sorted.len());
+        }
+    }
+
+    // Detail a few unowned extents, preferring ones also named in the wanted
+    // list (e.g. the bytenrs a full-scan-minus-collapsed diff produced).
+    let mut detail: Vec<u32> = Vec::new();
+    for p in unclaimed_sorted.iter() {
+        if wanted.contains(p) && detail.len() < 5 {
+            detail.push(*p);
+        }
+    }
+    for p in unclaimed_sorted.iter() {
+        if detail.len() < 8 && !detail.contains(p) {
+            detail.push(*p);
+        }
+    }
+    if detail.is_empty() {
+        // no referenced-but-unowned extents here: show the unreferenced ones
+        let mut nr: Vec<u32> = no_refs.iter().map(|p| **p).collect();
+        nr.sort_unstable();
+        detail.extend(nr.iter().take(8).copied());
+    }
+    for page in detail.iter() {
+        let bytenr = (*page as u64) << 12;
+        let nrefs = refs_of.get(page).map(|v| v.len()).unwrap_or(0);
+        match extents.get(page) {
+            Some(e) => eprintln!(
+                "[own] bytenr {bytenr}: disk {} ram {} window (btime {} btime_ns {} otime {}) \
+                 win_count {} assigned {} refs {nrefs}",
+                e.disk, e.ram, e.win_btime, e.win_btime_ns, e.win_otime, e.win_count, e.assigned
+            ),
+            None => eprintln!("[own] bytenr {bytenr}: not in the extent map at all"),
+        }
+        for node in refs_of.get(page).into_iter().flatten() {
+            let n = &tree.nodes[*node as usize];
+            let (btime, btime_ns, ctime, subvol) = node_key(tree, *node, subvol_otime);
+            let matched = extents
+                .get(page)
+                .map(|e| {
+                    btime == e.win_btime
+                        && btime_ns == e.win_btime_ns
+                        && ctime == e.win_otime
+                        && e.win_count > 0
+                })
+                .unwrap_or(false);
+            let s = &tree.subvols[subvol as usize];
+            eprintln!(
+                "[own]   node {node} kind {} flags 0x{:02x} btime {btime} btime_ns {btime_ns} \
+                 ctime {ctime} (subvol {} id {}) owned {} matched {matched} path {}",
+                n.kind,
+                n.flags,
+                subvol,
+                s.id,
+                n.owned,
+                String::from_utf8_lossy(&tree.path_of(*node))
+            );
+        }
+    }
+}
+
+/// Development aid, gated by `CST_DEBUG_OWN_STATS`: the ownership
+/// arithmetic, checked rather than trusted.
+///
+/// * `split` recomputes, per extent, how many references in the block match
+///   the window and what that credits them, and compares it with
+///   `win_count`: the two have to agree, since `set_windows` derives the
+///   window from exactly these references - so a deficit is bytes credited
+///   to nobody.
+/// * `inline` tallies the payloads that live in the fs tree rather than the
+///   extent tree, invisible to any mode that does not walk the subvolume.
+/// * `reach` walks the tree from the scanned roots and sums the owned bytes
+///   they reach, to catch bytes that never roll into a root's total.
+fn debug_ownership_stats(
+    tree: &Tree,
+    extents: &ExtentMap,
+    ref_blocks: &[Vec<u64>],
+    subvol_otime: &[u64],
+) {
+    // The split arithmetic: an extent is divided by win_count, and win_count
+    // is the number of references in the block that carry the window key.
+    // Count that independently - references whose node's key equals the window
+    // - and sum what each matched reference is credited. A deficit is bytes
+    // credited to nobody and an excess the reverse; both have to be zero, since
+    // `set_windows` derives the window from exactly these references.
+    {
+        let mut matched: HashMap<u32, u32> = HashMap::new();
+        let mut match_subvol: HashMap<u32, u16> = HashMap::new();
+        for r in ref_blocks[0].iter() {
+            let page = (*r >> 32) as u32;
+            let Some(e) = extents.get(&page) else { continue };
+            if e.win_count == 0 {
+                continue;
+            }
+            let (btime, btime_ns, ctime, subvol) = node_key(tree, *r as u32, subvol_otime);
+            if btime == e.win_btime && btime_ns == e.win_btime_ns && ctime == e.win_otime {
+                *matched.entry(page).or_insert(0) += 1;
+                match_subvol.entry(page).or_insert(subvol);
+            }
+        }
+        let mut deficit = 0u64;
+        let mut deficit_n = 0u64;
+        let mut over = 0u64;
+        let mut over_n = 0u64;
+        let mut mismatched_assigned = 0u64;
+        let mut by_subvol: HashMap<u16, (u64, u64)> = HashMap::new();
+        let mut by_otime: HashMap<u64, (u64, u64)> = HashMap::new();
+        for (p, e) in extents.iter() {
+            if e.win_count == 0 {
+                continue;
+            }
+            let m = *matched.get(p).unwrap_or(&0) as u64;
+            let n = e.win_count as u64;
+            if m != e.assigned as u64 {
+                mismatched_assigned += 1;
+            }
+            let credited = if m < n {
+                m * (e.disk / n)
+            } else {
+                e.disk + (m - n) * (e.disk / n)
+            };
+            if m < n {
+                let lost = e.disk - credited;
+                deficit += lost;
+                deficit_n += 1;
+                let sv = match_subvol.get(p).copied().unwrap_or(u16::MAX);
+                let b = by_subvol.entry(sv).or_insert((0, 0));
+                b.0 += 1;
+                b.1 += lost;
+                let b = by_otime.entry(e.win_otime).or_insert((0, 0));
+                b.0 += 1;
+                b.1 += lost;
+            } else if m > n {
+                over += credited - e.disk;
+                over_n += 1;
+            }
+        }
+        eprintln!(
+            "[own] split: {deficit_n} extents lose {:.3} GiB (matched < win_count); \
+             {over_n} extents over-credit {:.3} GiB (matched > win_count); \
+             {mismatched_assigned} extents where matched != assigned",
+            deficit as f64 / 1073741824.0,
+            over as f64 / 1073741824.0
+        );
+        let mut v: Vec<(u16, (u64, u64))> = by_subvol.into_iter().collect();
+        v.sort_by_key(|(_, c)| std::cmp::Reverse(c.1));
+        for (sv, (n, bytes)) in v.iter().take(8) {
+            let label = if *sv == u16::MAX {
+                "no matching ref".to_string()
+            } else {
+                let s = &tree.subvols[*sv as usize];
+                format!("id {} ({})", s.id, String::from_utf8_lossy(&s.path))
+            };
+            eprintln!(
+                "[own]   lost share: {n} extents, {:.3} GiB, matching refs in subvol {label}",
+                *bytes as f64 / 1073741824.0
+            );
+        }
+        let mut w: Vec<(u64, (u64, u64))> = by_otime.into_iter().collect();
+        w.sort_by_key(|(_, c)| std::cmp::Reverse(c.1));
+        for (ot, (n, bytes)) in w.iter().take(5) {
+            let ids: Vec<u64> = tree
+                .subvols
+                .iter()
+                .filter(|s| s.otime == *ot)
+                .map(|s| s.id)
+                .collect();
+            eprintln!(
+                "[own]   lost share: window otime {ot} -> {n} extents, {:.3} GiB; subvol ids {ids:?}",
+                *bytes as f64 / 1073741824.0
+            );
+        }
+    }
+
+    // Inline extents live in the fs tree, not in the extent tree, so only a
+    // mode that walks a subvolume's tree can see its inline bytes: how much
+    // rides on that is worth knowing before trusting a cross-mode difference.
+    {
+        let mut walked = (0u64, 0u64, 0u64);
+        let mut snaps = (0u64, 0u64, 0u64);
+        for (i, nd) in tree.nodes.iter().enumerate() {
+            if nd.kind != crate::model::KIND_FILE || (nd.inline_disk == 0 && nd.inline_ram == 0) {
+                continue;
+            }
+            let (_, _, _, sv) = node_key(tree, i as u32, subvol_otime);
+            let t = if tree.subvols[sv as usize].snapshot {
+                &mut snaps
+            } else {
+                &mut walked
+            };
+            t.0 += 1;
+            t.1 += nd.inline_disk as u64;
+            t.2 += nd.inline_ram as u64;
+        }
+        eprintln!(
+            "[own] inline: walked subvolumes {} files, {:.3} GiB disk, {:.3} GiB ram; \
+             snapshot-class {} files, {:.3} GiB disk, {:.3} GiB ram",
+            walked.0,
+            walked.1 as f64 / 1073741824.0,
+            walked.2 as f64 / 1073741824.0,
+            snaps.0,
+            snaps.1 as f64 / 1073741824.0,
+            snaps.2 as f64 / 1073741824.0
+        );
+    }
+
+    // Are the credited bytes reachable from the roots the report walks? A node
+    // that no root's traversal reaches holds owned bytes that never roll into
+    // the scanned root's total.
+    {
+        let total = tree.nodes.len();
+        let mut seen = vec![false; total];
+        let mut stack: Vec<u32> = Vec::new();
+        for r in tree.roots.iter() {
+            seen[*r as usize] = true;
+            stack.push(*r);
+        }
+        while let Some(i) = stack.pop() {
+            let nd = tree.nodes[i as usize];
+            for c in nd.first_child..nd.first_child + nd.nchildren {
+                if !seen[c as usize] {
+                    seen[c as usize] = true;
+                    stack.push(c);
+                }
+            }
+        }
+        // and again from the synthetic root's children, to tell "outside the
+        // scanned tree" from "not linked in at all"
+        let mut seen0 = vec![false; total];
+        let mut stack0: Vec<u32> = Vec::new();
+        {
+            let root0 = &tree.nodes[0];
+            for c in root0.first_child..root0.first_child + root0.nchildren {
+                seen0[c as usize] = true;
+                stack0.push(c);
+            }
+        }
+        while let Some(i) = stack0.pop() {
+            let nd = tree.nodes[i as usize];
+            for c in nd.first_child..nd.first_child + nd.nchildren {
+                if !seen0[c as usize] {
+                    seen0[c as usize] = true;
+                    stack0.push(c);
+                }
+            }
+        }
+        let mut all_owned = 0u64;
+        let mut seen_owned = 0u64;
+        let mut seen0_owned = 0u64;
+        let mut hidden: Vec<(u32, u64)> = Vec::new();
+        for i in 0..total {
+            let o = tree.nodes[i].owned;
+            all_owned += o;
+            if seen[i] {
+                seen_owned += o;
+            } else if o > 0 {
+                hidden.push((i as u32, o));
+            }
+            if seen0[i] {
+                seen0_owned += o;
+            }
+        }
+        hidden.sort_by_key(|(_, o)| std::cmp::Reverse(*o));
+        eprintln!(
+            "[own] reach: {} of {total} nodes reachable from the roots, owned {:.3} GiB; \
+             from the synthetic root, owned {:.3} GiB; all nodes {:.3} GiB; \
+             {} nodes ({:.3} GiB) outside the roots",
+            seen.iter().filter(|x| **x).count(),
+            seen_owned as f64 / 1073741824.0,
+            seen0_owned as f64 / 1073741824.0,
+            all_owned as f64 / 1073741824.0,
+            hidden.len(),
+            (all_owned - seen_owned) as f64 / 1073741824.0
+        );
+        for (i, o) in hidden.iter().take(8) {
+            let nd = &tree.nodes[*i as usize];
+            let d = if nd.kind == KIND_DIR {
+                &tree.dirs[nd.extra as usize]
+            } else {
+                &tree.dirs[tree.nodes[nd.parent as usize].extra as usize]
+            };
+            let s = &tree.subvols[d.subvol as usize];
+            eprintln!(
+                "[own]   outside-roots node {i} kind {} flags 0x{:02x} owned {:.3} GiB \
+                 subvol id {} ({}) parent {} path {}",
+                nd.kind,
+                nd.flags,
+                *o as f64 / 1073741824.0,
+                s.id,
+                String::from_utf8_lossy(&s.path),
+                nd.parent,
+                String::from_utf8_lossy(&tree.path_of(*i))
+            );
+        }
+    }
+}
+
 /// Scan by reading the trees: identical results to `walk::scan_tree`, without
 /// visiting a single file.
 pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     let started = std::time::Instant::now();
+    // Per-phase timing on stderr: which part of a scan the seconds go to.
+    let mut t_phase = std::time::Instant::now();
+    macro_rules! phase {
+        ($name:expr) => {{
+            eprintln!(
+                "[time] {:<24} {:8.2}s (total {:.2}s)",
+                $name,
+                t_phase.elapsed().as_secs_f64(),
+                started.elapsed().as_secs_f64()
+            );
+            t_phase = std::time::Instant::now();
+        }};
+    }
     let mut stats = ScanStats::default();
     let mut c = Collector {
         extents: ExtentMap::new(),
@@ -1275,14 +1681,25 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
             info,
         });
     }
+    phase!("inventory + roots");
+    let t_collect = std::time::Instant::now();
     for root in &roots {
         collect_all(&mut c, fd, &inv, root, &opts.excludes)?;
     }
+    if std::env::var_os("CST_TIME_SUBVOL").is_some() {
+        eprintln!(
+            "[time]   collect_all wall {:.2}s for {} subvolumes",
+            t_collect.elapsed().as_secs_f64(),
+            c.subs.len()
+        );
+    }
+    phase!("collect_all (fs-tree walks)");
 
     let (mut tree, final_refs, collapsed_nodes) = build(&mut c, &roots);
     tree.inventory = inv.clone();
     // the assembled array, whose references name their owner node
     let mut final_refs = final_refs;
+    phase!("build");
 
     // Snapshot-class subvolumes were not walked, so their references - and the
     // extents only they still hold - come from the extent tree instead.
@@ -1294,23 +1711,16 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
             memo: HashMap::new(),
         };
         collect_block_refs(fd, &mut g)?;
+        phase!("collect_block_refs");
         let blocks = g.index.len();
-        // the age each collapsed node carries into the ownership rule
-        let keys: HashMap<u32, (u32, u16, u64)> = collapsed_nodes
-            .values()
-            .map(|&n| {
-                let node = tree.nodes[n as usize];
-                let d = &tree.dirs[node.extra as usize];
-                (n, (node.btime, node.btime_ns, tree.subvols[d.subvol as usize].otime))
-            })
-            .collect();
         // every subvolume this scan covers: a reference that names one of them
         // is in scope, and if it resolves to nothing the bytes are lost
         let in_scan: HashSet<u64> = tree.subvols.iter().map(|s| s.id).collect();
         let inventory: HashSet<u64> = inv.iter().map(|r| r.treeid).collect();
         let (mut pairs, cstats) = collect_collapsed_refs(
-            fd, &collapsed_nodes, &keys, &in_scan, &inventory, &mut g, &mut c.extents,
+            fd, &collapsed_nodes, &in_scan, &inventory, &mut g, &mut c.extents,
         )?;
+        phase!("collect_collapsed_refs");
         drop(g);
         let nrefs = pairs.len();
         // A node's references have to be one contiguous run of the array, so
@@ -1329,6 +1739,7 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
             n.first_ref = start;
             n.nrefs = final_refs.len() as u32 - start;
         }
+        phase!("collapse ref grouping");
         eprintln!(
             "collapsed {} subvolumes: {nrefs} references resolved through {blocks} tree blocks in {:.1}s",
             collapsed_nodes.len(),
@@ -1423,10 +1834,25 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
             eprintln!("dumped {} extents to {path}", extents.len());
         }
     }
+    phase!("subvol remap + map dump");
     let subvol_otime: Vec<u64> = tree.subvols.iter().map(|s| s.otime).collect();
+    // The one place windows are set: from the references that reach the block,
+    // so a holder build() never placed cannot own - or deny - an extent.
+    set_windows(&tree, &ref_blocks[0], &mut extents, &subvol_otime);
     tree.attribute_owned(&ref_blocks, &mut extents, &subvol_otime);
+    phase!("attribute_owned");
+    if std::env::var_os("CST_DEBUG_OWN").is_some() {
+        debug_ownership(&tree, &extents, &ref_blocks, &subvol_otime);
+        phase!("debug_ownership");
+    }
+    if std::env::var_os("CST_DEBUG_OWN_STATS").is_some() {
+        debug_ownership_stats(&tree, &extents, &ref_blocks, &subvol_otime);
+        phase!("debug_ownership_stats");
+    }
     tree.attribute_reach(&mut ref_blocks, &extents);
+    phase!("attribute_reach");
     tree.rollup();
+    phase!("rollup");
     Ok((tree, stats))
 }
 

@@ -165,34 +165,21 @@ references to, to be diffed against the kernel's own answer from
   that was not walked is credited here. `scan` warns when it can see snapshots
   of a scanned subvolume outside the scanned paths. Scanning `/` (the default)
   avoids this entirely.
-* **A collapsed snapshot's numbers are an aggregate, and a close one rather than
-  an exact one.** Its references come from the extent tree, which records which
-  tree blocks reference an extent but not always *which subvolumes reach those
-  blocks*: a block can name a single owner root plus a few parent blocks while
-  many more subvolumes see it through a parent that is itself shared. That is
-  what `FULL_BACKREF` on disk means, and why the kernel's own `LOGICAL_INO` has
-  to read tree blocks one at a time (~150 us per extent) instead of trusting the
-  references. What that costs was measured against `--full-scan` on a `/home`
-  with 30 snapper snapshots and ~90 container layers: about **13,600 extents,
-  9.8 GiB**, and the loss lands entirely in the snapshot aggregates - every
-  walked subtree's number is identical between the two modes, and so is
-  `owned(root)` minus those bytes. They are not the extents the scan reports as
-  unresolvable - asking the kernel (`LOGICAL_INO`, which does the full backref
-  walk the extent tree cannot) about the 245,000 largest of those found not one
-  belonging to a collapsed subvolume.
-
-  They are **subvolumes nested inside a collapsed one**. A container layer can
-  hold a mock root created with `dnf --installroot`: its own tree, its own
-  files, and no `parent_uuid`, so it is not a snapshot and has no business being
-  collapsed - but the collapsed scan never discovers it, because nested
-  subvolumes are found by reading a parent's directories and a collapsed
-  subvolume's directories are exactly what is not read. Its extents are then
-  referenced by a subvolume the scan never interns, and the extent tree cannot
-  place them either. On the tree measured, nearly all of the 13,717 are held by
-  one such root. The fix is to enumerate a collapsed subvolume's children from
-  the root tree (`ROOT_BACKREF`), which the search for the remaining bytes
-  established; it is a change to how subvolumes are discovered, so it wants its
-  own round of gate checks. `--full-scan` is the exact answer until then.
+* **A collapsed snapshot's numbers are an aggregate, exact apart from the
+  inline data of the subvolumes that are not walked.** Its references and
+  extents come from the extent tree, which records everything a collapsed
+  subvolume holds - subvolumes nested inside it included, since those are found
+  through the root tree (`ROOT_BACKREF`) and their own trees are read - with
+  one exception: an extent item does not exist for an *inline* payload, a file
+  small enough to live in its inode's own tree block, so it cannot be recovered
+  from the extent tree at all. On the tree measured (`/home`) that is
+  **8.4 GiB of 606 GiB**, and subtracting those bytes from the full scan's
+  `owned` reproduces the collapsed figure; the same inline
+  bytes account for most of the uncompressed gap (679 GiB collapsed against
+  702 GiB with `--full-scan`), the rest being the `ram = len` fallback on
+  snapshot-only extents. Apart from that, the fast scan's aggregate is exact:
+  every walked subtree's numbers are the same in both modes. Use `--full-scan`
+  when the interiors of the collapsed subvolumes matter.
 * `CST_RESOLVE_SECONDS=<n>` spends up to n seconds asking the kernel about the
   largest unresolved extents - the exact route, for a filesystem where the
   missing ones are the big ones. Default 0: it costs ~80-400 us per extent and
@@ -212,9 +199,7 @@ references to, to be diffed against the kernel's own answer from
 * A collapsed snapshot's `uncompressed` is its compressed size for the extents
   only it holds - the extent tree has no uncompressed size. Its `referenced` is
   0 for the same reason: the logical sizes live in the files, which were not
-  read. Subvolumes that are only reachable through a collapsed snapshot (deleted
-  from the live tree since) are not discovered, so the subvolume count can be a
-  few lower than the file backend's.
+  read.
 * A scan is a snapshot in time; files changing during it are counted once, as
   seen.
 * Non-btrfs filesystems inside the tree (loop mounts, overlayfs, `/boot`) are
