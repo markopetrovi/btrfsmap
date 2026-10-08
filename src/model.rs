@@ -127,8 +127,13 @@ impl Subvol {
     pub fn is_snapshot(&self) -> bool {
         self.snapshot
     }
+    /// The flags are `btrfs_root_item.flags`, where read-only is **bit 0**
+    /// (`BTRFS_ROOT_SUBVOL_RDONLY`). Bit 1 is `BTRFS_SUBVOL_RDONLY` from the
+    /// *setflags* ioctl - a different constant in a different namespace, and
+    /// testing it silently reported every subvolume, snapshots included, as
+    /// writable.
     pub fn is_readonly(&self) -> bool {
-        self.flags & 0b10 != 0
+        self.flags & 1 != 0
     }
 }
 

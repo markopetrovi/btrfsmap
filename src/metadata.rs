@@ -397,17 +397,27 @@ fn flush_collapsed(
     extents: &mut ExtentMap,
     out: &mut Vec<(u32, u32)>,
     added: &mut u64,
-    unresolved: &mut (u64, u64),
+    stats: &mut CollapseStats,
+    named_in_scan: bool,
+    named_gone: bool,
 ) {
     if holders.is_empty() {
         if is_data && !extents.contains_key(&((bytenr >> 12) as u32)) {
             // In the extent tree, referenced by something, and nothing resolved
-            // to a subvolume this scan knows. Usually that is a subvolume
-            // outside the scanned tree - which the walk would not have counted
-            // either - but see the limits section of the README for what it
-            // costs when it is not.
-            unresolved.0 += 1;
-            unresolved.1 += len;
+            // to a subvolume this scan knows. When one of the named roots *is*
+            // a subvolume of the scan, the walk would have counted those bytes
+            // and this pass did not: a real loss. Otherwise the reference is
+            // from outside the scanned tree, which the walk does not count
+            // either.
+            let bucket = if named_in_scan {
+                &mut stats.lost
+            } else if named_gone {
+                &mut stats.gone
+            } else {
+                &mut stats.outside
+            };
+            bucket.0 += 1;
+            bucket.1 += len;
         }
         return;
     }
@@ -418,22 +428,45 @@ fn flush_collapsed(
     // then the only place its size is known. `disk` is exact (the item's key
     // offset is the length); `ram` is not recorded there at all, so a
     // snapshot-only extent reports its compressed size as its uncompressed one.
-    if let std::collections::hash_map::Entry::Vacant(v) = extents.entry(page) {
-        v.insert(ExtentInfo {
-            disk: len,
-            ram: len,
-            win_btime: u32::MAX,
-            win_btime_ns: u16::MAX,
-            win_otime: u64::MAX,
-            win_count: 0,
-            assigned: 0,
-        });
-        *added += 1;
+    match extents.entry(page) {
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert(ExtentInfo {
+                disk: len,
+                ram: len,
+                win_btime: u32::MAX,
+                win_btime_ns: u16::MAX,
+                win_otime: u64::MAX,
+                win_count: 0,
+                assigned: 0,
+            });
+            *added += 1;
+            stats.added.1 += len;
+        }
+        std::collections::hash_map::Entry::Occupied(_) => {
+            // a walked subtree holds this too: the one case where a collapsed
+            // subvolume's age has to be weighed against a file's
+            stats.contested.0 += 1;
+            stats.contested.1 += len;
+        }
     }
     // The window decides ownership, and a walker sets it as it goes; these
     // references need the same treatment or the extent ends up with a window no
     // node's key matches and nobody owns it.
     let e = extents.get_mut(&page).unwrap();
+    let dbg = std::env::var("CST_DEBUG_BYTENR")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v == bytenr)
+        .unwrap_or(false);
+    if dbg {
+        eprintln!(
+            "  [dbg] bytenr {bytenr} len {len} window before ({}, {}, {}) count {} holders {}",
+            e.win_btime, e.win_btime_ns, e.win_otime, e.win_count, holders.len()
+        );
+        for &n in holders.iter() {
+            eprintln!("    holder node {n}: key {:?}", keys.get(&n));
+        }
+    }
     for &n in holders.iter() {
         let key = *keys.get(&n).unwrap_or(&(u32::MAX, u16::MAX, 0));
         let best = (e.win_btime, e.win_btime_ns, e.win_otime);
@@ -446,10 +479,37 @@ fn flush_collapsed(
             e.win_count += 1;
         }
     }
+    if dbg {
+        let e = extents.get(&page).unwrap();
+        eprintln!(
+            "  [dbg] window after ({}, {}, {}) count {}",
+            e.win_btime, e.win_btime_ns, e.win_otime, e.win_count
+        );
+    }
     for &n in holders.iter() {
         out.push((n, page));
     }
     holders.clear();
+}
+
+/// What one collapsed pass found, for the notes the scan prints and for the
+/// limits section of the README.
+#[derive(Default)]
+pub struct CollapseStats {
+    /// extents only snapshots hold, and their bytes
+    pub added: (u64, u64),
+    /// extents held by a walked subtree *and* by a collapsed subvolume
+    pub contested: (u64, u64),
+    /// extents that resolved to no subvolume of this scan although one of their
+    /// named roots is in it: bytes the walk would have counted and this did not
+    pub lost: (u64, u64),
+    /// the same, for references from outside the scanned tree
+    pub outside: (u64, u64),
+    /// unresolved extents whose references name a subvolume that is not in the
+    /// root tree any more - a snapshot that was pruned, whose leaves survive
+    /// only in the snapshots that share them. The walk finds those extents in
+    /// the snapshots; the extent tree cannot link them to any surviving one.
+    pub gone: (u64, u64),
 }
 
 /// Attribute collapsed subvolumes' extents straight from the extent tree.
@@ -462,25 +522,31 @@ fn collect_collapsed_refs(
     fd: i32,
     nodes: &HashMap<u64, u32>,
     keys: &HashMap<u32, (u32, u16, u64)>,
+    in_scan: &HashSet<u64>,
+    inventory: &HashSet<u64>,
     g: &mut BlockRefs,
     extents: &mut ExtentMap,
-) -> io::Result<Vec<(u32, u32)>> {
+) -> io::Result<(Vec<(u32, u32)>, CollapseStats)> {
     let mut out: Vec<(u32, u32)> = Vec::new();
     let mut added = 0u64;
-    let mut unresolved = (0u64, 0u64);
+    let mut stats = CollapseStats::default();
     let mut holders: Vec<u32> = Vec::new();
     let mut cur_bytenr = u64::MAX;
     let mut cur_len = 0u64;
     let mut cur_data = false;
+    let mut named_in_scan = false;
+    let mut named_gone = false;
 
     btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, key_off, payload| {
         if bytenr != cur_bytenr {
             flush_collapsed(
                 cur_bytenr, cur_len, cur_data, &mut holders, keys, extents, &mut out,
-                &mut added, &mut unresolved,
+                &mut added, &mut stats, named_in_scan, named_gone,
             );
             cur_bytenr = bytenr;
             cur_data = false;
+            named_in_scan = false;
+            named_gone = false;
             cur_len = key_off; // an EXTENT_ITEM's key offset is its length
         }
         match ty {
@@ -496,6 +562,11 @@ fn collect_collapsed_refs(
                     btrfs::BTRFS_EXTENT_DATA_REF_KEY => {
                         // the very first field is the referencing subvolume
                         let root = u64::from_le_bytes(body[..8].try_into().unwrap());
+                        if in_scan.contains(&root) {
+                            named_in_scan = true;
+                        } else if !inventory.contains(&root) {
+                            named_gone = true;
+                        }
                         if let Some(&n) = nodes.get(&root) {
                             holders.push(n);
                         }
@@ -505,6 +576,11 @@ fn collect_collapsed_refs(
                         // file extent; the subvolumes are the roots that reach it
                         if let Some(s) = btrfs::parse_shared_data_ref(body) {
                             for r in g.roots_of(s.parent) {
+                                if in_scan.contains(&r) {
+                                    named_in_scan = true;
+                                } else if !inventory.contains(&r) {
+                                    named_gone = true;
+                                }
                                 if let Some(&n) = nodes.get(&r) {
                                     holders.push(n);
                                 }
@@ -519,6 +595,11 @@ fn collect_collapsed_refs(
             btrfs::BTRFS_EXTENT_DATA_REF_KEY => {
                 if payload.len() >= 28 {
                     let root = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                    if in_scan.contains(&root) {
+                        named_in_scan = true;
+                    } else if !inventory.contains(&root) {
+                        named_gone = true;
+                    }
                     if let Some(&n) = nodes.get(&root) {
                         holders.push(n);
                     }
@@ -527,6 +608,11 @@ fn collect_collapsed_refs(
             btrfs::BTRFS_SHARED_DATA_REF_KEY => {
                 // keyed (bytenr, type, parent): the parent block is the offset
                 for r in g.roots_of(key_off) {
+                    if in_scan.contains(&r) {
+                        named_in_scan = true;
+                    } else if !inventory.contains(&r) {
+                        named_gone = true;
+                    }
                     if let Some(&n) = nodes.get(&r) {
                         holders.push(n);
                     }
@@ -537,19 +623,10 @@ fn collect_collapsed_refs(
     })?;
     flush_collapsed(
         cur_bytenr, cur_len, cur_data, &mut holders, keys, extents, &mut out, &mut added,
-        &mut unresolved,
+        &mut stats, named_in_scan, named_gone,
     );
-    if added > 0 {
-        eprintln!("note: {added} extents are held by snapshots alone");
-    }
-    if unresolved.0 > 0 {
-        eprintln!(
-            "note: {} extents ({} bytes) resolved to no subvolume in this scan",
-            unresolved.0,
-            unresolved.1
-        );
-    }
-    Ok(out)
+    stats.added.0 = added;
+    Ok((out, stats))
 }
 
 /// Where a scan starts: one entry per path given on the command line.
@@ -1031,14 +1108,14 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     let first = opts.roots.first().cloned().unwrap_or_else(|| b"/".to_vec());
     let f = open_dir(&first)?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
-    let inventory = btrfs::list_subvolumes(fd).unwrap_or_default();
+    let inv = btrfs::list_subvolumes(fd).unwrap_or_default();
 
 
     let mut roots = Vec::new();
     for path in &opts.roots {
         let file = open_dir(path)?;
         let info = btrfs::get_subvol_info(std::os::fd::AsRawFd::as_raw_fd(&file))?;
-        let subvol = c.intern_subvol(&info, &inventory, path);
+        let subvol = c.intern_subvol(&info, &inv, path);
         let inode = file
             .metadata()
             .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
@@ -1051,10 +1128,11 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         });
     }
     for root in &roots {
-        collect_all(&mut c, fd, &inventory, root)?;
+        collect_all(&mut c, fd, &inv, root)?;
     }
 
     let (mut tree, final_refs, collapsed_nodes) = build(&mut c, &roots);
+    tree.inventory = inv.clone();
     // the assembled array, whose references name their owner node
     let mut final_refs = final_refs;
 
@@ -1078,7 +1156,13 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
                 (n, (node.btime, node.btime_ns, tree.subvols[d.subvol as usize].otime))
             })
             .collect();
-        let mut pairs = collect_collapsed_refs(fd, &collapsed_nodes, &keys, &mut g, &mut c.extents)?;
+        // every subvolume this scan covers: a reference that names one of them
+        // is in scope, and if it resolves to nothing the bytes are lost
+        let in_scan: HashSet<u64> = tree.subvols.iter().map(|s| s.id).collect();
+        let inventory: HashSet<u64> = inv.iter().map(|r| r.treeid).collect();
+        let (mut pairs, cstats) = collect_collapsed_refs(
+            fd, &collapsed_nodes, &keys, &in_scan, &inventory, &mut g, &mut c.extents,
+        )?;
         drop(g);
         let nrefs = pairs.len();
         // A node's references have to be one contiguous run of the array, so
@@ -1102,6 +1186,29 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
             collapsed_nodes.len(),
             started.elapsed().as_secs_f64()
         );
+        eprintln!(
+            "  snapshots alone hold {} extents ({:.2} GiB); {} extents ({:.2} GiB) are held by both \
+             a walked tree and a snapshot",
+            cstats.added.0,
+            cstats.added.1 as f64 / 1073741824.0,
+            cstats.contested.0,
+            cstats.contested.1 as f64 / 1073741824.0
+        );
+        eprintln!(
+            "  unresolved: {} extents ({:.2} GiB) inside this scan, {} extents ({:.2} GiB) outside it",
+            cstats.lost.0,
+            cstats.lost.1 as f64 / 1073741824.0,
+            cstats.outside.0,
+            cstats.outside.1 as f64 / 1073741824.0
+        );
+        if cstats.gone.0 > 0 {
+            eprintln!(
+                "  {} extents ({:.2} GiB) reference a subvolume that no longer exists (a pruned \
+                 snapshot's leaves, still referenced by the ones that share them)",
+                cstats.gone.0,
+                cstats.gone.1 as f64 / 1073741824.0
+            );
+        }
         if std::env::var_os("CST_DEBUG_EXT").is_some() {
             let mut per: HashMap<u32, u64> = HashMap::new();
             for (n, _) in pairs.iter() {
@@ -1281,7 +1388,7 @@ pub fn probe_extent_tree(fd: i32) -> io::Result<(u64, u64, u64, u64, u64, Vec<(u
 /// Development aid: for a sample of data extents, what the block-reference
 /// graph resolves their references to - to be diffed against the kernel's own
 /// `LOGICAL_INO` answer for the same bytenrs.
-pub fn probe_resolve(fd: i32, sample: usize) -> io::Result<()> {
+pub fn probe_resolve(fd: i32, sample: usize, only: &[u64]) -> io::Result<()> {
     let mut g = BlockRefs {
         index: HashMap::new(),
         refs: Vec::new(),
@@ -1311,7 +1418,8 @@ pub fn probe_resolve(fd: i32, sample: usize) -> io::Result<()> {
     };
     btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, key_off, payload| {
         if bytenr != cur {
-            if cur_refs.len() > 0 && seen % sample == 0 {
+            let wanted = only.is_empty() || only.contains(&cur);
+            if cur_refs.len() > 0 && (wanted || (only.is_empty() && seen % sample == 0)) {
                 flush(cur, cur_len, &cur_refs, &mut out);
             }
             if cur_refs.len() > 0 {

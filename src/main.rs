@@ -85,7 +85,13 @@ fn main() -> ExitCode {
                 };
                 let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
                 let sample: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-                match metadata::probe_resolve(fd, sample.max(1)) {
+                let only: Vec<u64> = args
+                    .iter()
+                    .skip(2)
+                    .filter_map(|s| s.parse::<u64>().ok())
+                    .filter(|v| *v > 1_000_000)
+                    .collect();
+                match metadata::probe_resolve(fd, sample.max(1), &only) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {
                         eprintln!("resolve probe failed: {e}");
