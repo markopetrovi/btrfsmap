@@ -580,7 +580,7 @@ where
         min_objectid: BTRFS_FIRST_FREE_OBJECTID,
         max_objectid: u64::MAX,
     };
-    searcher.for_each_item(fd, &spec, None, f)
+    searcher.for_each_item(fd, &spec, cancel, f)
 }
 
 /// `(child_root, dirid, name)` for every subvolume that lives inside

@@ -31,16 +31,14 @@ With no command, the graphical browser starts: open a saved scan or pick a path 
 
 commands:
   scan [options] PATH...   one pass, per-directory metrics on stdout
-  report [-b] PATH...      compsize-compatible table (the verification mode)
+  report [-b] [--buffer BYTES] PATH...
+                           compsize-compatible table (the verification mode)
   view FILE.cst            open a saved scan in the graphical browser
   check FILE.cst           load a saved scan and print what it holds (no GUI)
 
 scan options:
-  -j, --threads N          worker threads (default: number of CPUs)
-  -L, --follow-symlinks    follow symlinks found while walking
       --exclude PATH       skip this path prefix (repeatable; makes shared
                            extents below it look exclusive to what remains)
-      --buffer BYTES       kernel search buffer per thread (default 1048576)
       --depth N            directory levels to print (default 2)
       --top N              entries per level (default 12)
       --files N            biggest files to list (default 0)
@@ -53,7 +51,6 @@ scan options:
       --reproducible       omit timings and warnings from the saved scan, so two
                            scans of the same tree produce byte-identical files
       --compress           compress the saved scan with zstd
-      --progress           print progress while scanning
   -h, --help               this help
 ";
 
@@ -363,14 +360,6 @@ fn cmd_scan(args: &[String]) -> ExitCode {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-j" | "--threads" => {
-                i += 1;
-                match parse_usize("--threads", args.get(i)) {
-                    Ok(n) => opts.threads = n,
-                    Err(c) => return c,
-                }
-            }
-            "-L" | "--follow-symlinks" => opts.follow_symlinks = true,
             "--exclude" => {
                 i += 1;
                 match args.get(i) {
@@ -379,13 +368,6 @@ fn cmd_scan(args: &[String]) -> ExitCode {
                         eprintln!("--exclude needs a path");
                         return ExitCode::from(2);
                     }
-                }
-            }
-            "--buffer" => {
-                i += 1;
-                match parse_usize("--buffer", args.get(i)) {
-                    Ok(n) => opts.buf_size = n,
-                    Err(c) => return c,
                 }
             }
             "--depth" => {
@@ -424,7 +406,6 @@ fn cmd_scan(args: &[String]) -> ExitCode {
                     }
                 }
             }
-            "--progress" => opts.progress = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;

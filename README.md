@@ -70,8 +70,8 @@ sudo compsize-tree scan [options] PATH...
 ```
 
 One pass, then per-directory metrics. The scan itself never needs a cache: the tree
-lives in memory for the report, and `serve` reads it back from a saved cache only so
-that browsing later does not mean re-walking 37M files.
+lives in memory for the report, and a saved scan is there so browsing later does not
+mean re-walking 37M files.
 
 The scan reads the filesystem's own trees instead of the files - `INODE_ITEM`,
 `DIR_INDEX` and `EXTENT_DATA` out of each subvolume's fs tree, subvolume nesting out
@@ -90,11 +90,9 @@ difference between ~160 s (and ~280 s through the files) and ~20 s warm, 36 s co
 the exact answer; the collapsed scan lands within 1.5% of it on that tree, for the
 reasons in [Limits](#limits).
 
-With `--save` the cache goes to `$XDG_CACHE_HOME/compsize-tree/<roots>.cst`
-(`~/.cache/...` by default, named after the scanned roots so scans do not clobber each
-other) and is chowned to the invoking user, which is what lets `serve` run unprivileged.
-Budget ~90 bytes per file: ~3.5 GB for a 37M file `/home`, or ~750 MB with `--compress`.
-The UI footer reports the cache size and offers to delete it.
+`--save FILE` writes the scan wherever you point it, and hands the file to the invoking
+user, so a scan run under `sudo` leaves something you can open without it. Budget ~90
+bytes per file: ~3.5 GB for a 37M file `/home`, or ~750 MB with `--compress`.
 
 | option | |
 |---|---|
@@ -109,19 +107,6 @@ The UI footer reports the cache size and offers to delete it.
 | `--full-scan` | walk snapshot-class subvolumes too (default: one node per snapshot, aggregates only) |
 | `--progress` | live file/dir counters |
 | `--dump-subvols` | print the subvolume inventory with snapshot classification |
-
-### `serve`
-
-```
-compsize-tree serve [--cache PATH] [--port 8787] [--open]
-```
-
-Serves the newest cache in `$XDG_CACHE_HOME/compsize-tree` (or `--cache PATH`) and prints the
-URL; `--open` launches the browser for you.
-Local HTTP server on 127.0.0.1 serving a single-page UI: a lazily expanding
-file list, a sunburst ring chart (click a wedge to descend) or treemap, a
-metric selector, badges for snapshot/shared entries, biggest files/ directories
-and name search. Nothing is sent anywhere; the server only reads the cache.
 
 ### `report` (the compsize-compatible verifier)
 

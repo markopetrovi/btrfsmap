@@ -91,8 +91,6 @@ struct Collected {
     names: Vec<u8>,
     /// subvolumes nested directly inside this one: (child root id, dir inode, name)
     nested: Vec<(u64, u64, Vec<u8>)>,
-    dirs: u64,
-    files: u64,
 }
 
 /// Collects a whole scan: the shared extent map, the flat reference array and
@@ -212,8 +210,6 @@ fn collect_subvolume(
         entries: Vec::new(),
         names: Vec::new(),
         nested: Vec::new(),
-        dirs: 0,
-        files: 0,
     };
     let mut cur: Option<InodeRec> = None;
     let mut overflow = false;
@@ -1216,13 +1212,12 @@ fn collect_all(
         if std::env::var_os("CST_TIME_SUBVOL").is_some() {
             let s = &c.subvols[subvol as usize];
             eprintln!(
-                "[time]   subvol {} ({}) walked in {:.2}s: {} files, {} dirs, {} recs",
+                "[time]   subvol {} ({}) walked in {:.2}s: {} inodes, {} entries",
                 s.id,
                 String::from_utf8_lossy(&path),
                 t_sub.elapsed().as_secs_f64(),
-                col.files,
-                col.dirs,
-                col.recs.len()
+                col.recs.len(),
+                col.entries.len()
             );
         }
         for (child_root, dirid, name) in &col.nested {

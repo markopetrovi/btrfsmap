@@ -43,11 +43,7 @@ impl Progress {
 #[derive(Clone)]
 pub struct ScanOptions {
     pub roots: Vec<Vec<u8>>,
-    pub threads: usize,
-    pub follow_symlinks: bool,
-    pub buf_size: usize,
     pub excludes: Vec<Vec<u8>>,
-    pub progress: bool,
     /// walk snapshot-class subvolumes' trees instead of taking their
     /// references from the extent tree (their interiors stay browsable)
     pub full_scan: bool,
@@ -61,11 +57,7 @@ impl Default for ScanOptions {
     fn default() -> Self {
         ScanOptions {
             roots: Vec::new(),
-            threads: 0,
-            follow_symlinks: false,
-            buf_size: 1 << 20,
             excludes: Vec::new(),
-            progress: false,
             full_scan: false,
             live: None,
         }
