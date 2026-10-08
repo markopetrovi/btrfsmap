@@ -70,14 +70,12 @@ sudo compsize-tree scan [options] PATH...
 ```
 
 One pass, then per-directory metrics. The scan itself never needs a cache: the tree
-lives in memory for the report, and `serve` reads it back from a saved cache only so
-that browsing later does not mean re-walking 37M files.
+lives in memory for the report, and a saved scan is there so browsing later does not
+mean re-walking 37M files.
 
-With `--save` the cache goes to `$XDG_CACHE_HOME/compsize-tree/<roots>.cst`
-(`~/.cache/...` by default, named after the scanned roots so scans do not clobber each
-other) and is chowned to the invoking user, which is what lets `serve` run unprivileged.
-Budget ~90 bytes per file: ~3.5 GB for a 37M file `/home`, or ~750 MB with `--compress`.
-The UI footer reports the cache size and offers to delete it.
+`--save FILE` writes the scan wherever you point it, and hands the file to the invoking
+user, so a scan run under `sudo` leaves something you can open without it. Budget ~90
+bytes per file: ~3.5 GB for a 37M file `/home`, or ~750 MB with `--compress`.
 
 | option | |
 |---|---|
@@ -91,19 +89,6 @@ The UI footer reports the cache size and offers to delete it.
 | `-b, --bytes` | raw byte counts instead of human units |
 | `--progress` | live file/dir counters |
 | `--dump-subvols` | print the subvolume inventory with snapshot classification |
-
-### `serve`
-
-```
-compsize-tree serve [--cache PATH] [--port 8787] [--open]
-```
-
-Serves the newest cache in `$XDG_CACHE_HOME/compsize-tree` (or `--cache PATH`) and prints the
-URL; `--open` launches the browser for you.
-Local HTTP server on 127.0.0.1 serving a single-page UI: a lazily expanding
-file list, a sunburst ring chart (click a wedge to descend) or treemap, a
-metric selector, badges for snapshot/shared entries, biggest files/ directories
-and name search. Nothing is sent anywhere; the server only reads the cache.
 
 ### `report` (the compsize-compatible verifier)
 
@@ -170,3 +155,5 @@ identity comes from `BTRFS_IOC_GET_SUBVOL_INFO` at `st_dev` boundaries plus a
 root-tree scan for the UUID inventory, so snapshots are recognised
 structurally rather than by path convention. Compression, inline extents,
 prealloc and holes are all accounted the way compsize accounts them.
+
+--- this branch ---
