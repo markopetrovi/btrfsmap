@@ -112,6 +112,10 @@ struct Collector {
     full_scan: bool,
     /// snapshot-class subvolumes left un-walked: (root id, subvol index, path)
     collapsed: Vec<(u64, u16, Vec<u8>)>,
+    /// (collapsed parent's root id, child subvol index, name) for subvolumes
+    /// found through the root tree inside a collapsed one: their trees are
+    /// read, and this is where their nodes hang.
+    graph_kids: Vec<(u64, u16, Vec<u8>)>,
 }
 
 impl Collector {
@@ -128,6 +132,36 @@ impl Collector {
 }
 
 impl Collector {
+    /// Intern a subvolume from its root item, for one found in the root tree
+    /// rather than by opening a path: the root tree carries the whole identity
+    /// (uuid, parent_uuid, flags, otime), so nothing has to be opened - which is
+    /// what lets a subvolume nested inside a *collapsed* one, whose directories
+    /// are never read, still be found and judged on its own merits.
+    fn intern_root(
+        &mut self,
+        r: &btrfs::RootItem,
+        inventory: &[btrfs::RootItem],
+        path: &[u8],
+        name: &[u8],
+    ) -> u16 {
+        if let Some(i) = self.subvols.iter().position(|s| s.id == r.treeid) {
+            return i as u16;
+        }
+        let snapshot = r.parent_uuid != [0u8; 16] && inventory.iter().any(|x| x.uuid == r.parent_uuid);
+        self.subvols.push(Subvol {
+            id: r.treeid,
+            uuid: r.uuid,
+            parent_uuid: r.parent_uuid,
+            flags: r.flags,
+            otime: r.otime_sec,
+            name: name.to_vec(),
+            path: path.to_vec(),
+            seen: true,
+            snapshot,
+        });
+        (self.subvols.len() - 1) as u16
+    }
+
     fn intern_subvol(&mut self, info: &btrfs::SubvolInfo, inventory: &[btrfs::RootItem], path: &[u8]) -> u16 {
         if let Some(i) = self.subvols.iter().position(|s| s.id == info.treeid) {
             return i as u16;
@@ -966,7 +1000,53 @@ fn build(c: &mut Collector, roots: &[Root]) -> (Tree, Vec<u64>, HashMap<u64, u32
             };
             if let Some(subvol) = collapsed {
                 let idx = push_collapsed_node(&mut tree, c, subvol, node_idx, &child_name, depth);
-                collapsed_nodes.insert(tree.subvols[subvol as usize].id, idx);
+                let root_id = tree.subvols[subvol as usize].id;
+                collapsed_nodes.insert(root_id, idx);
+                // A subvolume the root tree says lives inside this collapsed one
+                // had its own tree read, so its node belongs here. The chain of
+                // directories between the two is not read - that is the point
+                // of collapsing - so it hangs directly off the collapsed node.
+                let kids = c.graph_kids.clone();
+                let first = tree.nodes.len() as u32;
+                for (p_root, child_subvol, gname) in kids {
+                    if p_root != root_id {
+                        continue;
+                    }
+                    let Some(child_ci) =
+                        c.subs.iter().position(|s| s.subvol == child_subvol)
+                    else {
+                        continue;
+                    };
+                    let sv = &tree.subvols[child_subvol as usize];
+                    let mut f = FLAG_SUBVOL;
+                    if sv.is_snapshot() {
+                        f |= FLAG_SNAPSHOT;
+                    }
+                    if sv.is_readonly() {
+                        f |= FLAG_READONLY;
+                    }
+                    let inode = btrfs::BTRFS_FIRST_FREE_OBJECTID;
+                    let Ok(pos) = c.subs[child_ci].recs.binary_search_by_key(&inode, |r| r.inode)
+                    else {
+                        continue;
+                    };
+                    let rec = c.subs[child_ci].recs[pos];
+                    let gidx = push_node(
+                        &mut tree, c, child_ci, inode, idx, &gname, f, rec, KIND_DIR,
+                        &mut final_refs, &mut inode_copies,
+                    );
+                    let gd = tree.dirs.len() as u32;
+                    tree.dirs.push(DirExtra {
+                        subvol: c.subs[child_ci].subvol,
+                        depth: depth + 1,
+                        ..Default::default()
+                    });
+                    tree.nodes[gidx as usize].extra = gd;
+                    dirs.push_back((child_ci, inode, gidx));
+                }
+                let n = tree.nodes.len() as u32 - first;
+                tree.nodes[idx as usize].first_child = first;
+                tree.nodes[idx as usize].nchildren = n;
                 continue;
             }
             let Ok(pos) = c.subs[child_ci].recs.binary_search_by_key(&child_inode, |r| r.inode) else {
@@ -1051,28 +1131,72 @@ fn collect_all(
     fd: i32,
     inventory: &[btrfs::RootItem],
     start: &Root,
+    excludes: &[Vec<u8>],
 ) -> io::Result<()> {
-    let mut work: Vec<(u64, u16, Vec<u8>)> = vec![(start.info.treeid, start.subvol, start.path.clone())];
+    // (root id, subvol index, path, whether to read its fs tree). A collapsed
+    // subvolume is still *visited*, to find what lives inside it - just not
+    // read.
+    let mut work: Vec<(u64, u16, Vec<u8>, bool)> =
+        vec![(start.info.treeid, start.subvol, start.path.clone(), true)];
     let mut done: Vec<u64> = Vec::new();
-    while let Some((root_id, subvol, path)) = work.pop() {
+    while let Some((root_id, subvol, path, read_tree)) = work.pop() {
         if done.contains(&root_id) {
             continue;
         }
         done.push(root_id);
+        if !read_tree {
+            // A collapsed subvolume's directories are never read, so its
+            // children come from the root tree instead: every subvolume
+            // reference is a ROOT_BACKREF keyed (child, ROOT_BACKREF, parent)
+            // carrying the entry's dirid and name, so one search per collapsed
+            // root yields them all with no directory reading at all - the way
+            // `btrfs subvolume list -o` answers the same question.
+            //
+            // They matter: a container layer can hold a mock root made with
+            // `dnf --installroot`, which is not a snapshot of anything and has
+            // a tree and files of its own. Skipping it loses its extents, since
+            // nothing else can attribute them - the extent tree names a
+            // subvolume the scan would never have interned.
+            for (child_root, _dirid, name) in btrfs::subvolumes_inside(fd, root_id)? {
+                let Some(r) = inventory.iter().find(|r| r.treeid == child_root) else {
+                    continue;
+                };
+                let mut child_path = path.clone();
+                if !child_path.ends_with(b"/") {
+                    child_path.push(b'/');
+                }
+                child_path.extend_from_slice(&name);
+                if excluded(&child_path, excludes) {
+                    continue;
+                }
+                let child = c.intern_root(r, inventory, &child_path, &name);
+                let collapsed = c.collapse(child);
+                if collapsed {
+                    c.collapsed.push((child_root, child, child_path.clone()));
+                } else {
+                    c.graph_kids.push((root_id, child, name.clone()));
+                }
+                work.push((child_root, child, child_path, !collapsed));
+            }
+            continue;
+        }
         let otime = c.subvols[subvol as usize].otime;
-        // Scanning a whole subvolume (its root inode) is the common case and
-        // needs no filtering; only a scan started deeper has to work out which
-        // inodes are inside the requested directory.
-        let scope = if path == start.path && start.inode != btrfs::BTRFS_FIRST_FREE_OBJECTID {
-            Some(scope_of(fd, root_id, start.inode)?)
-        } else {
-            None
-        };
+        // Which subvolume a scan started in is a question about the subvolume,
+        // not about the spelling of the path it was given.
+        let scope =
+            if root_id == start.info.treeid && start.inode != btrfs::BTRFS_FIRST_FREE_OBJECTID {
+                Some(scope_of(fd, root_id, start.inode)?)
+            } else {
+                None
+            };
         let col = collect_subvolume(c, fd, root_id, subvol, otime, scope.as_ref())?;
         for (child_root, dirid, name) in &col.nested {
             // the nested subvolume is reachable as a directory of this one, so
             // its identity is one open() away - no need to decode root items
             let child_path = path_to_dir(&col, *dirid, name, &path);
+            if excluded(&child_path, excludes) {
+                continue;
+            }
             let Ok(child) = open_dir(&child_path) else { continue };
             let Ok(info) = btrfs::get_subvol_info(std::os::fd::AsRawFd::as_raw_fd(&child)) else {
                 continue;
@@ -1081,27 +1205,22 @@ fn collect_all(
                 continue;
             }
             let child_subvol = c.intern_subvol(&info, inventory, &child_path);
-            if c.collapse(child_subvol) {
-                // No fs tree walk: its references come from the extent tree, so
-                // its subtree is not browsable - the trade the collapsed mode
-                // is built on.
-                //
-                // A subvolume nested inside a collapsed one is *not* found
-                // here, and that is a known gap: a container layer can hold a
-                // mock root (parent_uuid unset, so not a snapshot and not
-                // collapse-worthy) whose tree this scan then never walks, and
-                // whose extents it cannot attribute from the extent tree
-                // either. Measured on /home: 13,717 extents, 9.8 GiB. Finding
-                // them means enumerating a collapsed subvolume's children from
-                // the root tree instead.
-                c.collapsed.push((*child_root, child_subvol, child_path));
-                continue;
+            let collapsed = c.collapse(child_subvol);
+            if collapsed {
+                c.collapsed.push((*child_root, child_subvol, child_path.clone()));
             }
-            work.push((*child_root, child_subvol, child_path));
+            work.push((*child_root, child_subvol, child_path, !collapsed));
         }
         c.subs.push(col);
     }
     Ok(())
+}
+
+/// Would this path be skipped? `--exclude` is a prefix match, as in the file
+/// backend: the excluded subtree is not walked, so extents shared with it look
+/// exclusive against what remains.
+fn excluded(path: &[u8], excludes: &[Vec<u8>]) -> bool {
+    excludes.iter().any(|ex| path.starts_with(ex))
 }
 
 /// Scan by reading the trees: identical results to `walk::scan_tree`, without
@@ -1120,6 +1239,7 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         dirs: 0,
         full_scan: opts.full_scan,
         collapsed: Vec::new(),
+        graph_kids: Vec::new(),
     };
 
     // inventory of every subvolume, for snapshot classification
@@ -1146,7 +1266,7 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         });
     }
     for root in &roots {
-        collect_all(&mut c, fd, &inv, root)?;
+        collect_all(&mut c, fd, &inv, root, &opts.excludes)?;
     }
 
     let (mut tree, final_refs, collapsed_nodes) = build(&mut c, &roots);
