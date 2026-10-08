@@ -329,10 +329,6 @@ pub struct BlockRefs {
     /// kind 176 = "a block in root R's tree points here", 182 = "block P does"
     refs: Vec<(u8, u64)>,
     memo: HashMap<u64, Vec<u64>>,
-    /// blocks whose reference list the kernel itself does not trust
-    /// (`BTRFS_BLOCK_FLAG_FULL_BACKREF`): an extent referenced through one of
-    /// these cannot be resolved from the extent tree alone
-    full: HashSet<u64>,
 }
 
 impl BlockRefs {
@@ -384,9 +380,6 @@ fn collect_block_refs(fd: i32, g: &mut BlockRefs) -> io::Result<()> {
                 if !btrfs::is_metadata_extent(ty, &h) {
                     return;
                 }
-                if h.flags & btrfs::BTRFS_BLOCK_FLAG_FULL_BACKREF != 0 {
-                    g.full.insert(bytenr);
-                }
                 btrfs::for_each_inline_ref(ty, payload, &mut |ty, body| {
                     let value = u64::from_le_bytes(body[..8].try_into().unwrap());
                     match ty {
@@ -419,9 +412,6 @@ fn flush_collapsed(
     stats: &mut CollapseStats,
     named_in_scan: bool,
     named_gone: bool,
-    candidates: &mut Vec<(u64, u64)>,
-    suspect: bool,
-    want_candidates: bool,
 ) {
     if holders.is_empty() {
         if is_data && !extents.contains_key(&((bytenr >> 12) as u32)) {
@@ -440,9 +430,6 @@ fn flush_collapsed(
             };
             bucket.0 += 1;
             bucket.1 += len;
-            if suspect && want_candidates {
-                candidates.push((len, bytenr));
-            }
         }
         return;
     }
@@ -566,31 +553,17 @@ fn collect_collapsed_refs(
     // is the general signal: it is exactly the case where the extent tree's ref
     // list is known to be incomplete, so a subvolume that holds the extent can
     // be missing from it.
-    // Off by default: asking the kernel is the only exact route, at ~80-400us
-    // per extent, so it has to be aimed. Measured on /home with a 20s budget
-    // over the 245k largest unresolved extents: not one belonged to a collapsed
-    // subvolume, so the extents the collapsed scan cannot attribute are not
-    // simply the unresolved ones. Left as a knob for the filesystem where it
-    // does line up. See the README's limits.
-    let resolve_budget: f64 = std::env::var("CST_RESOLVE_SECONDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0);
-    let mut candidates: Vec<(u64, u64)> = Vec::new();
-    let mut suspect = false;
 
     btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, key_off, payload| {
         if bytenr != cur_bytenr {
             flush_collapsed(
                 cur_bytenr, cur_len, cur_data, &mut holders, keys, extents, &mut out,
-                &mut added, &mut stats, named_in_scan, named_gone, &mut candidates, suspect,
-                resolve_budget > 0.0,
+                &mut added, &mut stats, named_in_scan, named_gone,
             );
             cur_bytenr = bytenr;
             cur_data = false;
             named_in_scan = false;
             named_gone = false;
-            suspect = false;
             cur_len = key_off; // an EXTENT_ITEM's key offset is its length
         }
         match ty {
@@ -619,9 +592,6 @@ fn collect_collapsed_refs(
                         // a shared reference names the tree block that holds the
                         // file extent; the subvolumes are the roots that reach it
                         if let Some(s) = btrfs::parse_shared_data_ref(body) {
-                            if g.full.contains(&s.parent) {
-                                suspect = true;
-                            }
                             for r in g.roots_of(s.parent) {
                                 if in_scan.contains(&r) {
                                     named_in_scan = true;
@@ -654,9 +624,6 @@ fn collect_collapsed_refs(
             }
             btrfs::BTRFS_SHARED_DATA_REF_KEY => {
                 // keyed (bytenr, type, parent): the parent block is the offset
-                if g.full.contains(&key_off) {
-                    suspect = true;
-                }
                 for r in g.roots_of(key_off) {
                     if in_scan.contains(&r) {
                         named_in_scan = true;
@@ -673,59 +640,10 @@ fn collect_collapsed_refs(
     })?;
     flush_collapsed(
         cur_bytenr, cur_len, cur_data, &mut holders, keys, extents, &mut out, &mut added,
-        &mut stats, named_in_scan, named_gone, &mut candidates, suspect,
-        resolve_budget > 0.0,
+        &mut stats, named_in_scan, named_gone,
     );
     stats.added.0 = added;
 
-    // The budgeted repair. The extent tree can name a root whose block
-    // references are incomplete (`FULL_BACKREF`), and then an extent held only
-    // by collapsed snapshots looks exactly like one held by a subvolume outside
-    // the scan. The kernel can tell them apart - `LOGICAL_INO` does the full
-    // backref walk, reading tree blocks one at a time - but at ~150us per
-    // extent it is minutes for the whole filesystem, so it is spent here on the
-    // largest unresolved extents only, under a time cap.
-    if !candidates.is_empty() {
-        let budget = resolve_budget;
-        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        let queued: Vec<(u64, u64)> = std::mem::take(&mut candidates);
-        let started = std::time::Instant::now();
-        let mut buf: Vec<u8> = Vec::new();
-        let (mut tried, mut fixed, mut bytes) = (0u64, 0u64, 0u64);
-        for (len, bytenr) in queued.iter() {
-            if started.elapsed().as_secs_f64() > budget {
-                break;
-            }
-            tried += 1;
-            let Ok(refs) = btrfs::logical_ino(fd, *bytenr, &mut buf) else {
-                continue;
-            };
-            holders.clear();
-            for (root, _ino, _off) in refs {
-                if let Some(&n) = nodes.get(&root) {
-                    holders.push(n);
-                }
-            }
-            if holders.is_empty() {
-                continue; // genuinely outside the scan
-            }
-            flush_collapsed(
-                *bytenr, *len, true, &mut holders, keys, extents, &mut out, &mut added,
-                &mut stats, false, false, &mut candidates, false, false,
-            );
-            fixed += 1;
-            bytes += len;
-        }
-        if tried > 0 {
-            eprintln!(
-                "  asked the kernel about the {tried} largest unresolved extents ({:.1}s): \
-                 {fixed} belong to a collapsed subvolume ({:.2} GiB); {} left",
-                started.elapsed().as_secs_f64(),
-                bytes as f64 / 1073741824.0,
-                queued.len() as u64 - tried
-            );
-        }
-    }
     Ok((out, stats))
 }
 
@@ -1167,6 +1085,15 @@ fn collect_all(
                 // No fs tree walk: its references come from the extent tree, so
                 // its subtree is not browsable - the trade the collapsed mode
                 // is built on.
+                //
+                // A subvolume nested inside a collapsed one is *not* found
+                // here, and that is a known gap: a container layer can hold a
+                // mock root (parent_uuid unset, so not a snapshot and not
+                // collapse-worthy) whose tree this scan then never walks, and
+                // whose extents it cannot attribute from the extent tree
+                // either. Measured on /home: 13,717 extents, 9.8 GiB. Finding
+                // them means enumerating a collapsed subvolume's children from
+                // the root tree instead.
                 c.collapsed.push((*child_root, child_subvol, child_path));
                 continue;
             }
@@ -1235,7 +1162,6 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
             index: HashMap::new(),
             refs: Vec::new(),
             memo: HashMap::new(),
-            full: HashSet::new(),
         };
         collect_block_refs(fd, &mut g)?;
         let blocks = g.index.len();
@@ -1348,6 +1274,25 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     tree.scanned_roots = opts.roots.clone();
 
     let mut extents = c.extents;
+    // Development aid: the extent map this scan ended up with, as logical
+    // bytenrs, so two scans can be diffed against each other.
+    if let Ok(path) = std::env::var("CST_DUMP_MAP") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            let mut pages: Vec<u32> = extents.keys().copied().collect();
+            pages.sort_unstable();
+            let mut buf = String::with_capacity(1 << 20);
+            for p in pages {
+                buf.push_str(&format!("{}\n", (p as u64) << 12));
+                if buf.len() >= 1 << 20 {
+                    let _ = f.write_all(buf.as_bytes());
+                    buf.clear();
+                }
+            }
+            let _ = f.write_all(buf.as_bytes());
+            eprintln!("dumped {} extents to {path}", extents.len());
+        }
+    }
     let subvol_otime: Vec<u64> = tree.subvols.iter().map(|s| s.otime).collect();
     tree.attribute_owned(&ref_blocks, &mut extents, &subvol_otime);
     tree.attribute_reach(&mut ref_blocks, &extents);
@@ -1485,7 +1430,6 @@ pub fn probe_resolve(fd: i32, sample: usize, only: &[u64]) -> io::Result<()> {
         index: HashMap::new(),
         refs: Vec::new(),
         memo: HashMap::new(),
-        full: HashSet::new(),
     };
     collect_block_refs(fd, &mut g)?;
     eprintln!("block graph: {} blocks, {} references", g.index.len(), g.refs.len());

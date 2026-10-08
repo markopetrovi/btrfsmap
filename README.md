@@ -176,12 +176,23 @@ references to, to be diffed against the kernel's own answer from
   with 30 snapper snapshots and ~90 container layers: about **13,600 extents,
   9.8 GiB**, and the loss lands entirely in the snapshot aggregates - every
   walked subtree's number is identical between the two modes, and so is
-  `owned(root)` minus those bytes. They are *not* the extents the scan reports
-  as unresolvable, which is what one would expect: asking the kernel
-  (`LOGICAL_INO`, which does the full backref walk the extent tree cannot) about
-  the **245,000 largest unresolved extents found not one belonging to a
-  collapsed subvolume**. The mechanism is still open, and `--full-scan` is the
-  exact answer when it matters.
+  `owned(root)` minus those bytes. They are not the extents the scan reports as
+  unresolvable - asking the kernel (`LOGICAL_INO`, which does the full backref
+  walk the extent tree cannot) about the 245,000 largest of those found not one
+  belonging to a collapsed subvolume.
+
+  They are **subvolumes nested inside a collapsed one**. A container layer can
+  hold a mock root created with `dnf --installroot`: its own tree, its own
+  files, and no `parent_uuid`, so it is not a snapshot and has no business being
+  collapsed - but the collapsed scan never discovers it, because nested
+  subvolumes are found by reading a parent's directories and a collapsed
+  subvolume's directories are exactly what is not read. Its extents are then
+  referenced by a subvolume the scan never interns, and the extent tree cannot
+  place them either. On the tree measured, nearly all of the 13,717 are held by
+  one such root. The fix is to enumerate a collapsed subvolume's children from
+  the root tree (`ROOT_BACKREF`), which the search for the remaining bytes
+  established; it is a change to how subvolumes are discovered, so it wants its
+  own round of gate checks. `--full-scan` is the exact answer until then.
 * `CST_RESOLVE_SECONDS=<n>` spends up to n seconds asking the kernel about the
   largest unresolved extents - the exact route, for a filesystem where the
   missing ones are the big ones. Default 0: it costs ~80-400 us per extent and
