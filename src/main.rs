@@ -16,7 +16,7 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 extern "C" {
     fn geteuid() -> u32;
@@ -46,6 +46,8 @@ scan options:
   -b, --bytes              raw byte counts in the report
       --dump-subvols       print the subvolume inventory and its classification
       --save FILE          also write the scan to FILE (the GUI can open it)
+      --reproducible       omit timings and warnings from the saved scan, so two
+                           scans of the same tree produce byte-identical files
       --compress           compress the saved scan with zstd
       --progress           print progress while scanning
   -h, --help               this help
@@ -288,6 +290,7 @@ fn cmd_scan(args: &[String]) -> ExitCode {
                 }
             }
             "--progress" => opts.progress = true,
+            "--reproducible" => opts.reproducible = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -346,7 +349,14 @@ fn cmd_scan(args: &[String]) -> ExitCode {
     }
 
     if let Some(path) = save {
-        let c = cache::Cache::from_tree(&tree);
+        let mut c = cache::Cache::from_tree(&tree);
+        if opts.reproducible {
+            // Nothing about the run itself goes into the file: not when it ran,
+            // not how long it took, not the warnings it collected.
+            c.scanned_at = 0;
+            c.stats.elapsed = Duration::ZERO;
+            c.warnings.clear();
+        }
         let res = if compress {
             c.write_compressed(&path)
         } else {

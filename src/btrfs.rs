@@ -80,8 +80,11 @@ const OFF_SUBVOL_RECEIVED_UUID: usize = OFF_SUBVOL_PARENT_UUID + BTRFS_UUID_SIZE
 const OFF_SUBVOL_CTIME: usize = OFF_SUBVOL_RECEIVED_UUID + BTRFS_UUID_SIZE + 4 * 8;
 const OFF_SUBVOL_OTIME: usize = OFF_SUBVOL_CTIME + 16;
 
-#[allow(dead_code)]
-pub const BTRFS_SUBVOL_RDONLY: u64 = 1 << 1;
+/// Bit 0 of `struct btrfs_root_item`'s flags, and of the flags
+/// GET_SUBVOL_INFO reports (which are a copy of the root item's). The ioctl
+/// flag of the same name - what BTRFS_IOC_SUBVOL_SETFLAGS takes - is a
+/// different bit and never shows up in either.
+pub const BTRFS_ROOT_SUBVOL_RDONLY: u64 = 1 << 0;
 
 /// What the kernel tells us about a subvolume - enough to identify snapshots
 /// structurally (via `parent_uuid`) instead of guessing from path names.

@@ -38,24 +38,35 @@ pub struct Node {
     pub nchildren: u32,
     pub first_ref: u32,
     pub nrefs: u32,
-    /// dir: index into `dirs`; file: ref block index
+    /// dir: index into `dirs`; file: unused once the scan is attributed
     pub extra: u32,
     pub mtime: u32,
     pub owned: u64,
     pub referenced: u64,
     pub uncomp: u64,
     pub name_len: u16,
-    pub inline_disk: u16,
+    /// Where an inline extent's disk size used to sit. Inline payloads live in
+    /// metadata rather than in a data extent, so they are not tracked per node
+    /// any more - but the slot is kept, zeroed, so the saved-scan layout does
+    /// not move.
+    pub pad_inline_disk: u16,
     pub kind: u8,
     pub flags: u8,
-    pub inline_ram: u16,
+    /// Where an inline extent's uncompressed size used to sit (see above).
+    pub pad_inline_ram: u16,
     /// inode creation time (unix seconds): with the subvolume's age this is the
-    /// ownership key - the oldest holder of an extent owns it
+    /// ownership key - the oldest holder of an extent owns it. u32::MAX means
+    /// "unknown", which is what a node inside a snapshot-class subvolume
+    /// carries: a copy's birth time says nothing about the data.
     pub btime: u32,
     /// sub-second part of the birth time, nanoseconds >> 14 (~16 us steps, so
     /// files created microseconds apart still order correctly). Fits in what
     /// used to be struct padding.
     pub btime_ns: u16,
+    /// Declared tail padding: the cache file is a raw dump of this struct, so
+    /// every byte must be a field - implicit padding would leak stack garbage
+    /// into the file and break byte-for-byte reproducibility.
+    pub pad_tail: u16,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -69,19 +80,20 @@ pub struct DirExtra {
     pub uncomp_reach: u64,
     pub nfiles: u64,
     pub ndirs: u64,
-    /// inline extents live in metadata and are always private to one file.
-    pub inline_disk_sub: u64,
-    pub inline_ram_sub: u64,
     pub subvol: u16,
     pub depth: u16,
+    /// Declared tail padding, for the same reason as `Node::pad_tail`: every
+    /// byte of the raw dump must be a field.
+    pub pad: u32,
 }
 
 #[derive(Clone, Copy, Default)]
 pub struct ExtentInfo {
     pub disk: u64,
     pub ram: u64,
-    /// smallest (birth time, subvolume creation time) seen for this extent,
-    /// tracked incrementally during the walk
+    /// smallest (birth time, subvolume creation time) seen for this extent.
+    /// Filled in *after* the tree is assembled, from the references that
+    /// actually belong to nodes - see `Tree::compute_windows`.
     pub win_btime: u32,
     pub win_btime_ns: u16,
     pub win_otime: u64,
@@ -114,7 +126,7 @@ impl Subvol {
         self.snapshot
     }
     pub fn is_readonly(&self) -> bool {
-        self.flags & 0b10 != 0
+        self.flags & crate::btrfs::BTRFS_ROOT_SUBVOL_RDONLY != 0
     }
 }
 
@@ -179,18 +191,78 @@ impl Tree {
 // ---------------------------------------------------------------------------
 
 impl Tree {
+    /// The ownership key of a reference living in node `id`: (birth time,
+    /// nanoseconds, creation time of the subvolume it lives in). A node inside
+    /// a snapshot-class subvolume carries no birth time at all, so such a
+    /// reference keys on its subvolume's age alone (see `Node::btime`).
+    fn key_of(&self, id: u32, subvol_otime: &[u64]) -> (u32, u16, u64) {
+        let n = &self.nodes[id as usize];
+        let p = &self.nodes[n.parent as usize];
+        let sv = if p.kind == KIND_DIR {
+            self.dirs[p.extra as usize].subvol
+        } else {
+            0
+        };
+        (n.btime, n.btime_ns, *subvol_otime.get(sv as usize).unwrap_or(&0))
+    }
+
+    /// Fold the ownership window of every extent out of the references that
+    /// belong to nodes, and only those.
+    ///
+    /// This runs once the tree is assembled, not while references are being
+    /// read: an inode that never became a node - normally an unlinked file that
+    /// is still alive because a mount or an open fd holds it, so it is pending
+    /// deletion and ought to be invisible - would otherwise be able to set a
+    /// window no node can match, and the extent's legitimate holders would lose
+    /// their share of it. Extents referenced only by such inodes simply stay
+    /// unowned (`win_count == 0`), which is right: they are not part of the
+    /// tree.
+    pub fn compute_windows(&self, refs: &[Vec<u64>], extents: &mut ExtentMap, subvol_otime: &[u64]) {
+        for e in extents.values_mut() {
+            e.win_btime = u32::MAX;
+            e.win_btime_ns = u16::MAX;
+            e.win_otime = u64::MAX;
+            e.win_count = 0;
+        }
+        for block in refs {
+            for r in block {
+                let owner = (*r & 0xffff_ffff) as u32;
+                // `flatten` stamps a node id onto the references of files that
+                // became nodes; anything still pointing at the synthetic root
+                // belongs to an inode that did not, so it gets no say
+                if owner == self.root {
+                    continue;
+                }
+                let Some(e) = extents.get_mut(&((*r >> 32) as u32)) else {
+                    continue;
+                };
+                let key = self.key_of(owner, subvol_otime);
+                let best = (e.win_btime, e.win_btime_ns, e.win_otime);
+                if key < best {
+                    e.win_btime = key.0;
+                    e.win_btime_ns = key.1;
+                    e.win_otime = key.2;
+                    e.win_count = 1;
+                } else if key == best {
+                    e.win_count += 1;
+                }
+            }
+        }
+    }
+
     /// Split every extent between its references and give each file its
     /// `owned` / `uncomp` share.
     ///
     /// The ownership rule: every reference carries a key of (inode birth time,
     /// creation time of the subvolume it lives in). The smallest key owns the
-    /// extent. A snapshot shares its inodes with the subvolume it was taken
-    /// from, so those references tie on birth time and the older subvolume -
-    /// the original - keeps ownership; a reflink copy is strictly younger than
-    /// its source, whichever subvolume it landed in, so the source keeps
-    /// ownership. References that share the smallest key split the extent
-    /// evenly, and the integer remainder goes to the last of them, so every
-    /// subtree's total still equals the real physical usage.
+    /// extent. A reference inside a snapshot-class subvolume has no birth time,
+    /// so it keys on the subvolume's age alone and loses to every walked file:
+    /// among snapshots only subvolume ages decide, and the oldest snapshot
+    /// becomes the custodian of what the live trees have let go of. A reflink
+    /// copy is strictly younger than its source, whichever subvolume it landed
+    /// in, so the source keeps ownership. References that share the smallest
+    /// key split the extent evenly, and the integer remainder goes to the last
+    /// of them, so every subtree's total still equals the real physical usage.
     pub fn attribute_owned(
         &mut self,
         refs: &[Vec<u64>],
@@ -201,35 +273,14 @@ impl Tree {
             e.assigned = 0;
         }
         for i in 0..self.nodes.len() {
-            let (kind, nrefs, first_ref, block, inline_disk, inline_ram, btime, btime_ns, parent) = {
-                let n = &self.nodes[i];
-                (
-                    n.kind,
-                    n.nrefs as usize,
-                    n.first_ref as usize,
-                    n.extra as usize,
-                    n.inline_disk as u64,
-                    n.inline_ram as u64,
-                    n.btime,
-                    n.btime_ns,
-                    n.parent,
-                )
-            };
-            if kind != KIND_FILE {
+            let n = &self.nodes[i];
+            if n.kind != KIND_FILE {
                 continue;
             }
-            let ctime = {
-                let p = &self.nodes[parent as usize];
-                let sv = if p.kind == KIND_DIR {
-                    self.dirs[p.extra as usize].subvol
-                } else {
-                    0
-                };
-                *subvol_otime.get(sv as usize).unwrap_or(&0)
-            };
-            // Inline payloads are private to this file and need no splitting.
-            let mut owned = inline_disk;
-            let mut uncomp = inline_ram;
+            let (nrefs, first_ref, block) = (n.nrefs as usize, n.first_ref as usize, n.extra as usize);
+            let (btime, btime_ns, ctime) = self.key_of(i as u32, subvol_otime);
+            let mut owned = 0u64;
+            let mut uncomp = 0u64;
             for r in &refs[block][first_ref..first_ref + nrefs] {
                 let Some(e) = extents.get_mut(&((*r >> 32) as u32)) else {
                     continue;
@@ -389,6 +440,21 @@ impl Tree {
         }
     }
 
+    /// Drop the walk's own bookkeeping from the file nodes once the extents
+    /// have been attributed. Which reference block a file's extents were read
+    /// into is an accident of which thread picked up its directory, and nothing
+    /// downstream needs it; zeroing it keeps a saved scan a statement about the
+    /// tree rather than about the run.
+    pub fn clear_ref_bookkeeping(&mut self) {
+        for n in &mut self.nodes {
+            if n.kind == KIND_FILE {
+                n.first_ref = 0;
+                n.nrefs = 0;
+                n.extra = 0;
+            }
+        }
+    }
+
     /// Roll child values into parents. Nodes are ordered parent-before-child,
     /// so a single reverse pass is a valid bottom-up traversal.
     pub fn rollup(&mut self) {
@@ -405,21 +471,9 @@ impl Tree {
                 let pd = &mut self.dirs[p.extra as usize];
                 pd.nfiles += cd.nfiles;
                 pd.ndirs += cd.ndirs + 1;
-                pd.inline_disk_sub += cd.inline_disk_sub + child.inline_disk as u64;
-                pd.inline_ram_sub += cd.inline_ram_sub + child.inline_ram as u64;
             } else {
-                let pd = &mut self.dirs[p.extra as usize];
-                pd.nfiles += 1;
-                pd.inline_disk_sub += child.inline_disk as u64;
-                pd.inline_ram_sub += child.inline_ram as u64;
+                self.dirs[p.extra as usize].nfiles += 1;
             }
-        }
-        // inline payloads are private, so they also count as reach and as
-        // freeable for every directory above them
-        for d in self.dirs.iter_mut() {
-            d.compsize += d.inline_disk_sub;
-            d.freeable += d.inline_disk_sub;
-            d.uncomp_reach += d.inline_ram_sub;
         }
     }
 }

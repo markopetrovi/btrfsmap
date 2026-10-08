@@ -70,6 +70,9 @@ pub struct ScanOptions {
     pub buf_size: usize,
     pub excludes: Vec<Vec<u8>>,
     pub progress: bool,
+    /// drop timings and warnings from the saved scan, so two scans of the same
+    /// tree produce byte-identical files
+    pub reproducible: bool,
     /// shared counters for a GUI; `scan` fills this in itself when absent
     pub live: Option<Arc<Progress>>,
 }
@@ -83,6 +86,7 @@ impl Default for ScanOptions {
             buf_size: 1 << 20,
             excludes: Vec::new(),
             progress: false,
+            reproducible: false,
             live: None,
         }
     }
@@ -164,7 +168,11 @@ impl Shared {
     fn intern_subvol(&self, info: &btrfs::SubvolInfo, path: &[u8]) -> u16 {
         let mut table = self.subvols.lock().unwrap();
         if let Some(i) = table.iter().position(|s| s.id == info.treeid) {
-            if table[i].path.is_empty() {
+            // One subvolume reachable through several paths (or given on the
+            // command line twice): keep the lexicographically smallest path, so
+            // the recorded one does not depend on which entry the walk reached
+            // first.
+            if path < table[i].path.as_slice() {
                 table[i].path = path.to_vec();
             }
             return i as u16;
@@ -239,8 +247,6 @@ fn is_excluded(opts: &ScanOptions, path: &[u8]) -> bool {
 }
 
 /// Read one regular file's extent list. Returns its node with `owned` left at
-/// zero (that needs global extent counts, so it happens after the walk).
-/// Read one regular file's extent list. Returns its node with `owned` left at
 /// zero (that needs the global extent table, so it happens after the walk).
 ///
 /// One syscall for the file itself - `statx`, which yields the birth time the
@@ -255,7 +261,6 @@ fn scan_file(
     snap_class: bool,
     dir_fd: i32,
     dir_dev: u64,
-    subvol_otime: u64,
     nofollow: bool,
 ) -> Option<Node> {
     let st = {
@@ -281,8 +286,16 @@ fn scan_file(
         );
     }
     let ino = st.ino;
-    let btime = st.btime.min(u32::MAX as u64) as u32;
-    let btime_ns = (st.btime_ns >> 14) as u16;
+    // A snapshot's files are copies of the original's, so their birth times are
+    // not a fact about the data: reflinking the live file and renaming it is
+    // enough to hand the live side a younger inode, which would move ownership
+    // of data that never went anywhere. Such a reference therefore carries no
+    // birth time at all, and only the subvolume's age decides.
+    let (btime, btime_ns) = if snap_class {
+        (u32::MAX, u16::MAX)
+    } else {
+        (st.btime.min(u32::MAX as u64) as u32, (st.btime_ns >> 14) as u16)
+    };
 
     // A followed symlink can lead into another subvolume, where the directory's
     // descriptor would search the wrong tree; fall back to the file's own.
@@ -304,8 +317,6 @@ fn scan_file(
     };
 
     let mut referenced = 0u64;
-    let mut inline_disk = 0u32;
-    let mut inline_ram = 0u32;
     let mut overflow = false;
 
     let Worker {
@@ -317,10 +328,10 @@ fn scan_file(
     let first_ref = refs.len() as u32;
     let res = searcher.for_each_extent(fd, ino, &mut |item: &ExtentItem| {
         if item.kind == BTRFS_FILE_EXTENT_INLINE {
-            // Inline payloads live in metadata, are never shared, and compsize
-            // counts them per file: add them straight to this file.
-            inline_disk = inline_disk.saturating_add(item.disk_num_bytes as u32);
-            inline_ram = inline_ram.saturating_add(item.ram_bytes as u32);
+            // An inline payload is stored inside the inode's item in the fs
+            // tree: it is metadata, not a data extent. It has no extent
+            // identity to share or to count, so it never becomes a reference;
+            // the file still claims those bytes, so `referenced` counts them.
             referenced += item.ram_bytes;
             return;
         }
@@ -332,26 +343,14 @@ fn scan_file(
             overflow = true;
             return;
         }
-        let e = extents.entry(page).or_insert_with(|| ExtentInfo {
+        // The extent's ownership window is not decided here: it is computed
+        // from the references that end up belonging to nodes, once the tree is
+        // assembled (see `Tree::compute_windows`).
+        extents.entry(page).or_insert_with(|| ExtentInfo {
             disk: item.disk_num_bytes,
             ram: item.ram_bytes,
-            win_btime: u32::MAX,
-            win_btime_ns: u16::MAX,
-            win_otime: u64::MAX,
-            win_count: 0,
-            assigned: 0,
+            ..Default::default()
         });
-        // keep the smallest (birth time, subvolume age) seen for this extent
-        let key = (btime, btime_ns, subvol_otime);
-        let best = (e.win_btime, e.win_btime_ns, e.win_otime);
-        if key < best {
-            e.win_btime = btime;
-            e.win_btime_ns = btime_ns;
-            e.win_otime = subvol_otime;
-            e.win_count = 1;
-        } else if key == best {
-            e.win_count += 1;
-        }
         refs.push((page as u64) << 32);
         referenced += item.num_bytes;
     });
@@ -382,12 +381,36 @@ fn scan_file(
         btime,
         btime_ns,
         referenced,
-        inline_disk: inline_disk.min(u16::MAX as u32) as u16,
-        inline_ram: inline_ram.min(u16::MAX as u32) as u16,
         kind: KIND_FILE,
         flags,
         ..Default::default()
     })
+}
+
+/// `statx` on a path, with the NUL-terminated copy kept in the worker's
+/// reusable scratch buffer.
+fn statz(w: &mut Worker, path: &[u8], nofollow: bool) -> Option<btrfs::StatInfo> {
+    w.pathz.clear();
+    w.pathz.extend_from_slice(path);
+    w.pathz.push(0);
+    btrfs::stat_path(&w.pathz, nofollow).ok()
+}
+
+/// Birth time of a directory, as the ownership key's primary part. Inside a
+/// snapshot-class subvolume a directory is a copy like everything else, so it
+/// carries no birth time either - which also keeps a scan's bytes from
+/// depending on when a directory happened to be created.
+fn dir_btime(w: &mut Worker, path: &[u8], snap_class: bool, nofollow: bool) -> (u32, u16) {
+    if snap_class {
+        return (u32::MAX, u16::MAX);
+    }
+    match statz(w, path, nofollow) {
+        Some(s) => (
+            s.btime.min(u32::MAX as u64) as u32,
+            (s.btime_ns >> 14) as u16,
+        ),
+        None => (0, 0),
+    }
 }
 
 fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkItem) {
@@ -422,10 +445,6 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
         .as_ref()
         .map(|f| std::os::fd::AsRawFd::as_raw_fd(f))
         .unwrap_or(-1);
-    let subvol_otime = {
-        let table = shared.subvols.lock().unwrap();
-        table.get(item.subvol as usize).map(|s| s.otime).unwrap_or(0)
-    };
     // Same source as the per-file value, so the comparison is meaningful
     // (stat(2) and statx(2) pack the device differently).
     let dir_dev = {
@@ -524,6 +543,10 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
                                 continue;
                             }
                         }
+                        // Intern before the duplicate-mount check, so a
+                        // subvolume reached through another mount still gets
+                        // its path compared and the smallest one recorded.
+                        subvol = shared.intern_subvol(&info, &path);
                         // The same subvolume reachable through another mount
                         // would add a second reference to every file in it.
                         if !shared.visited_subvols.lock().unwrap().insert(info.uuid) {
@@ -535,7 +558,6 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
                             ));
                             continue;
                         }
-                        subvol = shared.intern_subvol(&info, &path);
                         let table = shared.subvols.lock().unwrap();
                         let s = &table[subvol as usize];
                         snap_class = s.is_snapshot();
@@ -593,6 +615,7 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
                 snap_class,
                 dev,
             });
+            let (btime, btime_ns) = dir_btime(w, &path, snap_class, !followed_symlink);
             let name_off = result.names.len() as u32;
             result.names.extend_from_slice(name);
             result.entries.push(Node {
@@ -603,6 +626,8 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
                 flags,
                 extra: dir_id,
                 mtime,
+                btime,
+                btime_ns,
                 ..Default::default()
             });
         } else if is_file {
@@ -613,7 +638,6 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
                 item.snap_class,
                 dir_fd,
                 dir_dev,
-                subvol_otime,
                 !opts.follow_symlinks,
             ) else {
                 continue;
@@ -626,7 +650,31 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
             shared.prog.files.fetch_add(1, Ordering::Relaxed);
         }
     }
+    sort_entries(&mut result);
     store_slot(shared, item.dir_id, result);
+}
+
+/// Store a directory's entries sorted by name, rebuilding the name blob to
+/// match. The tree's layout then depends on the tree alone, not on the order
+/// the kernel happened to return entries in, so two scans - or two machines -
+/// produce the same file.
+fn sort_entries(result: &mut DirResult) {
+    if result.entries.len() < 2 {
+        return;
+    }
+    let mut pairs: Vec<(Vec<u8>, Node)> = Vec::with_capacity(result.entries.len());
+    for e in result.entries.drain(..) {
+        let off = e.name_off as usize;
+        let len = e.name_len as usize;
+        pairs.push((result.names[off..off + len].to_vec(), e));
+    }
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    result.names.clear();
+    for (name, mut e) in pairs {
+        e.name_off = result.names.len() as u32;
+        result.names.extend_from_slice(&name);
+        result.entries.push(e);
+    }
 }
 
 fn store_slot(shared: &Shared, dir_id: u32, result: DirResult) {
@@ -804,6 +852,7 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
                 snap_class,
                 dev: md.dev(),
             });
+            let (btime, btime_ns) = dir_btime(&mut main_worker, root, snap_class, false);
             let name_off = root_result.names.len() as u32;
             root_result.names.extend_from_slice(name);
             root_result.entries.push(Node {
@@ -814,11 +863,13 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
                 flags,
                 extra: dir_id,
                 mtime: md.mtime().clamp(0, u32::MAX as i64) as u32,
+                btime,
+                btime_ns,
                 ..Default::default()
             });
         } else if md.is_file() {
             let Some(mut node) =
-                scan_file(&mut main_worker, &shared, root, false, -1, 0, 0, false)
+                scan_file(&mut main_worker, &shared, root, false, -1, 0, false)
             else {
                 continue;
             };
@@ -834,6 +885,7 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
             ));
         }
     }
+    sort_entries(&mut root_result);
     shared.slots.lock().unwrap()[0] = Some(root_result);
 
     let show_progress = opts.progress;
@@ -977,13 +1029,32 @@ pub fn flatten(
     mut raw: RawScan,
     inventory_items: Vec<btrfs::RootItem>,
 ) -> (Tree, Vec<Vec<u64>>, Vec<ExtentMap>, ScanStats) {
+    // The subvolume table goes into the cache as it stands, so its order has
+    // to be a property of the tree, not of which worker happened to meet a
+    // subvolume first (or of how the threads interleaved). Sorting by uuid
+    // gives every run of the same tree the same table; the directories'
+    // indices are renumbered to match.
+    let mut order: Vec<u16> = (0..raw.subvols.len() as u16).collect();
+    order.sort_by(|&a, &b| {
+        let (x, y) = (&raw.subvols[a as usize], &raw.subvols[b as usize]);
+        x.uuid.cmp(&y.uuid).then(x.id.cmp(&y.id))
+    });
+    let mut renumbered = vec![0u16; order.len()];
+    for (new, &old) in order.iter().enumerate() {
+        renumbered[old as usize] = new as u16;
+    }
+    let subvols: Vec<Subvol> = order
+        .iter()
+        .map(|&old| raw.subvols[old as usize].clone())
+        .collect();
+
     let mut tree = Tree {
         nodes: Vec::new(),
         names: Vec::new(),
         dirs: Vec::new(),
         roots: Vec::new(),
         root: 0,
-        subvols: raw.subvols,
+        subvols,
         inventory: Vec::new(),
         warnings: raw.warnings,
         stats: ScanStats::default(),
@@ -1013,7 +1084,12 @@ pub fn flatten(
         };
         let extra = tree.dirs.len() as u32;
         tree.dirs.push(DirExtra {
-            subvol: slot.subvol,
+            // 0 doubles as the "no subvolume" sentinel, so an index the table
+            // does not cover is left alone rather than remapped to a stranger
+            subvol: renumbered
+                .get(slot.subvol as usize)
+                .copied()
+                .unwrap_or(slot.subvol),
             depth,
             ..Default::default()
         });
@@ -1059,7 +1135,9 @@ pub fn flatten(
     (tree, raw.refs, raw.extents, stats)
 }
 
-/// Merge the per-thread extent maps into one table.
+/// Merge the per-thread extent maps into one table. Only the extent's size
+/// needs merging: the ownership window is not a walk-time value any more, it is
+/// folded out of the tree's own references afterwards.
 pub fn merge_extents(maps: Vec<ExtentMap>) -> ExtentMap {
     let mut maps = maps;
     maps.sort_by_key(|m| std::cmp::Reverse(m.len()));
@@ -1067,17 +1145,7 @@ pub fn merge_extents(maps: Vec<ExtentMap>) -> ExtentMap {
     for m in maps {
         for (k, v) in m {
             match out.get_mut(&k) {
-                Some(e) => {
-                    let mine = (e.win_btime, e.win_btime_ns, e.win_otime);
-                    let theirs = (v.win_btime, v.win_btime_ns, v.win_otime);
-                    if theirs < mine {
-                        e.win_btime = v.win_btime;
-                        e.win_btime_ns = v.win_btime_ns;
-                        e.win_otime = v.win_otime;
-                        e.win_count = v.win_count;
-                    } else if theirs == mine {
-                        e.win_count += v.win_count;
-                    }
+                Some(_) => {
                     // disk/ram keep the first-seen value, as compsize does
                 }
                 None => {
@@ -1100,9 +1168,11 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     tree.stats = stats.clone();
     tree.scanned_at = crate::cache::now();
     tree.scanned_roots = opts.roots.clone();
+    tree.compute_windows(&ref_blocks, &mut extents, &subvol_otime);
     tree.attribute_owned(&ref_blocks, &mut extents, &subvol_otime);
     tree.attribute_reach(&mut ref_blocks, &extents);
     tree.rollup();
+    tree.clear_ref_bookkeeping();
     drop(ref_blocks);
     Ok((tree, stats))
 }
