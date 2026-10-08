@@ -40,7 +40,7 @@ filesystem).
 
 | metric | meaning |
 |---|---|
-| **owned** | Semantic ownership: **the oldest holder of an extent owns it**. Every reference carries a key of (the file's birth time, the creation time of the subvolume it lives in); the smallest key owns the extent, and references sharing that smallest key split it evenly. A snapshot shares its inodes with the subvolume it was taken from, so the two tie on birth time and the older subvolume - the original - keeps ownership; a reflink copy is strictly younger than its source, whichever subvolume it landed in. Delete the parent and the oldest snapshot becomes the new custodian, exactly as if ownership had transferred. Additive: children sum to the parent and the whole tree sums to the true physical usage. This is the default. |
+| **owned** | Semantic ownership: **the oldest holder of an extent owns it**. Every reference carries a key of (the file's birth time, the creation time of the subvolume it lives in); the smallest key owns the extent, and references sharing that smallest key split it evenly. A reference from inside a *snapshot-class* subvolume carries **no** birth time: `(unknown, the snapshot's own creation time)`. So a snapshot owns what the live trees have let go of, and nothing they still hold - its files' birth times are not a fact about the data, since a reflink copy and a rename are enough to hand a live file a younger inode - and among snapshots the oldest is the custodian, so deleting the parent transfers ownership to it. A reflink copy inside the live tree is strictly younger than its source, whichever live subvolume it landed in. Additive: children sum to the parent and the whole tree sums to the true physical usage. This is the default. |
 | **freeable** | Bytes that deleting this path would actually free: extents whose references are *all* below it. Same idea as `btrfs fi du`'s "Exclusive", but per subtree and compression-aware. |
 | **compsize** | Exactly what `compsize <path>` prints as Disk Usage: every extent referenced anywhere below, counted once. The cross-check number (it is order-independent even though compsize itself is not). |
 | **referenced** | What the files claim (du/baobab's number, the 27 TB). |
@@ -172,19 +172,25 @@ references to, to be diffed against the kernel's own answer from
   many more subvolumes see it through a parent that is itself shared. That is
   what `FULL_BACKREF` on disk means, and why the kernel's own `LOGICAL_INO` has
   to read tree blocks one at a time (~150 us per extent) instead of trusting the
-  references. Two consequences, both measured against `--full-scan` on a `/home`
-  with 30 snapper snapshots and ~90 container layers (607 GiB owned):
-  * a collapsed subvolume's ownership key is its own creation time, not its
-    files' birth times, which are not recorded anywhere the extent tree reaches.
-    A read-only subvolume's files cannot be newer than it is, so that bound is
-    sound in the direction that matters, but an extent shared with a live file
-    whose inode is *newer* than the snapshot's copy goes to the live file where
-    the file backend gives it to the snapshot: **4.7 GiB** of it there;
-  * extents that only snapshots hold, and whose referencing blocks the extent
-    tree cannot link back to a subvolume, are not counted at all: **14 GiB**
-    there. `note:` lines on stderr report how many.
-  Net effect: `owned(/home)` came out **597 GiB against the exact 607 GiB**.
+  references. What that costs was measured against `--full-scan` on a `/home`
+  with 30 snapper snapshots and ~90 container layers: about **13,600 extents,
+  9.8 GiB**, all of them held by a collapsed subvolume whose extent-tree
+  references name no subvolume the scan knows. The loss lands entirely in the
+  snapshot aggregates - every walked subtree's number is identical between the
+  two modes, and so is `owned(root)` minus those bytes.
   `--full-scan` is the exact answer when that matters.
+* The ownership rule treats a *snapshot-class* subvolume as one voice: its
+  references carry no file birth time (unknown, with the subvolume's creation
+  time as the tie-break), so a snapshot owns what the live trees have let go of
+  and nothing they still hold, and among snapshots the oldest is the custodian.
+  Its files' birth times are deliberately ignored there: a reflink copy and a
+  rename are enough to hand a live file a younger inode, which would otherwise
+  move ownership of data that never went anywhere to a snapshot. The rule is the
+  same in all three walkers, so the file backend and the tree reader agree.
+* The file backend finds a handful of files the tree reader does not (4 of
+  /home's 38M, 78 MB): they live in a subvolume the root-tree backref walk does
+  not reach. It shows up as a `~78 MB` difference in `owned` for one subtree,
+  and it predates the collapsed scan.
 * A collapsed snapshot's `uncompressed` is its compressed size for the extents
   only it holds - the extent tree has no uncompressed size. Its `referenced` is
   0 for the same reason: the logical sizes live in the files, which were not

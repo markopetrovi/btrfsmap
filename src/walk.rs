@@ -287,8 +287,17 @@ fn scan_file(
         );
     }
     let ino = st.ino;
-    let btime = st.btime.min(u32::MAX as u64) as u32;
-    let btime_ns = (st.btime_ns >> 14) as u16;
+    // A file inside a snapshot-class subvolume carries no birth time: its
+    // references lose to any walked holder and the subvolume's age decides
+    // among snapshots, which is the same key the tree reader builds.
+    let (btime, btime_ns) = if snap_class {
+        (u32::MAX, u16::MAX)
+    } else {
+        (
+            st.btime.min(u32::MAX as u64) as u32,
+            (st.btime_ns >> 14) as u16,
+        )
+    };
 
     // A followed symlink can lead into another subvolume, where the directory's
     // descriptor would search the wrong tree; fall back to the file's own.
@@ -347,7 +356,9 @@ fn scan_file(
             win_count: 0,
             assigned: 0,
         });
-        // keep the smallest (birth time, subvolume age) seen for this extent
+        // keep the smallest (birth time, subvolume age) seen for this extent;
+        // for a snapshot-class subvolume the birth time is "unknown", so a
+        // walked file always beats it
         let key = (btime, btime_ns, subvol_otime);
         let best = (e.win_btime, e.win_btime_ns, e.win_otime);
         if key < best {
@@ -601,10 +612,13 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
             });
             let name_off = result.names.len() as u32;
             result.names.extend_from_slice(name);
-            // birth time, which only statx reports; a directory's is not used by
-            // the ownership rule, but leaving it zero would make two otherwise
-            // identical scans differ
-            let (btime, btime_ns) = {
+            // Birth time, which only statx reports. A directory's is not used
+            // by the ownership rule, but it goes into the cache, so it has to
+            // agree with the tree reader - which reads it from the inode item,
+            // and reports "unknown" inside a snapshot-class subvolume.
+            let (btime, btime_ns) = if snap_class {
+                (u32::MAX, u16::MAX)
+            } else {
                 let mut z = path.clone();
                 z.push(0);
                 match btrfs::stat_path(&z, !opts.follow_symlinks) {
@@ -853,16 +867,19 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
             let name_off = root_result.names.len() as u32;
             root_result.names.extend_from_slice(name);
             // the root's own birth time, which statx is the only way to get
-            let mut btime = 0u32;
-            let mut btime_ns = 0u16;
-            {
+            let (btime, btime_ns) = if snap_class {
+                (u32::MAX, u16::MAX)
+            } else {
                 let mut z = root.clone();
                 z.push(0);
-                if let Ok(st) = btrfs::stat_path(&z, true) {
-                    btime = st.btime.min(u32::MAX as u64) as u32;
-                    btime_ns = (st.btime_ns >> 14) as u16;
+                match btrfs::stat_path(&z, true) {
+                    Ok(st) => (
+                        st.btime.min(u32::MAX as u64) as u32,
+                        (st.btime_ns >> 14) as u16,
+                    ),
+                    Err(_) => (0, 0),
                 }
-            }
+            };
             root_result.entries.push(Node {
                 parent: NO_NODE,
                 name_off,

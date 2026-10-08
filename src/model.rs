@@ -202,14 +202,15 @@ impl Tree {
     /// `owned` / `uncomp` share.
     ///
     /// The ownership rule: every reference carries a key of (inode birth time,
-    /// creation time of the subvolume it lives in). The smallest key owns the
-    /// extent. A snapshot shares its inodes with the subvolume it was taken
-    /// from, so those references tie on birth time and the older subvolume -
-    /// the original - keeps ownership; a reflink copy is strictly younger than
-    /// its source, whichever subvolume it landed in, so the source keeps
-    /// ownership. References that share the smallest key split the extent
-    /// evenly, and the integer remainder goes to the last of them, so every
-    /// subtree's total still equals the real physical usage.
+    /// creation time of the subvolume it lives in), and the smallest key owns
+    /// the extent. A reference from inside a snapshot-class subvolume has **no**
+    /// birth time - its subvolume's creation time stands for it instead - so a
+    /// snapshot owns only what no walked tree still holds, and among snapshots
+    /// the oldest is the custodian. A reflink copy within the live tree is
+    /// strictly younger than its source, whichever subvolume it landed in, so
+    /// the source keeps ownership. References that share the smallest key split
+    /// the extent evenly, and the integer remainder goes to the last of them, so
+    /// every subtree's total still equals the real physical usage.
     pub fn attribute_owned(
         &mut self,
         refs: &[Vec<u64>],
@@ -504,7 +505,7 @@ impl Metric {
     /// Short explanation, shown under the selector.
     pub fn help(self) -> &'static str {
         match self {
-            Metric::Owned => "the oldest holder of a shared extent owns it: file birth time first, then the age of the subvolume it lives in. A snapshot ties with its parent (they share inodes) so the original keeps ownership; a reflink copy is younger than its source and owns only what is unique to it. Adds up.", 
+            Metric::Owned => "the oldest holder of a shared extent owns it: file birth time first, then the age of the subvolume it lives in. A snapshot has no birth time of its own to offer - only its creation time - so it owns what the live trees let go of and nothing they still hold, and among snapshots the oldest is the custodian. A reflink copy in the live tree is younger than its source and owns only what is unique to it. Adds up.", 
             Metric::Freeable => "what would actually be freed by deleting this subtree",
             Metric::Compsize => "every extent referenced anywhere below, counted once - what compsize prints for that path",
             Metric::Referenced => "what the files claim, the number du and baobab show",

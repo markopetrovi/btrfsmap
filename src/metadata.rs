@@ -169,6 +169,10 @@ fn collect_subvolume(
     scope: Option<&HashSet<u64>>,
 ) -> io::Result<Collected> {
     let in_scope = |inode: u64| scope.map(|s| s.contains(&inode)).unwrap_or(true);
+    // References from inside a snapshot-class subvolume carry no birth time -
+    // the same key the collapsed scan builds for it, so the two modes agree.
+    // See the ownership rule: a snapshot owns what the live trees let go of.
+    let snap_class = c.subvols[subvol as usize].is_snapshot();
     let mut col = Collected {
         subvol,
         recs: Vec::new(),
@@ -211,8 +215,16 @@ fn collect_subvolume(
                     inode: obj,
                     mode: item.mode,
                     mtime: item.mtime_sec.min(u32::MAX as u64) as u32,
-                    btime: item.otime_sec.min(u32::MAX as u64) as u32,
-                    btime_ns: (item.otime_nsec >> 14) as u16,
+                    btime: if snap_class {
+                        u32::MAX
+                    } else {
+                        item.otime_sec.min(u32::MAX as u64) as u32
+                    },
+                    btime_ns: if snap_class {
+                        u16::MAX
+                    } else {
+                        (item.otime_nsec >> 14) as u16
+                    },
                     ..Default::default()
                 });
             }
@@ -675,23 +687,14 @@ fn push_collapsed_node(
         ..Default::default()
     });
     c.dirs += 1;
-    // The age this node carries into the ownership rule. It stands for every
-    // file inside, whose own birth times are unknown - but a *read-only*
-    // subvolume's files cannot have been created after it was: they are
-    // inherited from what it is a snapshot of. So its own creation time is an
-    // upper bound, and using it is sound in the direction that matters - it can
-    // claim an extent only where the file backend would have given it to one of
-    // its files too. A writable subvolume (a container layer keeps its
-    // `parent_uuid`) can create files at any time, so it claims nothing on age
-    // and takes only what no walked holder references.
-    let (btime, btime_ns) = if flags & FLAG_READONLY != 0 {
-        (
-            s.otime.min(u32::MAX as u64) as u32,
-            0,
-        )
-    } else {
-        (u32::MAX, u16::MAX)
-    };
+    // The age this node carries into the ownership rule: none. Its birth time
+    // is "unknown", which loses against every walked file, and the subvolume's
+    // creation time rides in the third field so that snapshots tie with each
+    // other and the oldest one is the custodian. A snapshot owns what the live
+    // trees let go of, not what they still hold - its files' own birth times
+    // are not a fact about the data at all (a reflink copy and a rename are
+    // enough to hand a live file a younger inode), and it is the one thing the
+    // extent tree cannot supply for a collapsed subvolume.
     tree.nodes.push(Node {
         parent: parent_node,
         name_off,
@@ -699,8 +702,8 @@ fn push_collapsed_node(
         kind: KIND_DIR,
         flags,
         extra,
-        btime,
-        btime_ns,
+        btime: u32::MAX,
+        btime_ns: u16::MAX,
         ..Default::default()
     });
     idx
@@ -1456,7 +1459,6 @@ pub fn probe_resolve(fd: i32, sample: usize, only: &[u64]) -> io::Result<()> {
     flush(cur, cur_len, &cur_refs, &mut out);
     for line in &out {
         let f: Vec<&str> = line.split(' ').collect();
-        let bytenr: u64 = f[0].parse().unwrap();
         let mut roots: Vec<u64> = Vec::new();
         let mut i = 2;
         while i + 1 < f.len() {
