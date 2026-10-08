@@ -219,11 +219,19 @@ impl Tree {
         refs: &[Vec<u64>],
         extents: &mut ExtentMap,
         subvol_otime: &[u64],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) {
         for e in extents.values_mut() {
             e.assigned = 0;
         }
         for i in 0..self.nodes.len() {
+            // this pass is seconds of work on a big tree, so it is worth
+            // noticing a cancel in it rather than after it
+            if i % 8192 == 0
+                && cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return;
+            }
             let (kind, nrefs, first_ref, block, btime, btime_ns, parent, flags) = {
                 let n = &self.nodes[i];
                 (
@@ -305,7 +313,12 @@ impl Tree {
     /// `compsize` (reach) and `freeable` (exclusive) for every directory, from
     /// references grouped by extent. Unique extents - the common case - are a
     /// single ancestor walk shared by both metrics.
-    pub fn attribute_reach(&mut self, refs: &mut [Vec<u64>], extents: &ExtentMap) {
+    pub fn attribute_reach(
+        &mut self,
+        refs: &mut [Vec<u64>],
+        extents: &ExtentMap,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) {
         let nblocks = refs.len();
         for r in refs.iter_mut() {
             r.sort_unstable();
@@ -317,7 +330,14 @@ impl Tree {
         let mut union_list: Vec<u32> = Vec::new();
         let mut owners: Vec<u32> = Vec::new();
 
+        let mut batch = 0u32;
         loop {
+            batch += 1;
+            if batch % 1024 == 0
+                && cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return;
+            }
             // smallest page still available across all sorted blocks
             let mut page: Option<u32> = None;
             for b in 0..nblocks {

@@ -59,7 +59,7 @@ struct Entry {
 /// lets a scan rooted inside a subvolume ignore the rest of it.
 fn scope_of(fd: i32, root_id: u64, root_inode: u64) -> io::Result<HashSet<u64>> {
     let mut entries: Vec<(u64, u64)> = Vec::new(); // (parent dir, child)
-    btrfs::for_each_fs_item(fd, root_id, &mut |obj, ty, _off, payload| {
+    btrfs::for_each_fs_item(fd, root_id, None, &mut |obj, ty, _off, payload| {
         if ty != BTRFS_DIR_INDEX_KEY {
             return;
         }
@@ -227,7 +227,7 @@ fn collect_subvolume(
         }
     };
 
-    btrfs::for_each_fs_item(fd, root_id, &mut |obj, ty, key_off, payload| {
+    btrfs::for_each_fs_item(fd, root_id, live.map(|l| &l.cancel), &mut |obj, ty, key_off, payload| {
         // records are in inode order, so a new objectid ends the previous one
         let same = cur.as_ref().map(|r| r.inode == obj).unwrap_or(false);
         if !same && ty == BTRFS_INODE_ITEM_KEY {
@@ -326,6 +326,9 @@ fn collect_subvolume(
         }
     })?;
     flush(&mut cur, &mut col, c);
+    if live.is_some_and(|l| l.cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
     if overflow {
         c.warnings.push(format!(
             "subvolume {root_id}: extent above the 16 TiB addressing limit, not counted"
@@ -400,8 +403,12 @@ impl BlockRefs {
 
 /// Read the block-reference graph: one pass over the extent tree, keeping the
 /// references of every metadata extent.
-fn collect_block_refs(fd: i32, g: &mut BlockRefs) -> io::Result<()> {
-    btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, key_off, payload| {
+fn collect_block_refs(
+    fd: i32,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    g: &mut BlockRefs,
+) -> io::Result<()> {
+    btrfs::for_each_extent_tree_item(fd, cancel, &mut |bytenr, ty, key_off, payload| {
         match ty {
             btrfs::BTRFS_EXTENT_ITEM_KEY | btrfs::BTRFS_METADATA_ITEM_KEY => {
                 let Some(h) = btrfs::parse_extent_item_hdr(payload) else {
@@ -527,6 +534,7 @@ pub struct CollapseStats {
 /// nothing to sort by key afterwards.
 fn collect_collapsed_refs(
     fd: i32,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
     nodes: &HashMap<u64, u32>,
     in_scan: &HashSet<u64>,
     inventory: &HashSet<u64>,
@@ -548,7 +556,7 @@ fn collect_collapsed_refs(
     // list is known to be incomplete, so a subvolume that holds the extent can
     // be missing from it.
 
-    btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, key_off, payload| {
+    btrfs::for_each_extent_tree_item(fd, cancel, &mut |bytenr, ty, key_off, payload| {
         if bytenr != cur_bytenr {
             flush_collapsed(
                 cur_bytenr, cur_len, cur_data, &mut holders, extents, &mut out,
@@ -1691,6 +1699,13 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     let mut final_refs = final_refs;
     phase!("build");
 
+    // Where a cancel is honoured: the walks check it per kernel search, these
+    // passes per pass, and the ownership passes per batch of extents. Nothing
+    // here can interrupt a syscall already in flight, so the floor is one
+    // TREE_SEARCH_V2 - a few milliseconds - rather than one tree.
+    let cancel = opts.live.as_ref().map(|p| &p.cancel);
+    let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+
     // Snapshot-class subvolumes were not walked, so their references - and the
     // extents only they still hold - come from the extent tree instead.
     if !collapsed_nodes.is_empty() {
@@ -1700,7 +1715,10 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
             refs: Vec::new(),
             memo: HashMap::new(),
         };
-        collect_block_refs(fd, &mut g)?;
+        collect_block_refs(fd, cancel, &mut g)?;
+        if cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
         phase!("collect_block_refs");
         let blocks = g.index.len();
         // every subvolume this scan covers: a reference that names one of them
@@ -1708,8 +1726,11 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         let in_scan: HashSet<u64> = tree.subvols.iter().map(|s| s.id).collect();
         let inventory: HashSet<u64> = inv.iter().map(|r| r.treeid).collect();
         let (mut pairs, cstats) = collect_collapsed_refs(
-            fd, &collapsed_nodes, &in_scan, &inventory, &mut g, &mut c.extents,
+            fd, cancel, &collapsed_nodes, &in_scan, &inventory, &mut g, &mut c.extents,
         )?;
+        if cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
         phase!("collect_collapsed_refs");
         drop(g);
         let nrefs = pairs.len();
@@ -1829,8 +1850,11 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     // The one place windows are set: from the references that reach the block,
     // so a holder build() never placed cannot own - or deny - an extent.
     set_windows(&tree, &ref_blocks[0], &mut extents, &subvol_otime);
-    tree.attribute_owned(&ref_blocks, &mut extents, &subvol_otime);
+    tree.attribute_owned(&ref_blocks, &mut extents, &subvol_otime, cancel);
     phase!("attribute_owned");
+    if cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
     if std::env::var_os("CST_DEBUG_OWN").is_some() {
         debug_ownership(&tree, &extents, &ref_blocks, &subvol_otime);
         phase!("debug_ownership");
@@ -1839,8 +1863,11 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         debug_ownership_stats(&tree, &extents, &ref_blocks, &subvol_otime);
         phase!("debug_ownership_stats");
     }
-    tree.attribute_reach(&mut ref_blocks, &extents);
+    tree.attribute_reach(&mut ref_blocks, &extents, cancel);
     phase!("attribute_reach");
+    if cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
     tree.rollup();
     phase!("rollup");
     if let Some(l) = &live {
@@ -1854,7 +1881,7 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
 /// Time the kernel's reference lookup on a sample of extents.
 pub fn probe_logical_ino(fd: i32, sample: usize) -> io::Result<(usize, usize, f64)> {
     let mut extents: Vec<u64> = Vec::new();
-    btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, _len, payload| {
+    btrfs::for_each_extent_tree_item(fd, None, &mut |bytenr, ty, _len, payload| {
         if extents.len() >= sample {
             return;
         }
@@ -1894,7 +1921,7 @@ pub fn probe_extent_tree(fd: i32) -> io::Result<(u64, u64, u64, u64, u64, Vec<(u
     if std::env::var_os("CST_DUMP_EXT").is_some() {
         extents = 1; // dump mode: the first items, raw, for external checking
     }
-    btrfs::for_each_extent_tree_item(fd, &mut |bytenr, ty, len, payload| match ty {
+    btrfs::for_each_extent_tree_item(fd, None, &mut |bytenr, ty, len, payload| match ty {
         btrfs::BTRFS_EXTENT_ITEM_KEY | btrfs::BTRFS_METADATA_ITEM_KEY => {
             let Some(h) = btrfs::parse_extent_item_hdr(payload) else {
                 return;

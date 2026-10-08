@@ -7,6 +7,7 @@
 //! linux/btrfs_tree.h.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
 // ioctl(2) glue
@@ -217,7 +218,7 @@ impl Searcher {
             min_objectid: ino,
             max_objectid: ino,
         };
-        self.for_each_item(fd, &spec, &mut |_obj, _ty, key_offset, payload| {
+        self.for_each_item(fd, &spec, None, &mut |_obj, _ty, key_offset, payload| {
             if let Some(item) = parse_file_extent(payload, key_offset) {
                 f(&item);
             }
@@ -231,7 +232,18 @@ impl Searcher {
     /// from the last *completely* parsed item. A trailing item whose payload
     /// did not fit is re-fetched whole rather than skipped, so no item can be
     /// lost or double counted.
-    pub fn for_each_item<F>(&mut self, fd: i32, spec: &SearchSpec, f: &mut F) -> io::Result<u64>
+    /// `cancel`, when set, is checked before each kernel search, so a caller
+    /// that wants to stop does so within one in-flight `TREE_SEARCH_V2` - a few
+    /// milliseconds - rather than at the end of the tree it is enumerating.
+    /// The caller still decides what stopping means: this simply returns, and
+    /// the caller sees the flag for itself.
+    pub fn for_each_item<F>(
+        &mut self,
+        fd: i32,
+        spec: &SearchSpec,
+        cancel: Option<&AtomicBool>,
+        f: &mut F,
+    ) -> io::Result<u64>
     where
         F: FnMut(u64, u32, u64, &[u8]),
     {
@@ -241,6 +253,9 @@ impl Searcher {
         let mut min_type = spec.min_type;
         let mut min_offset = 0u64;
         loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Ok(n_seen);
+            }
             self.set_key(spec, min_objectid, min_type, min_offset);
             let rc = unsafe { ioctl(fd, BTRFS_IOC_TREE_SEARCH_V2, self.buf.as_mut_ptr()) };
             if rc < 0 {
@@ -414,7 +429,7 @@ pub fn list_subvolumes(fd: i32) -> io::Result<Vec<RootItem>> {
         max_objectid: u64::MAX,
     };
     let mut out = Vec::new();
-    searcher.for_each_item(fd, &spec, &mut |obj, _ty, _off, payload| {
+    searcher.for_each_item(fd, &spec, None, &mut |obj, _ty, _off, payload| {
         if let Some(r) = parse_root_item(payload, obj) {
             out.push(r);
         }
@@ -548,7 +563,12 @@ pub fn parse_inode_ref(p: &[u8], extref: bool) -> Option<(u64, &[u8])> {
 }
 
 /// Enumerate every item of one subvolume's fs tree, in key order.
-pub fn for_each_fs_item<F>(fd: i32, subvol_root_id: u64, f: &mut F) -> io::Result<u64>
+pub fn for_each_fs_item<F>(
+    fd: i32,
+    subvol_root_id: u64,
+    cancel: Option<&AtomicBool>,
+    f: &mut F,
+) -> io::Result<u64>
 where
     F: FnMut(u64, u32, u64, &[u8]),
 {
@@ -560,7 +580,7 @@ where
         min_objectid: BTRFS_FIRST_FREE_OBJECTID,
         max_objectid: u64::MAX,
     };
-    searcher.for_each_item(fd, &spec, f)
+    searcher.for_each_item(fd, &spec, None, f)
 }
 
 /// `(child_root, dirid, name)` for every subvolume that lives inside
@@ -579,7 +599,7 @@ pub fn subvolumes_inside(fd: i32, parent_root: u64) -> io::Result<Vec<(u64, u64,
         max_objectid: u64::MAX,
     };
     let mut out = Vec::new();
-    searcher.for_each_item(fd, &spec, &mut |child, _ty, parent, payload| {
+    searcher.for_each_item(fd, &spec, None, &mut |child, _ty, parent, payload| {
         if parent != parent_root || payload.len() < 18 {
             return;
         }
@@ -760,7 +780,11 @@ pub fn parse_data_ref(p: &[u8]) -> Option<DataRef> {
 
 /// Enumerate the whole extent tree in key order: each data extent's header is
 /// followed by its references, which is what makes a streaming pass possible.
-pub fn for_each_extent_tree_item<F>(fd: i32, f: &mut F) -> io::Result<u64>
+pub fn for_each_extent_tree_item<F>(
+    fd: i32,
+    cancel: Option<&AtomicBool>,
+    f: &mut F,
+) -> io::Result<u64>
 where
     F: FnMut(u64, u32, u64, &[u8]),
 {
@@ -772,7 +796,7 @@ where
         min_objectid: 0,
         max_objectid: u64::MAX,
     };
-    searcher.for_each_item(fd, &spec, f)
+    searcher.for_each_item(fd, &spec, cancel, f)
 }
 
 // ---------------------------------------------------------------------------
