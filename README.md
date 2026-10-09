@@ -96,7 +96,7 @@ bytes per file: ~3.5 GB for a 37M file `/home`, or ~750 MB with `--compress`.
 
 | option | |
 |---|---|
-| `-j, --threads N` | worker threads (default: CPUs) |
+| `-j, --threads N` | worker threads for the fs-tree walks (default: CPUs; the scan they produce is the same at any count) |
 | `-L, --follow-symlinks` | follow symlinks found while walking (off: matches compsize) |
 | `--exclude PATH` | skip a path prefix; extents shared with it will look exclusive to what remains. Excluding a whole subvolume also skips *reading* it, which inside a snapshot is the difference between a sweep and nothing |
 | `--save FILE` | also write the scan to FILE, so the app can open it later |
@@ -141,6 +141,15 @@ cmp /tmp/a.cst /tmp/b.cst
 unchanged tree byte-identical. Pass `--full-scan` on both sides when the tree has
 snapshot-class subvolumes: the collapsed scan is deliberately a different, aggregate
 tree, so it is compared on its numbers instead (see Limits).
+
+Name the scan root the same way in both runs: its spelling is part of the compared
+bytes, since the path is recorded in `scanned_roots` and in the subvolume it opens.
+An absolute root and a relative one differ by 144 bytes on the `.scratch/own` fixture
+- enough to fail `cmp` on its own.
+
+Nothing on the command line that changes *how* the scan is read changes what it
+writes: `-j N` walks the same subvolumes and merges them in traversal order, so the
+cache is byte-identical at any thread count (`-j 1` is the plain serial pass).
 
 With `--exclude`, the two implementations agree on every number the report shows and
 on the tree they build, but not byte for byte: the tree reader reads a subvolume's

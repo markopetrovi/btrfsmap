@@ -37,6 +37,8 @@ commands:
   check FILE.cst           load a saved scan and print what it holds (no GUI)
 
 scan options:
+  -j, --threads N          worker threads for the fs-tree walks (default: CPUs);
+                           the scan does not depend on the count
       --exclude PATH       skip this path prefix (repeatable; makes shared
                            extents below it look exclusive to what remains)
       --depth N            directory levels to print (default 2)
@@ -390,6 +392,13 @@ fn cmd_scan(args: &[String]) -> ExitCode {
                 i += 1;
                 match parse_usize("--files", args.get(i)) {
                     Ok(n) => files = n,
+                    Err(c) => return c,
+                }
+            }
+            "-j" | "--threads" => {
+                i += 1;
+                match parse_usize("--threads", args.get(i)) {
+                    Ok(n) => opts.threads = n,
                     Err(c) => return c,
                 }
             }
