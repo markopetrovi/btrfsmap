@@ -114,11 +114,15 @@ bytes per file: ~3.5 GB for a 37M file `/home`, or ~750 MB with `--compress`.
 sudo compsize-tree report [-b] PATH...
 ```
 
-Reproduces `compsize`'s table byte for byte from its own walk. Useful to prove
-the extent layer: `compsize-tree report -b /some/dir` and
-`compsize -b /some/dir` produce identical output, including on multi-million
-extent files where this implementation is ~5x faster thanks to a larger search
-buffer.
+Reproduces `compsize`'s table byte for byte from its own walk, and runs at about
+compsize's speed (measured interleaved on a tree of 422k extents: 3.2-4.2 s against
+3.4-3.6 s; `--buffer` trades memory for roughly 20% more, and the output is unchanged
+at any size).
+
+It is a second implementation of the extent layer, which is what makes it worth
+keeping: the item decoding the scanners share is compared here against an independent
+implementation of it, and a bug in that decoding would be invisible to the scanners'
+own byte gates, which compare two users of it.
 
 ## Verifying a change
 
