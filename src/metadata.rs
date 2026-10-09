@@ -22,7 +22,9 @@ use crate::model::*;
 use crate::scan::{Progress, ScanOptions, ScanStats};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 use std::io;
 
 pub const DT_DIR: u8 = 4;
@@ -93,14 +95,26 @@ struct Collected {
     nested: Vec<(u64, u64, Vec<u8>)>,
 }
 
+/// What one fs-tree walk writes into: the shared extent map, the flat
+/// reference array, and the warnings the walk raised.
+///
+/// A walk owns one of these - in parallel, each job gets its own, so no two
+/// walks touch the same vec. The collector holds the shard the walks are merged
+/// into; at one thread that is the only shard there is, so a serial scan
+/// neither copies nor merges anything.
+#[derive(Default)]
+struct Shard {
+    extents: ExtentMap,
+    refs: Vec<u64>,
+    warnings: Vec<String>,
+}
+
 /// Collects a whole scan: the shared extent map, the flat reference array and
 /// per-subvolume trees.
 struct Collector {
-    extents: ExtentMap,
-    refs: Vec<u64>,
+    shard: Shard,
     subs: Vec<Collected>,
     subvols: Vec<Subvol>,
-    warnings: Vec<String>,
     unreadable: u64,
     files: u64,
     dirs: u64,
@@ -191,19 +205,26 @@ fn open_dir(p: &[u8]) -> io::Result<std::fs::File> {
 }
 
 /// Enumerate one subvolume's fs tree into a `Collected`.
+///
+/// `shard` is this walk's own accounting (in parallel, one per job);
+/// `scope_inode`, when set, narrows the walk to that directory of the subvolume
+/// and is what lets a scan rooted inside a subvolume ignore the rest of it.
+/// `cancel` ends the walk at its next kernel search.
 fn collect_subvolume(
-    c: &mut Collector,
+    shard: &mut Shard,
     fd: i32,
     root_id: u64,
     subvol: u16,
-    scope: Option<&HashSet<u64>>,
+    snap_class: bool,
+    scope_inode: Option<u64>,
     live: Option<&Progress>,
+    cancel: Option<&AtomicBool>,
 ) -> io::Result<Collected> {
-    let in_scope = |inode: u64| scope.map(|s| s.contains(&inode)).unwrap_or(true);
-    // References from inside a snapshot-class subvolume carry no birth time -
-    // the same key the collapsed scan builds for it, so the two modes agree.
-    // See the ownership rule: a snapshot owns what the live trees let go of.
-    let snap_class = c.subvols[subvol as usize].is_snapshot();
+    let scope = match scope_inode {
+        Some(ino) => Some(scope_of(fd, root_id, ino)?),
+        None => None,
+    };
+    let in_scope = |inode: u64| scope.as_ref().map(|s| s.contains(&inode)).unwrap_or(true);
     let mut col = Collected {
         subvol,
         recs: Vec::new(),
@@ -216,18 +237,17 @@ fn collect_subvolume(
 
     // INODE_ITEM then DIR_INDEX then EXTENT_DATA arrive for one inode before the
     // next inode starts, so a record can be finished and pushed as we go.
-    let mut flush = |cur: &mut Option<InodeRec>, col: &mut Collected, c: &mut Collector| {
+    let flush = |cur: &mut Option<InodeRec>, col: &mut Collected| {
         if let Some(rec) = cur.take() {
-            let _ = c;
             col.recs.push(rec);
         }
     };
 
-    btrfs::for_each_fs_item(fd, root_id, live.map(|l| &l.cancel), &mut |obj, ty, key_off, payload| {
+    btrfs::for_each_fs_item(fd, root_id, cancel, &mut |obj, ty, key_off, payload| {
         // records are in inode order, so a new objectid ends the previous one
         let same = cur.as_ref().map(|r| r.inode == obj).unwrap_or(false);
         if !same && ty == BTRFS_INODE_ITEM_KEY {
-            flush(&mut cur, &mut col, c);
+            flush(&mut cur, &mut col);
         }
         if !in_scope(obj) {
             return;
@@ -303,12 +323,12 @@ fn collect_subvolume(
                     return;
                 }
                 if rec.first_ref == 0 && rec.nrefs == 0 {
-                    rec.first_ref = c.refs.len() as u32;
+                    rec.first_ref = shard.refs.len() as u32;
                 }
                 // The window is set later, from the references that reach the
                 // shared block (`set_windows`): the inodes collected here are
                 // candidates, not holders - only what build() places can hold.
-                c.extents.entry(page).or_insert_with(|| ExtentInfo {
+                shard.extents.entry(page).or_insert_with(|| ExtentInfo {
                     disk: item.disk_num_bytes,
                     ram: item.ram_bytes,
                     win_btime: u32::MAX,
@@ -317,19 +337,19 @@ fn collect_subvolume(
                     win_count: 0,
                     assigned: 0,
                 });
-                c.refs.push((page as u64) << 32);
+                shard.refs.push((page as u64) << 32);
                 rec.nrefs += 1;
                 rec.referenced += item.num_bytes;
             }
             _ => {}
         }
     })?;
-    flush(&mut cur, &mut col, c);
-    if live.is_some_and(|l| l.cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+    flush(&mut cur, &mut col);
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
     }
     if overflow {
-        c.warnings.push(format!(
+        shard.warnings.push(format!(
             "subvolume {root_id}: extent above the 16 TiB addressing limit, not counted"
         ));
     }
@@ -734,7 +754,7 @@ fn build(
         root: 0,
         subvols: c.subvols.clone(),
         inventory: Vec::new(),
-        warnings: c.warnings.clone(),
+        warnings: c.shard.warnings.clone(),
         stats: ScanStats::default(),
         scanned_at: 0,
         scanned_roots: Vec::new(),
@@ -748,7 +768,7 @@ fn build(
     });
     tree.dirs.push(DirExtra::default());
 
-    let mut final_refs: Vec<u64> = Vec::with_capacity(c.refs.len());
+    let mut final_refs: Vec<u64> = Vec::with_capacity(c.shard.refs.len());
     // (collected index, inode, parent node, name, flags) worklist for the BFS
     let mut queue: VecDeque<(usize, u64, u32, Vec<u8>, u8)> = VecDeque::new();
 
@@ -840,7 +860,7 @@ fn build(
         let a = rec.first_ref as usize;
         let b = a + rec.nrefs as usize;
         let first_ref = final_refs.len() as u32;
-        for r in &c.refs[a..b] {
+        for r in &c.shard.refs[a..b] {
             final_refs.push(*r | idx as u64); // low half: owner node index
         }
         if kind == KIND_DIR {
@@ -1126,7 +1146,178 @@ fn path_to_dir(col: &Collected, dirid: u64, name: &[u8], root_path: &[u8]) -> Ve
     out
 }
 
+// ---------------------------------------------------------------------------
+// The walks, on one thread or several
+// ---------------------------------------------------------------------------
+
+/// One fs-tree walk, as handed to a worker thread. The walk needs the root id
+/// (its fs tree), whether the subvolume is snapshot-class (its reference keys)
+/// and, for a scan rooted at a directory rather than at a subvolume root, that
+/// directory - everything else it records comes back with the result.
+struct Job {
+    root_id: u64,
+    subvol: u16,
+    snap_class: bool,
+    scope_inode: Option<u64>,
+}
+
+/// A finished walk: the tree it collected, the shard it wrote, and how long
+/// the walk itself took (which is what CST_TIME_SUBVOL prints).
+type JobResult = io::Result<(Collected, Shard, std::time::Duration)>;
+
+/// Walks in flight, and the results workers park for the coordinator.
+///
+/// Only the *walks* are parallel. Which subvolume is walked next, how it is
+/// interned, under which path and where a nested one hangs are decided on the
+/// coordinator thread, in the same order a serial scan decides them, because
+/// those decisions are order-dependent: a subvolume reachable through two
+/// parents keeps the path of the discovery that came first, and a subvolume
+/// found through the root tree hangs under whichever collapsed node reached it
+/// first. Peers doing the discovery too would make both depend on which thread
+/// arrived first - the scheduling-order leak that must not reach the cache.
+struct Pool {
+    state: Mutex<PoolState>,
+    /// a job is waiting
+    work: Condvar,
+    /// a result is waiting
+    done: Condvar,
+    /// set when the scan gives up: a walk in flight ends at its next kernel
+    /// search, since the `Searcher` polls this like a cancel
+    stop: AtomicBool,
+}
+
+#[derive(Default)]
+struct PoolState {
+    /// jobs no worker has taken. Workers take the newest, which is the one the
+    /// coordinator - whose work list is a stack - will ask for next.
+    queue: VecDeque<Job>,
+    /// finished walks by root id, waiting to be taken back in traversal order
+    results: HashMap<u64, JobResult>,
+    /// submitted and not finished: a `take` with neither a result nor anything
+    /// in flight is a bug, not something to wait for
+    inflight: usize,
+    shutdown: bool,
+}
+
+impl Pool {
+    fn new() -> Pool {
+        Pool {
+            state: Mutex::new(PoolState::default()),
+            work: Condvar::new(),
+            done: Condvar::new(),
+            stop: AtomicBool::new(false),
+        }
+    }
+
+    fn submit(&self, job: Job) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.queue.push_back(job);
+            st.inflight += 1;
+        }
+        self.work.notify_one();
+    }
+
+    /// The result of one walk, waiting for a worker to finish it.
+    fn take(&self, root_id: u64, cancel: Option<&AtomicBool>) -> JobResult {
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if let Some(r) = st.results.remove(&root_id) {
+                return r;
+            }
+            if st.inflight == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "internal: no walk was in flight for this subvolume",
+                ));
+            }
+            // Bounded, so a cancel set by a GUI is seen even while a long walk
+            // is running: the walkers then stop at their next kernel search.
+            let (next, _) = self
+                .done
+                .wait_timeout(st, Duration::from_millis(20))
+                .unwrap();
+            st = next;
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                self.stop.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn shutdown(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let mut st = self.state.lock().unwrap();
+        st.shutdown = true;
+        drop(st);
+        self.work.notify_all();
+        self.done.notify_all();
+    }
+}
+
+/// One worker: take a job, walk its tree, park the result.
+fn pool_worker(pool: &Pool, fd: i32, live: Option<&Progress>) {
+    loop {
+        let job = {
+            let mut st = pool.state.lock().unwrap();
+            loop {
+                if st.shutdown {
+                    return;
+                }
+                if let Some(j) = st.queue.pop_back() {
+                    break j;
+                }
+                st = pool.work.wait(st).unwrap();
+            }
+        };
+        let started = std::time::Instant::now();
+        let mut shard = Shard::default();
+        let r = collect_subvolume(
+            &mut shard,
+            fd,
+            job.root_id,
+            job.subvol,
+            job.snap_class,
+            job.scope_inode,
+            live,
+            Some(&pool.stop),
+        );
+        let walk = started.elapsed();
+        let mut st = pool.state.lock().unwrap();
+        st.inflight -= 1;
+        st.results.insert(job.root_id, r.map(|col| (col, shard, walk)));
+        drop(st);
+        pool.done.notify_all();
+    }
+}
+
+/// Merge one walk's shard into the collector's.
+///
+/// The walk recorded `first_ref`/`nrefs` against its own reference array, so
+/// every index moves by that array's new base. The extent values are
+/// properties of the extent itself (`disk`/`ram` are the same whichever file
+/// reached it), so the entry already in the map is the right one. The merge
+/// happens in traversal order, so the merged arrays come out exactly as a
+/// serial scan built them, whatever the thread count.
+fn merge_shard(dst: &mut Shard, col: &mut Collected, src: Shard) {
+    let base = dst.refs.len() as u32;
+    if base != 0 {
+        for rec in col.recs.iter_mut() {
+            if rec.nrefs > 0 {
+                rec.first_ref += base;
+            }
+        }
+    }
+    dst.refs.extend_from_slice(&src.refs);
+    dst.warnings.extend(src.warnings);
+    for (page, info) in src.extents {
+        dst.extents.entry(page).or_insert(info);
+    }
+}
+
 /// Collect one subvolume, then every subvolume nested inside it.
+///
+/// The walks run on `threads` workers; the traversal is one thread's, so the
+/// scan it produces does not depend on how many.
 fn collect_all(
     c: &mut Collector,
     fd: i32,
@@ -1134,6 +1325,36 @@ fn collect_all(
     start: &Root,
     excludes: &[Vec<u8>],
     live: Option<&Progress>,
+    threads: usize,
+) -> io::Result<()> {
+    if threads <= 1 {
+        // the serial path, unchanged: one thread, no copies, no merges
+        let pool = Pool::new();
+        return collect_walk(c, fd, inventory, start, excludes, live, &pool, false);
+    }
+    // Declared outside the scope so the workers' borrow of it outlives them.
+    let pool = Pool::new();
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| pool_worker(&pool, fd, live));
+        }
+        let r = collect_walk(c, fd, inventory, start, excludes, live, &pool, true);
+        pool.shutdown();
+        r
+    })
+}
+
+/// The traversal: pop a subvolume, take its walk (or run it), discover what is
+/// nested inside it, and push that back on the list.
+fn collect_walk(
+    c: &mut Collector,
+    fd: i32,
+    inventory: &[btrfs::RootItem],
+    start: &Root,
+    excludes: &[Vec<u8>],
+    live: Option<&Progress>,
+    pool: &Pool,
+    parallel: bool,
 ) -> io::Result<()> {
     // (root id, subvol index, path, whether to read its fs tree). A collapsed
     // subvolume is still *visited*, to find what lives inside it - just not
@@ -1141,6 +1362,9 @@ fn collect_all(
     let mut work: Vec<(u64, u16, Vec<u8>, bool)> =
         vec![(start.info.treeid, start.subvol, start.path.clone(), true)];
     let mut done: Vec<u64> = Vec::new();
+    // root ids handed to the pool: a subvolume reached twice is walked once
+    let mut submitted: HashSet<u64> = HashSet::new();
+    let cancel = live.map(|l| &l.cancel);
     while let Some((root_id, subvol, path, read_tree)) = work.pop() {
         // A GUI can cancel between subvolumes; the reads themselves cannot be
         // interrupted, since the kernel answers each fs-tree search whole.
@@ -1197,6 +1421,15 @@ fn collect_all(
                     c.collapsed.push((child_root, child, child_path.clone()));
                 } else {
                     c.graph_kids.push((root_id, child, name.clone()));
+                    if parallel && submitted.insert(child_root) {
+                        pool.submit(Job {
+                            root_id: child_root,
+                            subvol: child,
+                            snap_class: c.subvols[child as usize].is_snapshot(),
+                            // a child of a collapsed node is not the scan root
+                            scope_inode: None,
+                        });
+                    }
                 }
                 work.push((child_root, child, child_path, !collapsed));
             }
@@ -1204,21 +1437,34 @@ fn collect_all(
         }
         // Which subvolume a scan started in is a question about the subvolume,
         // not about the spelling of the path it was given.
-        let scope =
+        let scope_inode =
             if root_id == start.info.treeid && start.inode != btrfs::BTRFS_FIRST_FREE_OBJECTID {
-                Some(scope_of(fd, root_id, start.inode)?)
+                Some(start.inode)
             } else {
                 None
             };
-        let t_sub = std::time::Instant::now();
-        let col = collect_subvolume(c, fd, root_id, subvol, scope.as_ref(), live)?;
+        let snap_class = c.subvols[subvol as usize].is_snapshot();
+        let (col, walk) = if parallel {
+            if submitted.insert(root_id) {
+                pool.submit(Job { root_id, subvol, snap_class, scope_inode });
+            }
+            let (mut col, shard, walk) = pool.take(root_id, cancel)?;
+            merge_shard(&mut c.shard, &mut col, shard);
+            (col, walk)
+        } else {
+            let t_sub = std::time::Instant::now();
+            let col = collect_subvolume(
+                &mut c.shard, fd, root_id, subvol, snap_class, scope_inode, live, cancel,
+            )?;
+            (col, t_sub.elapsed())
+        };
         if std::env::var_os("CST_TIME_SUBVOL").is_some() {
             let s = &c.subvols[subvol as usize];
             eprintln!(
                 "[time]   subvol {} ({}) walked in {:.2}s: {} inodes, {} entries",
                 s.id,
                 String::from_utf8_lossy(&path),
-                t_sub.elapsed().as_secs_f64(),
+                walk.as_secs_f64(),
                 col.recs.len(),
                 col.entries.len()
             );
@@ -1241,6 +1487,13 @@ fn collect_all(
             let collapsed = c.collapse(child_subvol);
             if collapsed {
                 c.collapsed.push((*child_root, child_subvol, child_path.clone()));
+            } else if parallel && submitted.insert(*child_root) {
+                pool.submit(Job {
+                    root_id: *child_root,
+                    subvol: child_subvol,
+                    snap_class: c.subvols[child_subvol as usize].is_snapshot(),
+                    scope_inode: None,
+                });
             }
             work.push((*child_root, child_subvol, child_path, !collapsed));
         }
@@ -1689,11 +1942,9 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         l.running.store(true, Ordering::SeqCst);
     }
     let mut c = Collector {
-        extents: ExtentMap::new(),
-        refs: Vec::new(),
+        shard: Shard::default(),
         subs: Vec::new(),
         subvols: Vec::new(),
-        warnings: Vec::new(),
         unreadable: 0,
         files: 0,
         dirs: 0,
@@ -1727,8 +1978,15 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     }
     phase!("inventory + roots");
     let t_collect = std::time::Instant::now();
+    // 0 means "as many as the machine has", the old -j default; 1 means the
+    // serial path, exactly as it was before threads existed.
+    let threads = if opts.threads > 0 {
+        opts.threads
+    } else {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    };
     for root in &roots {
-        collect_all(&mut c, fd, &inv, root, &opts.excludes, live.as_deref())?;
+        collect_all(&mut c, fd, &inv, root, &opts.excludes, live.as_deref(), threads)?;
     }
     if std::env::var_os("CST_TIME_SUBVOL").is_some() {
         eprintln!(
@@ -1772,7 +2030,7 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         let in_scan: HashSet<u64> = tree.subvols.iter().map(|s| s.id).collect();
         let inventory: HashSet<u64> = inv.iter().map(|r| r.treeid).collect();
         let (mut pairs, cstats) = collect_collapsed_refs(
-            fd, cancel, &collapsed_nodes, &in_scan, &inventory, &mut g, &mut c.extents,
+            fd, cancel, &collapsed_nodes, &in_scan, &inventory, &mut g, &mut c.shard.extents,
         )?;
         if cancelled() {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -1864,14 +2122,14 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     stats.subvolumes = c.subvols.len() as u64;
     stats.files = c.files;
     stats.dirs = c.dirs;
-    stats.extents = c.extents.len() as u64;
+    stats.extents = c.shard.extents.len() as u64;
     stats.refs = ref_blocks[0].len() as u64;
     stats.elapsed = started.elapsed();
     tree.stats = stats.clone();
     tree.scanned_at = crate::cache::now();
     tree.scanned_roots = opts.roots.clone();
 
-    let mut extents = c.extents;
+    let mut extents = std::mem::take(&mut c.shard.extents);
     // Development aid: the extent map this scan ended up with, as logical
     // bytenrs, so two scans can be diffed against each other.
     if let Ok(path) = std::env::var("CST_DUMP_MAP") {

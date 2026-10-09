@@ -51,6 +51,9 @@ pub struct ScanOptions {
     /// inodes have gone by, and the flag its cancel button sets - and `None`
     /// for a headless scan, which has nobody to report to
     pub live: Option<Arc<Progress>>,
+    /// worker threads for the fs-tree walks; 0 means one per CPU, 1 the plain
+    /// serial pass. The output does not depend on it.
+    pub threads: usize,
 }
 
 impl Default for ScanOptions {
@@ -60,6 +63,7 @@ impl Default for ScanOptions {
             excludes: Vec::new(),
             full_scan: false,
             live: None,
+            threads: 0,
         }
     }
 }
