@@ -109,6 +109,44 @@ struct Shard {
     warnings: Vec<String>,
 }
 
+/// One tree's claim on a subvolume found through the root tree: the entry that
+/// names it, and what the child is called and where it lives under that tree.
+#[derive(Clone)]
+struct KidClaim {
+    /// the claiming tree's root id
+    parent: u64,
+    /// the child's own name under this claimant
+    name: Vec<u8>,
+    /// the child's full path under this claimant
+    path: Vec<u8>,
+    /// the child's node name under this claimant: the entry's name, with the
+    /// chain of directories above it when only the kernel could supply that
+    node: Vec<u8>,
+}
+
+/// A subvolume that lives inside a collapsed one, as every tree naming it sees
+/// it - and, once the walks are done, the claimant that wins.
+///
+/// Every tree whose directories hold an entry pointing at the child has a
+/// ROOT_BACKREF naming it, and each of those is a claim, so `claims` keeps all
+/// of them, not just the first. On this filesystem the root tree turns out to
+/// hold exactly one such backref per subvolume - a snapshot of the tree holding
+/// the entry does not get one of its own - so in practice there is usually a
+/// single claim; the shape is kept general because that is what the kernel
+/// promises, not what today's one measures. The winner is picked once the walks
+/// are finished, by `resolve_kids`, before anything is placed.
+#[derive(Clone)]
+struct GraphKid {
+    child_root: u64,
+    child: u16,
+    claims: Vec<KidClaim>,
+    /// resolved: the root id of the winning claimant
+    parent: u64,
+    /// resolved: the child's node name and path under it
+    name: Vec<u8>,
+    path: Vec<u8>,
+}
+
 /// Collects a whole scan: the shared extent map, the flat reference array and
 /// per-subvolume trees.
 struct Collector {
@@ -123,10 +161,10 @@ struct Collector {
     full_scan: bool,
     /// snapshot-class subvolumes left un-walked: (root id, subvol index, path)
     collapsed: Vec<(u64, u16, Vec<u8>)>,
-    /// (collapsed parent's root id, child subvol index, name) for subvolumes
-    /// found through the root tree inside a collapsed one: their trees are
-    /// read, and this is where their nodes hang.
-    graph_kids: Vec<(u64, u16, Vec<u8>)>,
+    /// subvolumes found through the root tree inside a collapsed one, with
+    /// every tree claiming each of them: their trees are read, and this is
+    /// where their nodes hang.
+    graph_kids: Vec<GraphKid>,
 }
 
 impl Collector {
@@ -140,6 +178,100 @@ impl Collector {
     fn collapse(&self, subvol: u16) -> bool {
         !self.full_scan && self.subvols[subvol as usize].is_snapshot()
     }
+
+    /// Record that `parent` names the subvolume `child_root`, keeping every
+    /// claim rather than the first, and interning the child on the first one so
+    /// that walk order (and so the caches) does not depend on the resolution.
+    fn claim_kid(
+        &mut self,
+        parent: u64,
+        child_root: u64,
+        child: u16,
+        claim: KidClaim,
+    ) {
+        match self.graph_kids.iter_mut().find(|k| k.child_root == child_root) {
+            Some(kid) => kid.claims.push(claim),
+            None => self.graph_kids.push(GraphKid {
+                child_root,
+                child,
+                claims: vec![claim],
+                parent,
+                name: Vec::new(),
+                path: Vec::new(),
+            }),
+        }
+    }
+}
+
+/// Order two claimants of one child: the tree the child actually lives in is
+/// the one that is not a copy of the others, so a tree that is not
+/// snapshot-class wins; a snapshot is always younger than what it was taken
+/// from, so the older subvolume wins next; the path is only a tiebreak, to keep
+/// the choice independent of the order the trees were enumerated in. The root
+/// id settles what the path cannot (two claimants with equal paths would be one
+/// tree), so the order is total.
+fn claim_cmp(subs: &[Subvol], a: u64, b: u64) -> std::cmp::Ordering {
+    let find = |id: u64| subs.iter().find(|s| s.id == id);
+    let (sa, sb) = (find(a), find(b));
+    let rank = |s: Option<&Subvol>| {
+        (
+            s.map_or(false, |s| s.is_snapshot()),
+            s.map_or(u64::MAX, |s| s.otime),
+        )
+    };
+    let (pa, pb) = (sa.map(|s| s.path.as_slice()), sb.map(|s| s.path.as_slice()));
+    rank(sa)
+        .cmp(&rank(sb))
+        .then_with(|| pa.cmp(&pb))
+        .then_with(|| a.cmp(&b))
+}
+
+/// Pick, for every child claimed by more than one tree, the tree it lives in,
+/// and give it the path and name that tree sees.
+///
+/// The subvolume table is corrected too: a child interned from the first claim
+/// carries that claimant's path, which is only the right one when that claim
+/// wins.
+fn resolve_kids(c: &mut Collector) {
+    let mut kids = std::mem::take(&mut c.graph_kids);
+    for kid in kids.iter_mut() {
+        let mut best = 0;
+        for i in 1..kid.claims.len() {
+            if claim_cmp(&c.subvols, kid.claims[i].parent, kid.claims[best].parent).is_lt() {
+                best = i;
+            }
+        }
+        let win = &kid.claims[best];
+        kid.parent = win.parent;
+        kid.name = win.node.clone();
+        kid.path = win.path.clone();
+        let s = &mut c.subvols[kid.child as usize];
+        s.name = win.name.clone();
+        s.path = win.path.clone();
+    }
+    // CST_DEBUG_CLAIMS: which tree each child found in the root tree went to,
+    // and who else claimed it - the check that the rule did what it says.
+    if std::env::var_os("CST_DEBUG_CLAIMS").is_some() {
+        for kid in &kids {
+            let who = |p: u64| {
+                let i = c.subvols.iter().position(|s| s.id == p);
+                match i {
+                    Some(i) => format!("{p}{}", if c.subvols[i].is_snapshot() { " (snapshot)" } else { "" }),
+                    None => format!("{p} (?)"),
+                }
+            };
+            let claims: Vec<String> = kid.claims.iter().map(|k| who(k.parent)).collect();
+            eprintln!(
+                "[claim] {} ({}) -> {}: claimed by [{}], {}",
+                kid.child_root,
+                String::from_utf8_lossy(&kid.path),
+                who(kid.parent),
+                claims.join(", "),
+                if kid.claims.len() > 1 { "chosen" } else { "only claimant" }
+            );
+        }
+    }
+    c.graph_kids = kids;
 }
 
 impl Collector {
@@ -729,6 +861,12 @@ fn push_collapsed_node(
         kind: KIND_DIR,
         flags,
         extra,
+        // childless for now: the subvolumes the root tree names inside it are
+        // placed as this node's own batch in `build`. The run starts right
+        // after the node, so a node that turns out to have none (the common
+        // case) still says where its children *would* be, which is what this
+        // field said before the batch was deferred.
+        first_child: idx + 1,
         btime: u32::MAX,
         btime_ns: u16::MAX,
         ..Default::default()
@@ -808,6 +946,12 @@ fn build(
     let mut root_nodes: Vec<u32> = Vec::new();
     // root id -> the node that stands for it
     let mut collapsed_nodes: HashMap<u64, u32> = HashMap::new();
+    // collapsed node -> the subvolumes the root tree named inside it, as
+    // (collected subvolume, subvol, node name, filtered path). They are placed
+    // when that node's own batch comes up, not with the batch that placed the
+    // collapsed node itself: a directory owns a contiguous run of nodes, and a
+    // grandchild appended inside its parent's batch would be counted in it.
+    let mut collapsed_kids: HashMap<u32, Vec<(usize, u16, Vec<u8>, Vec<u8>)>> = HashMap::new();
 
     // A directory must own a *contiguous* run of nodes, because everything
     // downstream (children slices, the rollup) assumes it. So each directory is
@@ -923,6 +1067,47 @@ fn build(
 
     while let Some((ci, inode, node_idx, dir_path)) = dirs.pop_front() {
         let first_child = tree.nodes.len() as u32;
+        // A collapsed node's batch: it has no directory entries to read, so its
+        // children are the subvolumes the root tree named inside it, gathered
+        // when the node was placed (see below). They are appended as this
+        // node's own run, so `child_ids` never hands them out as children of
+        // the directory that holds the collapsed node.
+        if let Some(list) = collapsed_kids.remove(&node_idx) {
+            let depth = tree.dirs[tree.nodes[node_idx as usize].extra as usize].depth + 1;
+            for (child_ci, child_subvol, gname, gp) in list {
+                let sv = &tree.subvols[child_subvol as usize];
+                let mut f = FLAG_SUBVOL;
+                if sv.is_snapshot() {
+                    f |= FLAG_SNAPSHOT;
+                }
+                if sv.is_readonly() {
+                    f |= FLAG_READONLY;
+                }
+                let inode = btrfs::BTRFS_FIRST_FREE_OBJECTID;
+                let Ok(pos) = c.subs[child_ci].recs.binary_search_by_key(&inode, |r| r.inode)
+                else {
+                    continue;
+                };
+                let rec = c.subs[child_ci].recs[pos];
+                let gidx = push_node(
+                    &mut tree, c, child_ci, node_idx, &gname, f, rec, KIND_DIR,
+                    &mut final_refs,
+                );
+                let gd = tree.dirs.len() as u32;
+                tree.dirs.push(DirExtra {
+                    subvol: c.subs[child_ci].subvol,
+                    depth,
+                    ..Default::default()
+                });
+                tree.nodes[gidx as usize].extra = gd;
+                dirs.push_back((child_ci, inode, gidx, gp));
+            }
+            let n = tree.nodes.len() as u32 - first_child;
+            let node = &mut tree.nodes[node_idx as usize];
+            node.first_child = first_child;
+            node.nchildren = n;
+            continue;
+        }
         // gather this directory's children first: pushing nodes borrows the
         // collector mutably, so nothing may hold a borrow of its entries
         let mut kids: Vec<(usize, u64, Vec<u8>, u8, Option<u16>, Vec<u8>)> = Vec::new();
@@ -1014,60 +1199,38 @@ fn build(
                 let root_id = tree.subvols[subvol as usize].id;
                 collapsed_nodes.insert(root_id, idx);
                 // A subvolume the root tree says lives inside this collapsed one
-                // had its own tree read, so its node belongs here. The chain of
-                // directories between the two is not read - that is the point
-                // of collapsing - so it hangs directly off the collapsed node.
-                let kids = c.graph_kids.clone();
-                let first = tree.nodes.len() as u32;
-                for (p_root, child_subvol, gname) in kids {
-                    if p_root != root_id {
+                // had its own tree read, so its node belongs here - if this is
+                // the claimant that won it. A child the rule gave to a walked
+                // tree was placed by that tree's own directories instead, and
+                // must not be placed a second time. The chain of directories
+                // between the two is not read - that is the point of collapsing
+                // - so `path` was resolved for exactly this case, and the node
+                // hangs directly off the collapsed node.
+                //
+                // Gathered now, placed later: this batch is the *enclosing*
+                // directory's run of children, and appending a grandchild to it
+                // would put the node in that run as well (child_ids is
+                // first_child..first_child+nchildren), which shows the child
+                // twice - once in its real place and once beside its parent.
+                let mut list: Vec<(usize, u16, Vec<u8>, Vec<u8>)> = Vec::new();
+                for kid in c.graph_kids.clone() {
+                    if kid.parent != root_id {
                         continue;
                     }
                     let Some(child_ci) =
-                        c.subs.iter().position(|s| s.subvol == child_subvol)
+                        c.subs.iter().position(|s| s.subvol == kid.child)
                     else {
                         continue;
                     };
-                    let sv = &tree.subvols[child_subvol as usize];
-                    let mut f = FLAG_SUBVOL;
-                    if sv.is_snapshot() {
-                        f |= FLAG_SNAPSHOT;
-                    }
-                    if sv.is_readonly() {
-                        f |= FLAG_READONLY;
-                    }
-                    let inode = btrfs::BTRFS_FIRST_FREE_OBJECTID;
-                    let Ok(pos) = c.subs[child_ci].recs.binary_search_by_key(&inode, |r| r.inode)
-                    else {
-                        continue;
-                    };
-                    let rec = c.subs[child_ci].recs[pos];
-                    let gidx = push_node(
-                        &mut tree, c, child_ci, idx, &gname, f, rec, KIND_DIR,
-                        &mut final_refs,
-                    );
-                    let gd = tree.dirs.len() as u32;
-                    tree.dirs.push(DirExtra {
-                        subvol: c.subs[child_ci].subvol,
-                        depth: depth + 1,
-                        ..Default::default()
-                    });
-                    tree.nodes[gidx as usize].extra = gd;
-                    let gp = if filter {
-                        let mut p = child_path.clone();
-                        if !p.ends_with(b"/") {
-                            p.push(b'/');
-                        }
-                        p.extend_from_slice(&gname);
-                        p
-                    } else {
-                        Vec::new()
-                    };
-                    dirs.push_back((child_ci, inode, gidx, gp));
+                    let gp = if filter { kid.path.clone() } else { Vec::new() };
+                    list.push((child_ci, kid.child, kid.name, gp));
                 }
-                let n = tree.nodes.len() as u32 - first;
-                tree.nodes[idx as usize].first_child = first;
-                tree.nodes[idx as usize].nchildren = n;
+                // Only a node that has kids needs its batch visited; one with
+                // none keeps the empty run `push_collapsed_node` left it.
+                if !list.is_empty() {
+                    collapsed_kids.insert(idx, list);
+                    dirs.push_back((0, 0, idx, Vec::new()));
+                }
                 continue;
             }
             let Ok(pos) = c.subs[child_ci].recs.binary_search_by_key(&child_inode, |r| r.inode) else {
@@ -1144,6 +1307,54 @@ fn path_to_dir(col: &Collected, dirid: u64, name: &[u8], root_path: &[u8]) -> Ve
     }
     out.extend_from_slice(name);
     out
+}
+
+/// The node name an entry takes when the directories above it had to come from
+/// the kernel: `rel` is the path from the subvolume's root down to the directory
+/// holding the entry, so the name is that path plus the entry's own name. An
+/// empty `rel` - the entry is in the subvolume's root directory - leaves just
+/// the name.
+fn join_rel(rel: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut start = 0;
+    let mut end = rel.len();
+    while start < end && rel[start] == b'/' {
+        start += 1;
+    }
+    while end > start && rel[end - 1] == b'/' {
+        end -= 1;
+    }
+    let rel = &rel[start..end];
+    let mut out = Vec::with_capacity(rel.len() + 1 + name.len());
+    if !rel.is_empty() {
+        out.extend_from_slice(rel);
+        out.push(b'/');
+    }
+    out.extend_from_slice(name);
+    out
+}
+
+/// What one tree sees of a subvolume it names in its own directories: the entry
+/// that points at it, plus the path down to the directory holding that entry.
+///
+/// The path is the piece a collapsed parent cannot supply itself: the dirid in
+/// its backref names a directory in a tree this scan never read, so the
+/// directories between the parent's root and the entry - the `x` and `y` of
+/// `.../x/y/A2` - are known only to the kernel. `INO_LOOKUP` asks it, once per
+/// claim, and it answers with the `/`-separated names from the subvolume's root
+/// down to that inode. When it has nothing to say (an inode that is gone, a
+/// kernel without the ioctl), the entry's bare name is all there is and the
+/// child's node keeps the flattened path it would otherwise have had.
+fn root_claim(fd: i32, parent: u64, dirid: u64, name: &[u8], parent_path: &[u8]) -> KidClaim {
+    let node = match btrfs::ino_lookup(fd, parent, dirid) {
+        Ok(rel) => join_rel(&rel, name),
+        Err(_) => name.to_vec(),
+    };
+    let mut path = parent_path.to_vec();
+    if !path.ends_with(b"/") {
+        path.push(b'/');
+    }
+    path.extend_from_slice(&node);
+    KidClaim { parent, name: name.to_vec(), path, node }
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,34 +1604,46 @@ fn collect_walk(
             // a tree and files of its own. Skipping it loses its extents, since
             // nothing else can attribute them - the extent tree names a
             // subvolume the scan would never have interned.
-            for (child_root, _dirid, name) in btrfs::subvolumes_inside(fd, root_id)? {
-                // Only what this scan has not already accounted for. A snapshot
-                // of a subvolume holds copies of that subvolume's directory
-                // entries, so the root tree lists everything nested in the
-                // original as a child of every snapshot of it too - and those
-                // are the same subvolumes, already walked or collapsed from
-                // where they really live. Taking them again would hang each
-                // subtree under every snapshot.
-                if c.subvols.iter().any(|s| s.id == child_root) {
+            //
+            // Every claim is kept and the child's tree is walked once, on the
+            // first one; which claimant it hangs under is settled afterwards,
+            // when all of them are known (see `resolve_kids`).
+            let mut n_kids = 0usize;
+            let mut n_claims = 0usize;
+            for (child_root, dirid, name) in btrfs::subvolumes_inside(fd, root_id)? {
+                // A subvolume this scan already knows has its tree walked once,
+                // wherever it was found first. The claim is not discarded for
+                // that, though: if several trees name the same child, this one
+                // may be the tree it really lives in.
+                if let Some(child) = c.subvols.iter().position(|s| s.id == child_root).map(|i| i as u16) {
+                    if c.graph_kids.iter().any(|k| k.child_root == child_root) {
+                        let claim = root_claim(fd, root_id, dirid, &name, &path);
+                        c.claim_kid(root_id, child_root, child, claim);
+                        n_claims += 1;
+                    }
                     continue;
                 }
                 let Some(r) = inventory.iter().find(|r| r.treeid == child_root) else {
                     continue;
                 };
-                let mut child_path = path.clone();
-                if !child_path.ends_with(b"/") {
-                    child_path.push(b'/');
-                }
-                child_path.extend_from_slice(&name);
-                if excluded(&child_path, excludes) {
+                let claim = root_claim(fd, root_id, dirid, &name, &path);
+                if excluded(&claim.path, excludes) {
                     continue;
                 }
-                let child = c.intern_root(r, inventory, &child_path, &name);
+                n_kids += 1;
+                let child = c.intern_root(r, inventory, &claim.path, &claim.name);
                 let collapsed = c.collapse(child);
+                let child_path = claim.path.clone();
                 if collapsed {
                     c.collapsed.push((child_root, child, child_path.clone()));
                 } else {
-                    c.graph_kids.push((root_id, child, name.clone()));
+                    // A child whose tree is read hangs off the tree that names
+                    // it, and which tree that is has to wait for the walks to
+                    // finish. Its walk starts here anyway, on the first claim:
+                    // deferring it would change the order trees are read in,
+                    // and with it the caches, for a choice that only ever moves
+                    // the node's parent.
+                    c.claim_kid(root_id, child_root, child, claim);
                     if parallel && submitted.insert(child_root) {
                         pool.submit(Job {
                             root_id: child_root,
@@ -1432,6 +1655,13 @@ fn collect_walk(
                     }
                 }
                 work.push((child_root, child, child_path, !collapsed));
+            }
+            if std::env::var_os("CST_DEBUG_CLAIMS").is_some() && n_kids + n_claims > 0 {
+                eprintln!(
+                    "[claim] collapsed {} ({}): {n_kids} new children, {n_claims} claims for known ones",
+                    root_id,
+                    String::from_utf8_lossy(&path)
+                );
             }
             continue;
         }
@@ -1484,6 +1714,25 @@ fn collect_walk(
                 continue;
             }
             let child_subvol = c.intern_subvol(&info, inventory, &child_path);
+            // A child reached through a walked tree is claimed here like any
+            // other, whether or not a collapsed tree also names it: a walked
+            // tree is never snapshot-class, so the rule always prefers it and
+            // the node belongs exactly where the walk found it. Recording it
+            // only when the record already exists would drop this claim when
+            // the walk came first, and then the collapsed claimant's would be
+            // the only one - the child would hang off a snapshot although a
+            // live tree holds its entry.
+            c.claim_kid(
+                root_id,
+                *child_root,
+                child_subvol,
+                KidClaim {
+                    parent: root_id,
+                    name: info.name.clone(),
+                    path: child_path.clone(),
+                    node: name.clone(),
+                },
+            );
             let collapsed = c.collapse(child_subvol);
             if collapsed {
                 c.collapsed.push((*child_root, child_subvol, child_path.clone()));
@@ -1996,6 +2245,12 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         );
     }
     phase!("collect_all (fs-tree walks)");
+
+    // Every tree that names a subvolume found inside a collapsed one has now had
+    // its say, so the child can be given to the one it really lives in - before
+    // `build` places anything.
+    resolve_kids(&mut c);
+    phase!("resolve_kids");
 
     let (mut tree, final_refs, collapsed_nodes) = build(&mut c, &roots, &opts.excludes);
     tree.inventory = inv.clone();

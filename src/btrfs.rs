@@ -60,6 +60,9 @@ const SEARCH_HEADER_SIZE: usize = 32; // struct btrfs_ioctl_search_header, padde
 
 const BTRFS_IOC_TREE_SEARCH_V2: u64 = ioc(IOC_WRITE | IOC_READ, BTRFS_IOCTL_MAGIC, 17, SEARCH_ARGS_V2_SIZE as u64);
 const BTRFS_IOC_GET_SUBVOL_INFO: u64 = ioc(IOC_READ, BTRFS_IOCTL_MAGIC, 60, SUBVOL_INFO_SIZE as u64);
+// _IOWR(0x94, 18, struct btrfs_ioctl_ino_lookup_args) = 0xd0009412: the size
+// field is sizeof(struct ...) = 4096, the number is 18 and not 1.
+const BTRFS_IOC_INO_LOOKUP: u64 = ioc(IOC_WRITE | IOC_READ, BTRFS_IOCTL_MAGIC, 18, INO_LOOKUP_SIZE as u64);
 
 // ---------------------------------------------------------------------------
 // GET_SUBVOL_INFO
@@ -588,7 +591,19 @@ where
 /// know where subvolumes are nested.
 ///
 /// A backref is keyed `(child_root, ROOT_BACKREF, parent_root)`: the objectid is
-/// the subvolume, the offset is the subvolume it was snapshotted from.
+/// the subvolume and the offset is the tree that *holds* its entry - the
+/// subvolume it lives in, not the one it was snapshotted from. Its payload is
+/// `(dirid, sequence, name)`, the directory in that tree and the entry's name
+/// there. Measured on this filesystem: a subvolume has exactly one of these, a
+/// snapshot of the tree holding it does not get one of its own, and moving the
+/// subvolume updates this one in place (dirid and sequence change).
+///
+/// Every entry is recorded twice in the root tree, as `(child, ROOT_BACKREF,
+/// parent)` and as the mirror `(parent, ROOT_REF, child)`, so a search over one
+/// offset sees both and the mirror reads as the child's *parent* being a child
+/// of `parent_root`. The type is therefore checked here: only a ROOT_BACKREF
+/// says "this subvolume is inside that one", and the item's payload - the dirid
+/// of the containing directory - belongs to the backref that named it.
 pub fn subvolumes_inside(fd: i32, parent_root: u64) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
     let mut searcher = Searcher::new(1 << 20);
     let spec = SearchSpec {
@@ -599,8 +614,8 @@ pub fn subvolumes_inside(fd: i32, parent_root: u64) -> io::Result<Vec<(u64, u64,
         max_objectid: u64::MAX,
     };
     let mut out = Vec::new();
-    searcher.for_each_item(fd, &spec, None, &mut |child, _ty, parent, payload| {
-        if parent != parent_root || payload.len() < 18 {
+    searcher.for_each_item(fd, &spec, None, &mut |child, ty, parent, payload| {
+        if ty != BTRFS_ROOT_BACKREF_KEY || parent != parent_root || payload.len() < 18 {
             return;
         }
         let dirid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
@@ -611,6 +626,38 @@ pub fn subvolumes_inside(fd: i32, parent_root: u64) -> io::Result<Vec<(u64, u64,
         let _ = &out;
     })?;
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// INO_LOOKUP
+// ---------------------------------------------------------------------------
+
+/// struct btrfs_ioctl_ino_lookup_args: `{ u64 treeid; u64 objectid; char
+/// name[4080]; }` - the name buffer is BTRFS_INO_LOOKUP_PATH_MAX and the struct
+/// is exactly one page.
+const INO_LOOKUP_SIZE: usize = 4096;
+const INO_LOOKUP_NAME_OFF: usize = 16;
+const INO_LOOKUP_NAME_MAX: usize = 4080;
+
+/// The path from `treeid`'s root down to one inode, as the kernel knows it:
+/// `/`-separated names, NUL-terminated. The subvolume's root itself comes back
+/// as the empty string.
+///
+/// This is how a subvolume found in the root tree gets a real path: its tree is
+/// never walked, so the dirid in its backref names a directory in that tree
+/// that nothing here has read. It is one small ioctl, and it is only needed
+/// where a walk was skipped for exactly that reason.
+pub fn ino_lookup(fd: i32, treeid: u64, objectid: u64) -> io::Result<Vec<u8>> {
+    let mut buf = [0u8; INO_LOOKUP_SIZE];
+    buf[0..8].copy_from_slice(&treeid.to_ne_bytes());
+    buf[8..16].copy_from_slice(&objectid.to_ne_bytes());
+    let rc = unsafe { ioctl(fd, BTRFS_IOC_INO_LOOKUP, buf.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let name = &buf[INO_LOOKUP_NAME_OFF..INO_LOOKUP_NAME_OFF + INO_LOOKUP_NAME_MAX];
+    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    Ok(name[..end].to_vec())
 }
 
 // ---------------------------------------------------------------------------
