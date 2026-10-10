@@ -156,8 +156,8 @@ struct Collector {
     subvols: Vec<Subvol>,
     files: u64,
     dirs: u64,
-    /// walk every fs tree, including the snapshot-class subvolumes (the M2
-    /// behaviour: snapshot interiors stay browsable)
+    /// walk every fs tree, including the snapshot-class subvolumes (snapshot
+    /// interiors stay browsable)
     full_scan: bool,
     /// snapshot-class subvolumes left un-walked: (root id, subvol index, path)
     collapsed: Vec<(u64, u16, Vec<u8>)>,
@@ -1295,13 +1295,9 @@ fn build(
                 // must not be placed a second time. The chain of directories
                 // between the two is not read - that is the point of collapsing
                 // - so `path` was resolved for exactly this case, and the node
-                // hangs directly off the collapsed node.
-                //
-                // Gathered now, placed later: this batch is the *enclosing*
-                // directory's run of children, and appending a grandchild to it
-                // would put the node in that run as well (child_ids is
-                // first_child..first_child+nchildren), which shows the child
-                // twice - once in its real place and once beside its parent.
+                // hangs directly off the collapsed node. Why they are gathered
+                // here and placed with this node's own batch: see
+                // `collapsed_kids`.
                 let mut list: Vec<(usize, u16, Vec<u8>, Vec<u8>, bool)> = Vec::new();
                 for kid in c.graph_kids.clone() {
                     if kid.parent != root_id {
@@ -1490,14 +1486,9 @@ type JobResult = io::Result<(Collected, Shard, std::time::Duration)>;
 
 /// Walks in flight, and the results workers park for the coordinator.
 ///
-/// Only the *walks* are parallel. Which subvolume is walked next, how it is
-/// interned, under which path and where a nested one hangs are decided on the
-/// coordinator thread, in the same order a serial scan decides them, because
-/// those decisions are order-dependent: a subvolume reachable through two
-/// parents keeps the path of the discovery that came first, and a subvolume
-/// found through the root tree hangs under whichever collapsed node reached it
-/// first. Peers doing the discovery too would make both depend on which thread
-/// arrived first - the scheduling-order leak that must not reach the cache.
+/// Only the *walks* are parallel: the traversal is one thread's, so nothing the
+/// scan records - what is interned, where a subvolume hangs, the order warnings
+/// are listed in - depends on which worker finished first.
 struct Pool {
     state: Mutex<PoolState>,
     /// a job is waiting
@@ -2310,8 +2301,6 @@ fn debug_ownership(
 ///   `win_count`: the two have to agree, since `set_windows` derives the
 ///   window from exactly these references - so a deficit is bytes credited
 ///   to nobody.
-/// * `inline` tallies the payloads that live in the fs tree rather than the
-///   extent tree, invisible to any mode that does not walk the subvolume.
 /// * `reach` walks the tree from the scanned roots and sums the owned bytes
 ///   they reach, to catch bytes that never roll into a root's total.
 fn debug_ownership_stats(

@@ -1,5 +1,5 @@
-//! M1: a single-walk accounting pass that reproduces `compsize`'s output
-//! byte for byte, so the extent layer can be verified against it.
+//! A single-walk accounting pass that reproduces `compsize`'s output byte for
+//! byte, so the extent layer can be verified against it.
 //!
 //! This is deliberately serial and mirrors compsize.c's `do_recursive_search`
 //! (same open flags, same errno policy, same dedup key, same counters). The

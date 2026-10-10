@@ -1,7 +1,8 @@
 //! Cache file: the result of a scan, in a fixed-width layout that loads back
 //! with a single read per array.
 //!
-//! Written by `scan` (running as root), read by `serve` (unprivileged).
+//! Written by `scan` (running as root) and handed to the invoking user, so the
+//! report, the app and `check` can read it back unprivileged.
 
 use crate::model::*;
 use crate::scan::ScanStats;
@@ -259,7 +260,7 @@ impl Cache {
         })
     }
 
-    /// Move the loaded arrays into the tree the report and the server use.
+    /// Move the loaded arrays into the tree the report and the app use.
     pub fn into_tree(self) -> Tree {
         Tree {
             nodes: self.nodes,

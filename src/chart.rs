@@ -1,7 +1,6 @@
 //! The usage chart: a sunburst ring chart and a treemap, drawn with cairo.
 //!
-//! The geometry is the same as the web version had, so the two look alike:
-//! the current directory sits in the middle, its children form the first ring,
+//! The current directory sits in the middle, its children form the first ring,
 //! and the biggest grandchildren form a second ring. Children are coloured in
 //! a fixed eight-hue order (validated for colour-vision deficiency); everything
 //! past the eighth slot is neutral, and deeper rings reuse the parent's hue at

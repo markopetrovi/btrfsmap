@@ -79,9 +79,7 @@ pub struct Node {
     /// files created microseconds apart still order correctly). Fits in what
     /// used to be struct padding.
     pub btime_ns: u16,
-    /// declared so the struct has no implicit padding: these bytes go into the
-    /// cache file, and compiler padding is not guaranteed to be zeroed, which
-    /// made otherwise identical scans differ
+    /// tail padding, for the same reason as `_pad2`
     pub _pad: u16,
 }
 
