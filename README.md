@@ -145,15 +145,15 @@ cmp /tmp/a.cst /tmp/b.cst
 ```
 
 `--reproducible` drops timings and warnings, which is what makes two scans of an
-unchanged tree byte-identical. Pass `--full-scan` on both sides when the tree has
-snapshot-class subvolumes: the collapsed scan is deliberately a different, aggregate
-tree, so it is compared on its numbers instead (see Limits).
+unchanged tree byte-identical. When the tree has snapshot-class subvolumes the
+tree reader needs `--full-scan` to match the reference, which always walks them;
+a collapsed scan is a deliberately different, aggregate tree, and is compared on
+its numbers instead (see Limits).
 
-Let the tree settle first: the tree reader reads the committed tree, so a fixture
-just written to can be missing entries that the path walk still sees (`sync`
-before comparing; this is the usual reason a gate fails). Name the scan root the
-same way in both runs: its spelling is part of the compared bytes, since the path
-is recorded in `scanned_roots` and in the subvolume it opens.
+`sync` a fixture before comparing it: the tree reader reads the committed tree, so
+a tree just written to can be missing entries the path walk still sees.
+Name the scan root the same way in both runs: its spelling is part of the compared
+bytes, since the path is recorded in `scanned_roots` and in the subvolume it opens.
 An absolute root and a relative one differ by 144 bytes on the `.scratch/own` fixture
 - enough to fail `cmp` on its own.
 
@@ -213,11 +213,8 @@ failed to parse (the count has to be zero).
   0 for the same reason: the logical sizes live in the files, which were not
   read.
 * A scan is a snapshot in time; files changing during it are counted once, as
-  seen. What it reads is btrfs's *committed* tree, so anything written in the
-  moments before the scan may not be in that tree yet - measured: a directory
-  with two fresh files (no `sync`) reports 0 files, and 2 files after one. The
-  file walk does not have this: it walks the directory cache. `sync` first when
-  the difference matters.
+  seen - and it reads the committed tree, so a file written moments ago may not
+  be in it until `sync`.
 * A mount the scan does not enter - a non-btrfs filesystem (loop mounts,
   overlayfs, tmpfs, `/boot`), a *different* btrfs filesystem (its fsid is
   compared with the scanned one by `BTRFS_IOC_FS_INFO` before anything is read
@@ -233,9 +230,9 @@ failed to parse (the count has to be zero).
   handed out in mount order - and the others show as mount points with nothing
   under them, so its files do not gain a second reference. A subvolume that also
   lives inside the scanned tree keeps its tree location, and its mounts are only
-  aliases. A mount inside a subvolume that was *not* walked (a collapsed
-  snapshot) cannot be placed at all; the scan warns that what it mounts is not
-  counted.
+  aliases. A mount inside a subvolume that was not walked (a collapsed snapshot)
+  is read like a subvolume found inside one: it hangs off the collapsed node by
+  the path the kernel gives for the directories between them.
 * Several paths may be given to one scan; a path inside another one is not
   scanned separately, because it is already in that scan and a second placement
   would split every extent between the two copies. The scan says so when it

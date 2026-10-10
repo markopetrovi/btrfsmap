@@ -109,7 +109,8 @@ struct Shard {
 /// names it, and what the child is called and where it lives under that tree.
 #[derive(Clone)]
 struct KidClaim {
-    /// the claiming tree's root id
+    /// the claiming tree's root id - for a mount, the tree the mount point
+    /// sits in, whose directories are not read either way
     parent: u64,
     /// the child's own name under this claimant
     name: Vec<u8>,
@@ -118,6 +119,8 @@ struct KidClaim {
     /// the child's node name under this claimant: the entry's name, with the
     /// chain of directories above it when only the kernel could supply that
     node: Vec<u8>,
+    /// the claim is a mount point: the child's tree begins there
+    mount: bool,
 }
 
 /// A subvolume that lives inside a collapsed one, as every tree naming it sees
@@ -141,6 +144,8 @@ struct GraphKid {
     /// resolved: the child's node name and path under it
     name: Vec<u8>,
     path: Vec<u8>,
+    /// resolved: the winning claim is a mount point
+    mount: bool,
 }
 
 /// Collects a whole scan: the shared extent map, the flat reference array and
@@ -192,6 +197,7 @@ impl Collector {
             None => self.graph_kids.push(GraphKid {
                 child_root,
                 child,
+                mount: claim.mount,
                 claims: vec![claim],
                 parent,
                 name: Vec::new(),
@@ -243,6 +249,7 @@ fn resolve_kids(c: &mut Collector) {
         kid.parent = win.parent;
         kid.name = win.node.clone();
         kid.path = win.path.clone();
+        kid.mount = win.mount;
         let s = &mut c.subvols[kid.child as usize];
         s.name = win.name.clone();
         s.path = win.path.clone();
@@ -959,12 +966,16 @@ fn build(
     let mut root_nodes: Vec<u32> = Vec::new();
     // root id -> the node that stands for it
     let mut collapsed_nodes: HashMap<u64, u32> = HashMap::new();
-    // collapsed node -> the subvolumes the root tree named inside it, as
-    // (collected subvolume, subvol, node name, filtered path). They are placed
-    // when that node's own batch comes up, not with the batch that placed the
-    // collapsed node itself: a directory owns a contiguous run of nodes, and a
-    // grandchild appended inside its parent's batch would be counted in it.
-    let mut collapsed_kids: HashMap<u32, Vec<(usize, u16, Vec<u8>, Vec<u8>)>> = HashMap::new();
+    // collapsed node -> the subvolumes the root tree or a mount names inside
+    // it, as (collected subvolume, subvol, node name, filtered path, whether
+    // the claim is a mount point); a collected index of usize::MAX means the
+    // child is snapshot-class too and stands as a collapsed node of its own.
+    // They are placed when that node's own batch comes up, not with the batch
+    // that placed the collapsed node itself: a directory owns a contiguous run
+    // of nodes, and a grandchild appended inside its parent's batch would be
+    // counted in it.
+    let mut collapsed_kids: HashMap<u32, Vec<(usize, u16, Vec<u8>, Vec<u8>, bool)>> =
+        HashMap::new();
 
     // A directory must own a *contiguous* run of nodes, because everything
     // downstream (children slices, the rollup) assumes it. So each directory is
@@ -1087,7 +1098,7 @@ fn build(
         // the directory that holds the collapsed node.
         if let Some(list) = collapsed_kids.remove(&node_idx) {
             let depth = tree.dirs[tree.nodes[node_idx as usize].extra as usize].depth + 1;
-            for (child_ci, child_subvol, gname, gp) in list {
+            for (child_ci, child_subvol, gname, gp, from_mount) in list {
                 let sv = &tree.subvols[child_subvol as usize];
                 let mut f = FLAG_SUBVOL;
                 if sv.is_snapshot() {
@@ -1095,6 +1106,19 @@ fn build(
                 }
                 if sv.is_readonly() {
                     f |= FLAG_READONLY;
+                }
+                if from_mount {
+                    f |= FLAG_MOUNT;
+                }
+                if child_ci == usize::MAX {
+                    // snapshot-class below a collapsed node: one node for the
+                    // subtree, and the extent tree supplies its references
+                    let root_id = sv.id;
+                    let gidx = push_collapsed_node(
+                        &mut tree, c, child_subvol, node_idx, &gname, depth, f,
+                    );
+                    collapsed_nodes.insert(root_id, gidx);
+                    continue;
                 }
                 let inode = btrfs::BTRFS_FIRST_FREE_OBJECTID;
                 let Ok(pos) = c.subs[child_ci].recs.binary_search_by_key(&inode, |r| r.inode)
@@ -1280,18 +1304,29 @@ fn build(
                 // would put the node in that run as well (child_ids is
                 // first_child..first_child+nchildren), which shows the child
                 // twice - once in its real place and once beside its parent.
-                let mut list: Vec<(usize, u16, Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut list: Vec<(usize, u16, Vec<u8>, Vec<u8>, bool)> = Vec::new();
                 for kid in c.graph_kids.clone() {
                     if kid.parent != root_id {
                         continue;
                     }
-                    let Some(child_ci) =
-                        c.subs.iter().position(|s| s.subvol == kid.child)
-                    else {
-                        continue;
-                    };
                     let gp = if filter { kid.path.clone() } else { Vec::new() };
-                    list.push((child_ci, kid.child, kid.name, gp));
+                    match c.subs.iter().position(|s| s.subvol == kid.child) {
+                        Some(child_ci) => {
+                            list.push((child_ci, kid.child, kid.name, gp, kid.mount))
+                        }
+                        // a kid that is itself snapshot-class has no collected
+                        // tree either: like its parent, one collapsed node
+                        // stands for its subtree and the extent tree supplies
+                        // its references
+                        None if c
+                            .collapsed
+                            .iter()
+                            .any(|(r, _, _)| *r == tree.subvols[kid.child as usize].id) =>
+                        {
+                            list.push((usize::MAX, kid.child, kid.name, gp, kid.mount))
+                        }
+                        None => {}
+                    }
                 }
                 // Only a node that has kids needs its batch visited; one with
                 // none keeps the empty run `push_collapsed_node` left it.
@@ -1417,7 +1452,7 @@ fn join_rel(rel: &[u8], name: &[u8]) -> Vec<u8> {
 /// down to that inode. When it has nothing to say (an inode that is gone, a
 /// kernel without the ioctl), the entry's bare name is all there is and the
 /// child's node keeps the flattened path it would otherwise have had.
-fn root_claim(fd: i32, parent: u64, dirid: u64, name: &[u8], parent_path: &[u8]) -> KidClaim {
+fn root_claim(fd: i32, parent: u64, dirid: u64, name: &[u8], parent_path: &[u8], mount: bool) -> KidClaim {
     let node = match btrfs::ino_lookup(fd, parent, dirid) {
         Ok(rel) => join_rel(&rel, name),
         Err(_) => name.to_vec(),
@@ -1427,7 +1462,13 @@ fn root_claim(fd: i32, parent: u64, dirid: u64, name: &[u8], parent_path: &[u8])
         path.push(b'/');
     }
     path.extend_from_slice(&node);
-    KidClaim { parent, name: name.to_vec(), path, node }
+    KidClaim {
+        parent,
+        name: name.to_vec(),
+        path,
+        node,
+        mount,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1667,7 +1708,16 @@ fn collect_walk(
                 break;
             }
             mounts_left = false;
-            seed_mounts(c, inventory, root_index, pool, parallel, &mut submitted, &mut work);
+            seed_mounts(
+                c,
+                fd,
+                inventory,
+                root_index,
+                pool,
+                parallel,
+                &mut submitted,
+                &mut work,
+            );
             continue;
         };
         // A GUI can cancel between subvolumes; the reads themselves cannot be
@@ -1710,7 +1760,7 @@ fn collect_walk(
                 // may be the tree it really lives in.
                 if let Some(child) = c.subvols.iter().position(|s| s.id == child_root).map(|i| i as u16) {
                     if c.graph_kids.iter().any(|k| k.child_root == child_root) {
-                        let claim = root_claim(fd, root_id, dirid, &name, &path);
+                        let claim = root_claim(fd, root_id, dirid, &name, &path, false);
                         c.claim_kid(root_id, child_root, child, claim);
                         n_claims += 1;
                     }
@@ -1719,7 +1769,7 @@ fn collect_walk(
                 let Some(r) = inventory.iter().find(|r| r.treeid == child_root) else {
                     continue;
                 };
-                let claim = root_claim(fd, root_id, dirid, &name, &path);
+                let claim = root_claim(fd, root_id, dirid, &name, &path, false);
                 if excluded(&claim.path, excludes) {
                     continue;
                 }
@@ -1824,6 +1874,7 @@ fn collect_walk(
                     name: info.name.clone(),
                     path: child_path.clone(),
                     node: name.clone(),
+                    mount: false,
                 },
             );
             let collapsed = c.collapse(child_subvol);
@@ -1983,8 +2034,10 @@ fn covered_roots(roots: &[Root], mounts: &[MountPoint]) -> Vec<(usize, usize)> {
 /// (`MountPoint::candidate`) is read; the rest stay aliases and their nodes say
 /// so.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn seed_mounts(
     c: &mut Collector,
+    fd: i32,
     inventory: &[btrfs::RootItem],
     root_index: usize,
     pool: &Pool,
@@ -2003,27 +2056,34 @@ fn seed_mounts(
         if c.subvols.iter().any(|s| s.id == child_root) {
             continue; // the tree reached it first: its tree location wins
         }
-        // A mount inside a subvolume this scan did not walk - a collapsed
-        // snapshot - has no directory in the tree to hang from: nothing read
-        // the entries that would hold it, and there is nowhere to put its node.
-        // Reading the mounted subvolume anyway would only make nodes nothing
-        // can reach, so it is not read, and the loss is said out loud.
-        if c.collapsed
-            .iter()
-            .any(|(r, _, _)| *r == c.mounts[mi].holder.0)
-        {
-            c.shard.warnings.push(format!(
-                "{}: a mount point inside a subvolume that was not walked; \
-                 what it mounts is not counted",
-                String::from_utf8_lossy(&c.mounts[mi].path)
-            ));
-            continue;
-        }
         let path = c.mounts[mi].path.clone();
         // interned from what the kernel says about the mount, as the file
         // walker did: the subvolume's own name, at the path it is mounted on
         let child = c.intern_subvol(&info, inventory, &path);
         c.mounts[mi].child = Some(child);
+        // Where the mount sits in a subvolume whose directories were not read -
+        // a collapsed snapshot - there is no entry to place it from. It hangs
+        // off that collapsed node instead, exactly like a subvolume found
+        // through the root tree inside one: the kernel names the chain of
+        // directories between the two (INO_LOOKUP), and the mounted subvolume's
+        // own tree is read like any other. A mount that is only an alias of a
+        // tree the scan reaches elsewhere is not claimed at all, and the
+        // collapsed node stays closed.
+        if let Some((_, _, holder_path)) = c
+            .collapsed
+            .iter()
+            .find(|(r, _, _)| *r == c.mounts[mi].holder.0)
+        {
+            let claim = root_claim(
+                fd,
+                c.mounts[mi].holder.0,
+                c.mounts[mi].holder.1,
+                mounts::name_of(&path),
+                &holder_path.clone(),
+                true,
+            );
+            c.claim_kid(c.mounts[mi].holder.0, child_root, child, claim);
+        }
         let collapsed = c.collapse(child);
         if collapsed {
             c.collapsed.push((child_root, child, path.clone()));
