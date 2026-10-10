@@ -13,7 +13,9 @@
 //! * `EXTENT_DATA` is the same extent list the per-inode search returns.
 //!
 //! Subvolume boundaries come from the root tree's backrefs, so a nested
-//! subvolume or snapshot is found without walking anything above it.
+//! subvolume or snapshot is found without walking anything above it - and from
+//! the mount table, for the subvolumes the kernel serves at a path inside the
+//! scan without any tree saying so (see `mounts`).
 
 use crate::btrfs::{
     self, BTRFS_DIR_INDEX_KEY, BTRFS_EXTENT_DATA_KEY, BTRFS_FILE_EXTENT_INLINE, BTRFS_INODE_ITEM_KEY,
@@ -123,8 +125,9 @@ struct KidClaim {
     mount: bool,
 }
 
-/// A subvolume that lives inside a collapsed one, as every tree naming it sees
-/// it - and, once the walks are done, the claimant that wins.
+/// A subvolume that lives inside a collapsed one, as everything naming it sees
+/// it - a tree whose directories hold an entry pointing at it, or a mount point
+/// over one - and, once the walks are done, the claimant that wins.
 ///
 /// Every tree whose directories hold an entry pointing at the child has a
 /// ROOT_BACKREF naming it, and each of those is a claim, so `claims` keeps all
@@ -844,10 +847,6 @@ struct MountPoint {
     abs: Vec<u8>,
 }
 
-/// Assemble the tree the rest of the program expects from the collected pieces.
-///
-/// Node indices come out in the same order the file backend produces: breadth
-/// first, children sorted by name. That is what makes the two comparable at all.
 /// Append the single node that stands in for a collapsed subvolume.
 ///
 /// It is a directory node with no children: the scan knows the subvolume is
@@ -911,6 +910,10 @@ fn push_collapsed_node(
     idx
 }
 
+/// Assemble the tree the rest of the program expects from the collected pieces.
+///
+/// Node indices come out in the same order the file backend produces: breadth
+/// first, children sorted by name. That is what makes the two comparable at all.
 fn build(
     c: &mut Collector,
     roots: &[Root],
@@ -1435,17 +1438,21 @@ fn join_rel(rel: &[u8], name: &[u8]) -> Vec<u8> {
     out
 }
 
-/// What one tree sees of a subvolume it names in its own directories: the entry
-/// that points at it, plus the path down to the directory holding that entry.
+/// What names a child under a parent whose own directories were not read: the
+/// entry that points at it - or the mount point over that entry - plus the path
+/// down to it.
 ///
-/// The path is the piece a collapsed parent cannot supply itself: the dirid in
-/// its backref names a directory in a tree this scan never read, so the
-/// directories between the parent's root and the entry - the `x` and `y` of
-/// `.../x/y/A2` - are known only to the kernel. `INO_LOOKUP` asks it, once per
-/// claim, and it answers with the `/`-separated names from the subvolume's root
-/// down to that inode. When it has nothing to say (an inode that is gone, a
-/// kernel without the ioctl), the entry's bare name is all there is and the
-/// child's node keeps the flattened path it would otherwise have had.
+/// The path is the piece such a parent cannot supply itself: the dirid in its
+/// backref names a directory in a tree this scan never read, so the directories
+/// between the parent's root and the entry - the `x` and `y` of `.../x/y/A2` -
+/// are known only to the kernel. `INO_LOOKUP` asks it, once per claim, and it
+/// answers with the `/`-separated names from the subvolume's root down to that
+/// inode. That is asked by inode rather than taken from the mount's own path
+/// because a subvolume may be mounted in several places, and then its namespace
+/// path says nothing about where its tree puts the mount point. When the kernel
+/// has nothing to say (an inode that is gone, a kernel without the ioctl), the
+/// entry's bare name is all there is and the child's node keeps the flattened
+/// path it would otherwise have had.
 fn root_claim(fd: i32, parent: u64, dirid: u64, name: &[u8], parent_path: &[u8], mount: bool) -> KidClaim {
     let node = match btrfs::ino_lookup(fd, parent, dirid) {
         Ok(rel) => join_rel(&rel, name),

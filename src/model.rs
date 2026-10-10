@@ -3,12 +3,11 @@
 //!
 //! Metrics, per node (files hold their own, directories hold their subtree):
 //!
-//! * `owned`        bytes whose *semantic owner* is here. A reference counts
-//!                  in full when its subvolume class is the extent's priority
-//!                  class (live data first, snapshots only for extents the
-//!                  live tree no longer references), split evenly between
-//!                  same-class references. Additive: the tree sums to the true
-//!                  physical usage.
+//! * `owned`        bytes whose *semantic owner* is here: the smallest key of
+//!                  (file birth time, subvolume creation time) among an
+//!                  extent's references owns it, and references sharing that
+//!                  key split it. Additive: the tree sums to the true physical
+//!                  usage. The rule in full is on `attribute_owned`.
 //! * `compsize`     (dirs) Σ extent size over extents referenced anywhere
 //!                  below - exactly what `compsize <dir>` prints.
 //! * `freeable`     (dirs) Σ extent size over extents whose references are all
