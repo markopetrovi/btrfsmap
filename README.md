@@ -136,14 +136,46 @@ own byte gates, which compare two users of it.
 
 The file walker is the reference implementation: what the tree reader produces has
 to match it byte for byte. It no longer ships in this tree - the
-`deprecated-files-backend` branch keeps it, and its binary is kept around as the
-gate. Scan the same tree with both and compare the caches:
+`deprecated-files-backend` branch keeps it, and a build of that branch is kept at
+`/tmp/cst-old-files` as the gate (`git worktree add /tmp/cst deprecated-files-backend
+&& (cd /tmp/cst && cargo build --release)`, then `target/release/compsize-tree`).
+Scan the same tree with both and compare the caches:
 
 ```
 sudo compsize-tree scan --full-scan --save /tmp/a.cst --reproducible PATH
 sudo /tmp/cst-old-files scan --save /tmp/b.cst --reproducible PATH
 cmp /tmp/a.cst /tmp/b.cst
 ```
+
+The gate is run on two trees. One is `.scratch/own`, which must not be modified -
+it is the input to a byte comparison, and a frozen fixture is what makes a new
+difference between two runs mean something. It is a subvolume holding an
+inline-sized file, a hardlinked pair, a symlink, a file with real extents, a
+directory nested two deep, and a snapshot taken midway through - so it holds an
+older, smaller set of the same files - which is what makes the gate compare the
+snapshot and ownership paths and not only plain files. It is not in git (its
+snapshot is a subvolume, not files); if it is lost:
+
+```
+sudo btrfs subvolume create .scratch/own && sudo chown "$USER" .scratch/own
+cd .scratch/own
+printf 'hello\n' > a.txt && ln -s a.txt link
+head -c 300000 /dev/urandom > b.bin
+mkdir -p sub/deeper && printf '01234\n' > sub/c.txt
+head -c 120000 /dev/urandom > sub/deeper/d.bin
+sync && sudo btrfs subvolume snapshot . snap
+# after the snapshot, so it holds the older, smaller set: a second link to
+# a.txt, another file, and a longer c.txt - the snapshot keeps the six bytes
+ln a.txt hardlink
+head -c 90000 /dev/urandom > sub/e.bin
+printf '0123456\n' > sub/c.txt
+sync
+```
+
+The other is any tree with a large image file in it (the one used here is a 250 GB
+disk image, 381k extents): that is what exercises compression, and files with
+enough extents to page the kernel search - the fixture above is small and
+uncompressed, so it covers shapes, not those.
 
 `--reproducible` drops timings and warnings, which is what makes two scans of an
 unchanged tree byte-identical. When the tree has snapshot-class subvolumes the
