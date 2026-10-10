@@ -403,6 +403,12 @@ fn dir_tags(tree: &Tree, id: u32) -> String {
     } else if n.flags & FLAG_SUBVOL != 0 {
         tags.push("subvolume".into());
     }
+    if n.flags & FLAG_MOUNT != 0 {
+        tags.push("mount".into());
+    }
+    if n.flags & FLAG_MOUNT_OTHER != 0 {
+        tags.push("mount (not entered)".into());
+    }
     if n.flags & FLAG_READONLY != 0 {
         tags.push("ro".into());
     }

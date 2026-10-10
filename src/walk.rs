@@ -12,13 +12,13 @@
 
 use crate::btrfs::{self, ExtentItem, Searcher, BTRFS_FILE_EXTENT_INLINE, O_DIRECTORY, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK};
 use crate::model::*;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirEntryExt, MetadataExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -96,6 +96,12 @@ pub struct DirResult {
     pub entries: Vec<Node>,
     pub names: Vec<u8>,
     pub subvol: u16,
+    /// false for a directory the walk did not enter (a mount whose content is
+    /// read elsewhere, or is not this filesystem's): it still stands in the
+    /// tree - and in the dirs table, since a node's subvolume and depth come
+    /// from there - but it has no children, so its first_child stays zero
+    /// exactly as the tree reader leaves it.
+    pub entered: bool,
 }
 
 struct WorkItem {
@@ -122,6 +128,172 @@ pub struct ScanStats {
     pub elapsed: Duration,
 }
 
+/// One mount in this process's mount namespace.
+struct Mount {
+    /// Mount ID. The kernel hands these out in mount order, so a lower id is an
+    /// older mount and no two are equal.
+    id: u64,
+    /// Where it is mounted, unescaped and absolute.
+    path: Vec<u8>,
+    /// The mounted filesystem's type, as the kernel spells it ("btrfs", "tmpfs").
+    fs_type: Vec<u8>,
+}
+
+/// The mounts under the scan roots, decided once before the walk.
+///
+/// A path walk meets a mount where the tree reader cannot see one at all, but
+/// it must still know which of several mounts of one subvolume is the one that
+/// reads it, and it must recognize a mount whose filesystem is not this one
+/// before it walks into it: the containing tree holds an ordinary directory
+/// where a mount is, and entering it would read a stranger's tree.
+struct Mounts {
+    /// Every mount point under the scan roots, spelled the way the walk spells
+    /// paths, so a directory being processed can be looked up by the path it
+    /// already has.
+    points: HashSet<Vec<u8>>,
+    /// uuid -> the path of the mount that reads that subvolume: the oldest
+    /// (lowest mount id) of its mounts under the roots, when that mount is a
+    /// btrfs subvolume root of this filesystem. Subvolumes mounted at several
+    /// paths are read once, at their oldest mount, exactly as the tree reader
+    /// picks them.
+    chosen: HashMap<[u8; 16], Vec<u8>>,
+}
+
+impl Mounts {
+    fn is_point(&self, path: &[u8]) -> bool {
+        self.points.contains(path)
+    }
+
+    /// The path at which the subvolume with this uuid is read, if this scan
+    /// reads it at all.
+    fn reads(&self, uuid: &[u8; 16]) -> Option<&[u8]> {
+        self.chosen.get(uuid).map(|p| p.as_slice())
+    }
+}
+
+/// Read `/proc/self/mountinfo`, oldest mount first.
+///
+/// A line is `id parent major:minor root mountpoint options [optional...] -
+/// fstype source superopts`, with an unknown number of optional fields, so the
+/// type is read from the first "-" field rather than from a fixed position. The
+/// mount point is field 5, octal-escaped for space, tab, newline and backslash.
+/// Only the id, the path and the type are needed: mount ids are handed out in
+/// mount order, which is what makes "the oldest mount of a subvolume" a fact
+/// the table can answer.
+fn read_mounts() -> Vec<Mount> {
+    let mut out: Vec<Mount> = Vec::new();
+    let Ok(text) = fs::read("/proc/self/mountinfo") else {
+        return out;
+    };
+    for line in text.split(|b| *b == b'\n') {
+        let f: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
+        if f.len() < 6 {
+            continue;
+        }
+        let Some(sep) = f.iter().position(|x| *x == b"-") else {
+            continue;
+        };
+        let (Some(id), Some(fs_type)) = (
+            std::str::from_utf8(f[0]).ok().and_then(|s| s.parse().ok()),
+            f.get(sep + 1),
+        ) else {
+            continue;
+        };
+        out.push(Mount {
+            id,
+            path: unescape(f[4]),
+            fs_type: fs_type.to_vec(),
+        });
+    }
+    out.sort_by_key(|m| m.id);
+    out
+}
+
+/// mountinfo escapes space, tab, newline and backslash as `\NNN` octal, so a
+/// path with a space in it does not split into two fields.
+fn unescape(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == b'\\' && i + 3 < s.len() {
+            let d = &s[i + 1..i + 4];
+            if d.iter().all(|c| (b'0'..=b'7').contains(c)) {
+                out.push((d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'));
+                i += 4;
+                continue;
+            }
+        }
+        out.push(s[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Is `path` inside `root` (which is a directory, not a file)? Component-wise,
+/// so `/home2` is not inside `/home`.
+fn under(path: &[u8], root: &[u8]) -> bool {
+    let Some(rest) = path.strip_prefix(root) else {
+        return false;
+    };
+    rest.is_empty() || root.ends_with(b"/") || rest.starts_with(b"/")
+}
+
+/// Find the mounts under the scan roots, and which mount reads each mounted
+/// subvolume.
+///
+/// One open and two ioctls per mount point - never per file - and a mount whose
+/// type is not btrfs is not even opened. A scan root is not a mount *under*
+/// itself: it is entered because the user asked for it, and its node says so
+/// instead.
+fn discover_mounts(roots: &[Vec<u8>], fs_id: ([u8; 16], [u8; 16]), excludes: &[Vec<u8>]) -> Mounts {
+    let mut mounts = Mounts {
+        points: HashSet::new(),
+        chosen: HashMap::new(),
+    };
+    // Roots are compared canonicalized - a mount point is absolute and spelled
+    // the kernel's way - but mounts are keyed by the path the walk will build,
+    // which follows the spelling the user gave.
+    let canon: Vec<Vec<u8>> = roots
+        .iter()
+        .map(|r| {
+            fs::canonicalize(OsStr::from_bytes(r))
+                .map(|p| p.as_os_str().as_bytes().to_vec())
+                .unwrap_or_else(|_| r.clone())
+        })
+        .collect();
+    // Oldest first: the first mount of a subvolume is the one that reads it.
+    for m in read_mounts() {
+        let Some(ri) = canon.iter().position(|r| under(&m.path, r)) else {
+            continue;
+        };
+        if m.path == canon[ri] {
+            continue;
+        }
+        let rel = &m.path[canon[ri].len()..];
+        let mut path = roots[ri].clone();
+        path.push(b'/');
+        path.extend_from_slice(rel.strip_prefix(b"/").unwrap_or(rel));
+        if is_excluded_path(&path, excludes) {
+            continue;
+        }
+        if m.fs_type == b"btrfs" {
+            if let Ok(f) = open_dir(&path) {
+                let fd = f.as_raw_fd();
+                let ours = btrfs::fs_identity(fd)
+                    .map(|id| id == fs_id)
+                    .unwrap_or(false);
+                if ours {
+                    if let Ok(info) = btrfs::get_subvol_info(fd) {
+                        mounts.chosen.entry(info.uuid).or_insert_with(|| path.clone());
+                    }
+                }
+            }
+        }
+        mounts.points.insert(path);
+    }
+    mounts
+}
+
 struct Shared {
     queue: Mutex<VecDeque<WorkItem>>,
     cv: Condvar,
@@ -129,6 +301,8 @@ struct Shared {
     next_dir_id: AtomicU32,
     slots: Mutex<Vec<Option<DirResult>>>,
     subvols: Mutex<Vec<Subvol>>,
+    /// the mounts under the roots, decided before the walk started
+    mounts: Mounts,
     /// every subvolume on the filesystem (uuid, parent_uuid, treeid)
     inventory: Vec<btrfs::RootItem>,
     visited_dirs: Mutex<HashSet<(u64, u64)>>,
@@ -195,6 +369,145 @@ impl Shared {
         });
         (table.len() - 1) as u16
     }
+
+    /// Intern a subvolume and return what a node standing for it needs: its
+    /// index, the flags of the node itself, and whether it is snapshot-class
+    /// (which the caller also hands to the work item, because everything
+    /// *inside* the subvolume is marked with it).
+    fn subvol_node(&self, info: &btrfs::SubvolInfo, path: &[u8]) -> (u16, u8, bool) {
+        let subvol = self.intern_subvol(info, path);
+        let table = self.subvols.lock().unwrap();
+        let s = &table[subvol as usize];
+        let snap_class = s.is_snapshot();
+        let mut flags = FLAG_SUBVOL;
+        if s.is_readonly() {
+            flags |= FLAG_READONLY;
+        }
+        if snap_class {
+            flags |= FLAG_SNAPSHOT;
+        }
+        (subvol, flags, snap_class)
+    }
+}
+
+/// The times of the directory a mount point covers.
+///
+/// A mount hides the directory it sits over: statx on the path reports the
+/// mounted subvolume's root, never what the containing tree holds there - and
+/// that directory is what the tree reader puts in the node for a mount it does
+/// not enter. readdir hands out its inode number (the entry comes from the
+/// containing tree), so one inode-item search on the containing directory's own
+/// descriptor recovers the record statx cannot reach. `None` when there is no
+/// btrfs tree to search, in which case the caller keeps the statx result.
+fn covered_dir_times(
+    w: &mut Worker,
+    shared: &Shared,
+    holding_subvol: u16,
+    dir_fd: i32,
+    ino: u64,
+) -> Option<btrfs::InodeTimes> {
+    if dir_fd < 0 {
+        return None;
+    }
+    let tree_id = shared
+        .subvols
+        .lock()
+        .unwrap()
+        .get(holding_subvol as usize)?
+        .id;
+    let spec = btrfs::SearchSpec {
+        tree_id,
+        item_type: btrfs::BTRFS_INODE_ITEM_KEY,
+        min_objectid: ino,
+        max_objectid: ino,
+    };
+    let mut times = None;
+    w.searcher
+        .for_each_item(dir_fd, &spec, &mut |obj, _off, payload| {
+            if obj == ino && times.is_none() {
+                times = btrfs::parse_inode_times(payload);
+            }
+        })
+        .ok()?;
+    times
+}
+
+/// Push the node for a directory the walk does not enter - a mount whose
+/// content belongs to another mount, or to a filesystem this scan does not
+/// read. It is the node the walk would have pushed for that path, so its name
+/// and its times are the directory the containing tree holds; it just has no
+/// children.
+///
+/// The slot matters even though the directory holds nothing: flatten gives a
+/// directory node its DirExtra - its subvolume and its depth - from a slot, and
+/// taking it in the same breadth-first order as every other directory is what
+/// keeps the dirs table laid out the way the tree reader lays it out.
+#[allow(clippy::too_many_arguments)]
+fn push_dir_not_entered(
+    shared: &Shared,
+    w: &mut Worker,
+    result: &mut DirResult,
+    item: &WorkItem,
+    path: &[u8],
+    name: &[u8],
+    mtime: u32,
+    mut flags: u8,
+    nofollow: bool,
+    dir_fd: i32,
+    ino: u64,
+) {
+    let subvol = item.subvol;
+    let snap_class = item.snap_class;
+    if snap_class {
+        flags |= FLAG_SNAP_CLASS;
+    }
+    let (mtime, btime, btime_ns) = match covered_dir_times(w, shared, subvol, dir_fd, ino) {
+        Some(t) => (
+            t.mtime_sec.min(u32::MAX as u64) as u32,
+            if snap_class {
+                u32::MAX
+            } else {
+                t.otime_sec.min(u32::MAX as u64) as u32
+            },
+            if snap_class {
+                u16::MAX
+            } else {
+                (t.otime_nsec >> 14) as u16
+            },
+        ),
+        None => {
+            let (btime, btime_ns) = dir_btime(w, path, snap_class, nofollow);
+            (mtime, btime, btime_ns)
+        }
+    };
+    let dir_id = shared.next_dir_id.fetch_add(1, Ordering::Relaxed);
+    store_slot(
+        shared,
+        dir_id,
+        DirResult {
+            entries: Vec::new(),
+            names: Vec::new(),
+            subvol,
+            entered: false,
+        },
+    );
+    // The directory count is a count of nodes, the way the tree reader counts
+    // them; this node has no read_dir behind it.
+    shared.prog.dirs.fetch_add(1, Ordering::Relaxed);
+    let name_off = result.names.len() as u32;
+    result.names.extend_from_slice(name);
+    result.entries.push(Node {
+        parent: NO_NODE,
+        name_off,
+        name_len: name.len() as u16,
+        kind: KIND_DIR,
+        flags,
+        extra: dir_id,
+        mtime,
+        btime,
+        btime_ns,
+        ..Default::default()
+    });
 }
 
 struct Worker {
@@ -243,7 +556,11 @@ fn note_open_error(shared: &Shared, path: &[u8], e: &io::Error) {
 }
 
 fn is_excluded(opts: &ScanOptions, path: &[u8]) -> bool {
-    opts.excludes.iter().any(|ex| path.starts_with(ex))
+    is_excluded_path(path, &opts.excludes)
+}
+
+fn is_excluded_path(path: &[u8], excludes: &[Vec<u8>]) -> bool {
+    excludes.iter().any(|ex| path.starts_with(ex))
 }
 
 /// Read one regular file's extent list. Returns its node with `owned` left at
@@ -419,6 +736,7 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
             entries: Vec::new(),
             names: Vec::new(),
             subvol: item.subvol,
+            entered: true,
         });
         return;
     }
@@ -433,6 +751,7 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
         entries: Vec::new(),
         names: Vec::new(),
         subvol: item.subvol,
+        entered: true,
     };
     let mut path = item.path.to_vec();
     let base_len = path.len();
@@ -520,14 +839,74 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
             };
             let Some(md) = md else { continue };
             let mtime = md.mtime().clamp(0, u32::MAX as i64) as u32;
-            if md.dev() != item.dev {
+            // A mount point is a boundary even where st_dev does not change: a
+            // bind mount of a plain directory carries the device of the tree it
+            // was bound from. mountinfo, read before the walk, is the only
+            // thing that says a filesystem is mounted here, and it also says
+            // which of a subvolume's mounts is the one that reads it.
+            let mounted = shared.mounts.is_point(&path);
+            // The entry's inode number comes from the containing tree, so at a
+            // mount point it still names the directory that is covered - which
+            // is the one a node for a mount the walk does not enter describes.
+            let entry_ino = entry.ino();
+            if mounted || md.dev() != item.dev {
                 let probe = open_dir(&path).and_then(|f| {
                     let fd = f.as_raw_fd();
                     let info = btrfs::get_subvol_info(fd)?;
-                    Ok((info, btrfs::fs_identity(fd).ok()))
+                    // The root of a subvolume always carries
+                    // BTRFS_FIRST_FREE_OBJECTID as its inode, while a bind
+                    // mount of a plain directory keeps that directory's own -
+                    // so one stat on the descriptor the probe already holds
+                    // tells the two apart.
+                    let ino = f.metadata().map(|m| m.ino()).unwrap_or(0);
+                    Ok((info, btrfs::fs_identity(fd).ok(), ino))
                 });
                 match probe {
-                    Ok((info, ident)) => {
+                    Ok((info, ident, ino)) => {
+                        // What a mounted path must be for the walk to enter it:
+                        // a subvolume root of the filesystem the scan started
+                        // on. Anything else is left alone - another
+                        // filesystem's extent addresses are only unique within
+                        // itself, and a bind mount of a plain directory is not
+                        // a subvolume at all - and the node that stands for it
+                        // says a mount is there and holds none of what is
+                        // under it.
+                        let ours = ident == Some(shared.fs_id)
+                            && ino == btrfs::BTRFS_FIRST_FREE_OBJECTID;
+                        if mounted && !ours {
+                            match ident {
+                                Some(id) if id != shared.fs_id => {
+                                    shared.otherfs.fetch_add(1, Ordering::Relaxed);
+                                    shared.warn(format!(
+                                        "{}: different btrfs filesystem ({}), subtree skipped",
+                                        String::from_utf8_lossy(&path),
+                                        btrfs::fmt_fsid(&id)
+                                    ));
+                                }
+                                _ if ino != btrfs::BTRFS_FIRST_FREE_OBJECTID => {
+                                    shared.warn(format!(
+                                        "{}: mount of a plain directory, subtree skipped",
+                                        String::from_utf8_lossy(&path)
+                                    ));
+                                }
+                                _ => {}
+                            }
+                            flags |= FLAG_MOUNT_OTHER;
+                            push_dir_not_entered(
+                                shared,
+                                w,
+                                &mut result,
+                                &item,
+                                &path,
+                                name,
+                                mtime,
+                                flags,
+                                !followed_symlink,
+                                dir_fd,
+                                entry_ino,
+                            );
+                            continue;
+                        }
                         // Another btrfs filesystem? Extent addresses are only
                         // unique within one filesystem, so mixing them would
                         // corrupt the dedup. Skip it; scanning it on its own
@@ -543,13 +922,82 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
                                 continue;
                             }
                         }
-                        // Intern before the duplicate-mount check, so a
-                        // subvolume reached through another mount still gets
-                        // its path compared and the smallest one recorded.
-                        subvol = shared.intern_subvol(&info, &path);
+                        // Of several mounts of one subvolume only the oldest is
+                        // read: reading a second one would add a second
+                        // reference to every file in it. An alias mount is like
+                        // a mount of a foreign filesystem here - its node
+                        // stands for the directory the containing tree holds,
+                        // which is what the reader of that tree would place,
+                        // and it is not descended into.
+                        if mounted && shared.mounts.reads(&info.uuid) != Some(path.as_slice()) {
+                            match shared.mounts.reads(&info.uuid) {
+                                Some(p) => shared.warn(format!(
+                                    "{}: subvolume {} is read at {}, this mount is not entered",
+                                    String::from_utf8_lossy(&path),
+                                    btrfs::fmt_uuid(&info.uuid),
+                                    String::from_utf8_lossy(p)
+                                )),
+                                // no mount under the roots reads this subvolume
+                                // (its filesystem could not be identified when
+                                // the mounts were read)
+                                None => shared.warn(format!(
+                                    "{}: subvolume {} is not read anywhere under these roots, \
+                                     subtree skipped",
+                                    String::from_utf8_lossy(&path),
+                                    btrfs::fmt_uuid(&info.uuid)
+                                )),
+                            }
+                            flags |= FLAG_MOUNT_OTHER;
+                            push_dir_not_entered(
+                                shared,
+                                w,
+                                &mut result,
+                                &item,
+                                &path,
+                                name,
+                                mtime,
+                                flags,
+                                !followed_symlink,
+                                dir_fd,
+                                entry_ino,
+                            );
+                            continue;
+                        }
+                        // Intern before the duplicate check, so a subvolume
+                        // reached through another path still gets its path
+                        // compared and the smallest one recorded.
+                        let (sv, f, sc) = shared.subvol_node(&info, &path);
+                        subvol = sv;
+                        snap_class = sc;
+                        flags |= f;
                         // The same subvolume reachable through another mount
                         // would add a second reference to every file in it.
                         if !shared.visited_subvols.lock().unwrap().insert(info.uuid) {
+                            if mounted {
+                                // the subvolume is read at its tree location,
+                                // or was met through an earlier path: this
+                                // mount holds none of it here
+                                flags |= FLAG_MOUNT_OTHER;
+                                shared.warn(format!(
+                                    "{}: subvolume {} already read elsewhere, subtree skipped",
+                                    String::from_utf8_lossy(&path),
+                                    btrfs::fmt_uuid(&info.uuid)
+                                ));
+                                push_dir_not_entered(
+                                    shared,
+                                    w,
+                                    &mut result,
+                                    &item,
+                                    &path,
+                                    name,
+                                    mtime,
+                                    flags,
+                                    !followed_symlink,
+                                    dir_fd,
+                                    entry_ino,
+                                );
+                                continue;
+                            }
                             shared.warn(format!(
                                 "{}: subvolume {} already walked through another mount, \
                                  subtree skipped",
@@ -558,16 +1006,11 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
                             ));
                             continue;
                         }
-                        let table = shared.subvols.lock().unwrap();
-                        let s = &table[subvol as usize];
-                        snap_class = s.is_snapshot();
-                        if s.is_readonly() {
-                            flags |= FLAG_READONLY;
+                        if mounted {
+                            // this is the mount that reads the subvolume: the
+                            // walk enters the tree here
+                            flags |= FLAG_MOUNT;
                         }
-                        if snap_class {
-                            flags |= FLAG_SNAPSHOT;
-                        }
-                        flags |= FLAG_SUBVOL;
                     }
                     Err(e) => {
                         let raw = e.raw_os_error().unwrap_or(0);
@@ -577,12 +1020,49 @@ fn process_dir(w: &mut Worker, shared: &Shared, opts: &ScanOptions, item: WorkIt
                                 "{}: not btrfs, subtree skipped",
                                 String::from_utf8_lossy(&path)
                             ));
+                            if mounted {
+                                // a mount of a filesystem that is not btrfs at
+                                // all: its node says a mount is here
+                                flags |= FLAG_MOUNT_OTHER;
+                                push_dir_not_entered(
+                                    shared,
+                                    w,
+                                    &mut result,
+                                    &item,
+                                    &path,
+                                    name,
+                                    mtime,
+                                    flags,
+                                    !followed_symlink,
+                                    dir_fd,
+                                    entry_ino,
+                                );
+                            }
                             continue;
                         }
                         shared.warn(format!(
                             "{}: subvolume info failed: {e}",
                             String::from_utf8_lossy(&path)
                         ));
+                        if mounted {
+                            // a mount whose filesystem could not be identified
+                            // is not entered either
+                            flags |= FLAG_MOUNT_OTHER;
+                            push_dir_not_entered(
+                                shared,
+                                w,
+                                &mut result,
+                                &item,
+                                &path,
+                                name,
+                                mtime,
+                                flags,
+                                !followed_symlink,
+                                dir_fd,
+                                entry_ino,
+                            );
+                            continue;
+                        }
                     }
                 }
                 dev = md.dev();
@@ -746,6 +1226,10 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
         }
     }
 
+    // The mounts, before anything is walked: which mounts under the roots the
+    // walk must recognize, and which of them reads each mounted subvolume.
+    let mounts = discover_mounts(&opts.roots, fs_id, &opts.excludes);
+
     let shared = Arc::new(Shared {
         queue: Mutex::new(VecDeque::new()),
         inventory,
@@ -754,6 +1238,7 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
         next_dir_id: AtomicU32::new(1), // 0 is the synthetic root
         slots: Mutex::new(vec![None]),
         subvols: Mutex::new(Vec::new()),
+        mounts,
         visited_dirs: Mutex::new(HashSet::new()),
         visited_subvols: Mutex::new(HashSet::new()),
         fs_id,
@@ -775,6 +1260,7 @@ pub fn scan(opts: &ScanOptions) -> io::Result<RawScan> {
         entries: Vec::new(),
         names: Vec::new(),
         subvol: 0,
+        entered: true,
     };
     let mut main_worker = Worker {
         searcher: Searcher::new(opts.buf_size),
@@ -1094,6 +1580,11 @@ pub fn flatten(
             ..Default::default()
         });
         tree.nodes[node_id as usize].extra = extra;
+        // A directory the walk did not enter holds nothing and is not
+        // descended; its first_child stays zero, as the tree reader leaves it.
+        if !slot.entered {
+            continue;
+        }
         tree.nodes[node_id as usize].first_child = tree.nodes.len() as u32;
 
         let first_child = tree.nodes.len() as u32;

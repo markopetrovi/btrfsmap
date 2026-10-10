@@ -132,6 +132,37 @@ pub fn get_subvol_info(fd: i32) -> io::Result<SubvolInfo> {
 }
 
 // ---------------------------------------------------------------------------
+// TREE_SEARCH_V2: fs-tree items
+// ---------------------------------------------------------------------------
+
+pub const BTRFS_INODE_ITEM_KEY: u32 = 1;
+
+/// What an INODE_ITEM says about times. It is the record the tree reader puts
+/// in a node, so an inode whose statx cannot be reached - the directory a mount
+/// point covers - can still be described the way the reader describes it.
+#[derive(Debug, Clone, Copy)]
+pub struct InodeTimes {
+    pub mtime_sec: u64,
+    pub otime_sec: u64,
+    pub otime_nsec: u32,
+}
+
+/// `struct btrfs_inode_item` is packed; the three times sit after the
+/// generation/transid/size counters, and otime is the last of them.
+pub fn parse_inode_times(p: &[u8]) -> Option<InodeTimes> {
+    if p.len() < 160 {
+        return None;
+    }
+    let u64_at = |o: usize| u64::from_le_bytes(p[o..o + 8].try_into().unwrap());
+    let u32_at = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+    Some(InodeTimes {
+        mtime_sec: u64_at(136),
+        otime_sec: u64_at(148),
+        otime_nsec: u32_at(156),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // TREE_SEARCH_V2: per-inode extent list
 // ---------------------------------------------------------------------------
 
@@ -481,6 +512,11 @@ pub struct StatInfo {
 
 pub const S_IFMT: u16 = 0o170000;
 pub const S_IFREG: u16 = 0o100000;
+
+/// The inode number of every subvolume's root directory. It is what tells a
+/// mounted subvolume apart from a bind mount of an ordinary directory, whose
+/// inode is the directory's own.
+pub const BTRFS_FIRST_FREE_OBJECTID: u64 = 256;
 
 /// `path` must be NUL-terminated.
 pub fn stat_path(path: &[u8], nofollow: bool) -> io::Result<StatInfo> {

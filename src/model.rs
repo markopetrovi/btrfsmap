@@ -26,6 +26,14 @@ pub const FLAG_SUBVOL: u8 = 1 << 1; // directory is a subvolume root
 pub const FLAG_SNAPSHOT: u8 = 1 << 2; // that subvolume is a snapshot (has parent_uuid)
 pub const FLAG_READONLY: u8 = 1 << 3; // subvolume is read-only
 pub const FLAG_SNAP_CLASS: u8 = 1 << 4; // node lives inside a snapshot-class subvolume
+/// a subvolume mounted here: this node is where its tree begins (the directory
+/// in the containing tree is the mount's underlying directory, and holds none
+/// of the mounted subvolume's files)
+pub const FLAG_MOUNT: u8 = 1 << 6;
+/// a mount point whose content this scan did not read here - the same subvolume
+/// is counted at another of its mounts, or the mounted filesystem is not this
+/// one and is never entered
+pub const FLAG_MOUNT_OTHER: u8 = 1 << 7;
 
 pub const NO_NODE: u32 = u32::MAX;
 

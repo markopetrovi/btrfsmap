@@ -275,6 +275,12 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         } else if d.flags & FLAG_SUBVOL != 0 {
             t.push_str("subvolume");
         }
+        if d.flags & FLAG_MOUNT != 0 {
+            t.push_str(" · mount");
+        }
+        if d.flags & FLAG_MOUNT_OTHER != 0 {
+            t.push_str(" · mount (not entered)");
+        }
         if d.is_dir && d.freeable < d.owned {
             if !t.is_empty() {
                 t.push(' ');
@@ -918,6 +924,20 @@ impl Ui {
                     human(d.freeable)
                 ));
             }
+        }
+        if n.flags & FLAG_MOUNT != 0 {
+            text.push_str(
+                "\n<span size='small'>a subvolume is mounted here: its tree begins at this \
+                 node, and the directory the containing tree holds is only where it is \
+                 mounted over</span>",
+            );
+        }
+        if n.flags & FLAG_MOUNT_OTHER != 0 {
+            text.push_str(
+                "\n<span size='small'>a mount point this scan did not read: the same \
+                 subvolume is counted at another of its mounts, or the mounted filesystem \
+                 is not this one and is never entered</span>",
+            );
         }
         self.details.set_markup(&text);
     }
