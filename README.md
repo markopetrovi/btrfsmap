@@ -149,8 +149,11 @@ unchanged tree byte-identical. Pass `--full-scan` on both sides when the tree ha
 snapshot-class subvolumes: the collapsed scan is deliberately a different, aggregate
 tree, so it is compared on its numbers instead (see Limits).
 
-Name the scan root the same way in both runs: its spelling is part of the compared
-bytes, since the path is recorded in `scanned_roots` and in the subvolume it opens.
+Let the tree settle first: the tree reader reads the committed tree, so a fixture
+just written to can be missing entries that the path walk still sees (`sync`
+before comparing; this is the usual reason a gate fails). Name the scan root the
+same way in both runs: its spelling is part of the compared bytes, since the path
+is recorded in `scanned_roots` and in the subvolume it opens.
 An absolute root and a relative one differ by 144 bytes on the `.scratch/own` fixture
 - enough to fail `cmp` on its own.
 
@@ -210,7 +213,11 @@ failed to parse (the count has to be zero).
   0 for the same reason: the logical sizes live in the files, which were not
   read.
 * A scan is a snapshot in time; files changing during it are counted once, as
-  seen.
+  seen. What it reads is btrfs's *committed* tree, so anything written in the
+  moments before the scan may not be in that tree yet - measured: a directory
+  with two fresh files (no `sync`) reports 0 files, and 2 files after one. The
+  file walk does not have this: it walks the directory cache. `sync` first when
+  the difference matters.
 * A mount the scan does not enter - a non-btrfs filesystem (loop mounts,
   overlayfs, tmpfs, `/boot`), a *different* btrfs filesystem (its fsid is
   compared with the scanned one by `BTRFS_IOC_FS_INFO` before anything is read

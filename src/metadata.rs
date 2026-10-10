@@ -1196,34 +1196,27 @@ fn build(
                 // A mount point: the containing tree has an ordinary directory
                 // here, and nothing of what is mounted over it.
                 //
-                // A mount this scan does not read here still shows the
-                // subvolume it mounts when that subvolume is read at its other
-                // mount - the node the file walker would find there - but it is
-                // never descended into: those files are placed at the mount
-                // that reads them, and a second placement would split every
-                // extent between the two.
-                let child = c.mounts[mi].child.or_else(|| {
-                    let id = c.mounts[mi].candidate.as_ref()?.treeid;
-                    c.subvols.iter().position(|s| s.id == id).map(|i| i as u16)
-                });
-                match child {
+                // `child` is set only for the mount this scan reads the
+                // subvolume at, so that node is the subvolume's root. Every
+                // other mount point - an alias, a filesystem this scan does not
+                // enter, a bind mount of a directory - keeps the directory the
+                // containing tree holds, and is never descended into: what is
+                // mounted there is counted at the mount that reads it, and a
+                // second placement would split every extent between the two.
+                match c.mounts[mi].child {
                     Some(child) => {
-                        let read_here = c.mounts[mi].child.is_some();
                         let root = tree.subvols[child as usize].id;
                         let s = &tree.subvols[child as usize];
-                        let mut f = FLAG_SUBVOL;
+                        let mut f = FLAG_SUBVOL | FLAG_MOUNT;
                         if s.is_snapshot() {
                             f |= FLAG_SNAPSHOT;
                         }
                         if s.is_readonly() {
                             f |= FLAG_READONLY;
                         }
-                        f |= if read_here { FLAG_MOUNT } else { FLAG_MOUNT_OTHER };
                         match c.collapsed.iter().find(|(r, _, _)| *r == root) {
-                            // a collapsed subvolume has no collected tree, so a
-                            // node for it can only stand where it is read
-                            Some(&(_, subvol, _)) if read_here => (usize::MAX, 0, f, Some(subvol)),
-                            Some(_) => (ci, e.child, FLAG_MOUNT_OTHER, None),
+                            // a collapsed mount: one node for the whole subtree
+                            Some(&(_, subvol, _)) => (usize::MAX, 0, f, Some(subvol)),
                             None => {
                                 match c.subs.iter().position(
                                     |s| tree.subvols[s.subvol as usize].id == root,
@@ -1239,8 +1232,6 @@ fn build(
                             }
                         }
                     }
-                    // a filesystem this scan does not enter: the node is the
-                    // directory the tree holds, and says a mount is over it
                     None => (ci, e.child, FLAG_MOUNT_OTHER, None),
                 }
             } else {
@@ -1915,7 +1906,18 @@ fn discover_mounts(
                 let ours = btrfs::fs_identity(mfd)
                     .map(|id| id == fs_id)
                     .unwrap_or(false);
-                if ours {
+                // A subvolume mounted at its root has the subvolume's root
+                // inode as the inode of the mount point itself. A bind mount of
+                // a plain directory answers GET_SUBVOL_INFO with the subvolume
+                // that holds it, but it is not a subvolume mount: there is no
+                // root inode to place, and treating it as one would look for
+                // one this scan may not even hold (the containing subvolume's
+                // root is out of scope when the scan starts below it).
+                let mounts_root = mf
+                    .metadata()
+                    .map(|md| std::os::unix::fs::MetadataExt::ino(&md) == btrfs::BTRFS_FIRST_FREE_OBJECTID)
+                    .unwrap_or(false);
+                if ours && mounts_root {
                     if let Ok(info) = btrfs::get_subvol_info(mfd) {
                         if claimed.insert(info.treeid) {
                             candidate = Some(info);
