@@ -12,7 +12,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MAGIC: &[u8; 8] = b"CSTREE\x01\n";
+const MAGIC: &[u8; 8] = b"BTRFSMAP";
 const VERSION: u32 = 5;
 
 pub struct Cache {
@@ -168,7 +168,7 @@ impl Cache {
         if &magic != MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "not a compsize-tree cache",
+                "not a btrfsmap cache",
             ));
         }
         let version = read_u32(&mut r)?;

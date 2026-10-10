@@ -1,12 +1,12 @@
 [package]
-name = "compsize-tree"
+name = "btrfsmap"
 version = "0.2.0"
 edition = "2021"
 description = "Extent-accurate btrfs disk usage in one pass, with a GTK4 browser"
 license = "GPL-2.0-or-later"
 
 [[bin]]
-name = "compsize-tree"
+name = "btrfsmap"
 path = "src/main.rs"
 
 [dependencies]

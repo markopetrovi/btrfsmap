@@ -1,12 +1,12 @@
-# compsize-tree
+# btrfsmap
 
 Extent-accurate disk usage for btrfs: **one pass** over the tree gives every
 directory's true size, and a GTK4 browser shows it the way baobab would - if baobab
 understood reflinks, snapshots and compression.
 
 ```
-sudo compsize-tree                     # the app: scan a path, or open a saved scan
-sudo compsize-tree scan /home          # headless: one pass, per-directory metrics
+sudo btrfsmap                     # the app: scan a path, or open a saved scan
+sudo btrfsmap scan /home          # headless: one pass, per-directory metrics
 ```
 
 The graphical browser (GTK4) starts with no arguments. From there you can pick a
@@ -16,7 +16,7 @@ Nothing is written to disk unless you ask for it, and there is no cache director
 a saved scan is just a file you choose the location of.
 
 Scanning needs root (the kernel's extent ioctl requires CAP_SYS_ADMIN), so start the
-app with `sudo compsize-tree`; opening a saved scan works unprivileged.
+app with `sudo btrfsmap`; opening a saved scan works unprivileged.
 
 ## Why `du`/baobab are wrong here, and compsize is tedious
 
@@ -66,7 +66,7 @@ scan. Files: `Open…` loads a saved scan, `Save scan…` writes the current one
 ### `scan` (needs root)
 
 ```
-sudo compsize-tree scan [options] PATH...
+sudo btrfsmap scan [options] PATH...
 ```
 
 One pass, then per-directory metrics. The scan itself never needs a cache: the tree
@@ -93,11 +93,11 @@ bytes per file: ~3.5 GB for a 37M file `/home`, or ~750 MB with `--compress`.
 ### `report` (the compsize-compatible verifier)
 
 ```
-sudo compsize-tree report [-b] PATH...
+sudo btrfsmap report [-b] PATH...
 ```
 
 Reproduces `compsize`'s table byte for byte from its own walk. Useful to prove
-the extent layer: `compsize-tree report -b /some/dir` and
+the extent layer: `btrfsmap report -b /some/dir` and
 `compsize -b /some/dir` produce identical output, including on multi-million
 extent files where this implementation is ~5x faster thanks to a larger search
 buffer.
