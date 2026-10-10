@@ -2745,6 +2745,23 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         }
     }
 
+    // Extents no placed node references. The walk reads every EXTENT_DATA item
+    // of a subvolume, and an unlinked inode's items are still in the tree: one
+    // deleted disk image left 161873 extents, 20.84 GiB, in the tree of
+    // mywork/disk, all of them inode 2341, an inode with no path. The file
+    // walker never sees those, because it walks directories - they were the
+    // whole of what made the two extent counts differ. Nothing can own them (no
+    // node reaches them, and `set_windows` weighs only references a node holds),
+    // so dropping them moves no metric, and the count means the same thing on
+    // both sides afterwards.
+    {
+        let mut referenced: HashSet<u32> = HashSet::with_capacity(final_refs.len() / 4);
+        for r in &final_refs {
+            referenced.insert((*r >> 32) as u32);
+        }
+        c.shard.extents.retain(|page, _| referenced.contains(page));
+    }
+
     // deterministic subvolume numbering, same as the file backend
     {
         let mut order: Vec<usize> = (0..tree.subvols.len()).collect();

@@ -162,7 +162,12 @@ fn cmd_diff(args: &[String]) -> ExitCode {
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
 
+    // The same two numbers the report shows, through the same accessor: a file
+    // has no dir record of its own, and asking for one reads the synthetic
+    // root's - which is how this used to compare every file's "compsize" as the
+    // whole tree's total.
     let collect = |t: &model::Tree| {
+        use model::Metric;
         let mut out: std::collections::HashMap<Vec<u8>, (u64, u64)> = Default::default();
         let mut stack: Vec<u32> = t.roots.clone();
         while let Some(id) = stack.pop() {
@@ -172,42 +177,79 @@ fn cmd_diff(args: &[String]) -> ExitCode {
             }
             out.insert(
                 t.path_of(id),
-                (n.owned, t.dir(id).compsize),
+                (Metric::Owned.value(t, id), Metric::Compsize.value(t, id)),
             );
             stack.extend(t.child_ids(id));
         }
         out
     };
     let (ma, mb) = (collect(&ta), collect(&tb));
-    let mut diffs: Vec<(i64, Vec<u8>, (u64, u64), (u64, u64))> = Vec::new();
+    // A path in one cache only is a difference in itself, and so is a path whose
+    // two numbers disagree. The first version of this reported neither: it
+    // looked only at paths both caches had, only at `owned`, and its "compared
+    // paths" line summed every node's subtree total - which counts each child
+    // once per ancestor, so the number it printed meant nothing.
+    let mut diffs: Vec<(u64, u8, Vec<u8>, (u64, u64), (u64, u64))> = Vec::new();
     for (path, va) in &ma {
-        if let Some(vb) = mb.get(path) {
-            let d = va.0 as i64 - vb.0 as i64;
-            if d != 0 {
-                diffs.push((d, path.clone(), *va, *vb));
+        match mb.get(path) {
+            Some(vb) => {
+                let mut what = 0u8;
+                if va.0 != vb.0 {
+                    what |= 1; // owned
+                }
+                if va.1 != vb.1 {
+                    what |= 2; // compsize
+                }
+                if what != 0 {
+                    let owned = (va.0 as i64 - vb.0 as i64).unsigned_abs();
+                    let comp = (va.1 as i64 - vb.1 as i64).unsigned_abs();
+                    diffs.push((owned.max(comp), what, path.clone(), *va, *vb));
+                }
             }
+            None => diffs.push((va.0.max(va.1), 4, path.clone(), *va, (0, 0))),
         }
     }
-    diffs.sort_by_key(|(d, _, _, _)| -d.abs());
-    let sum = |m: &std::collections::HashMap<Vec<u8>, (u64, u64)>| -> (u64, u64) {
-        m.values().fold((0, 0), |a, v| (a.0 + v.0, a.1 + v.1))
+    for (path, vb) in &mb {
+        if !ma.contains_key(path) {
+            diffs.push((vb.0.max(vb.1), 8, path.clone(), (0, 0), *vb));
+        }
+    }
+    diffs.sort_by_key(|(scale, _, _, _, _)| std::cmp::Reverse(*scale));
+    let totals = |t: &model::Tree| -> (u64, u64, u64) {
+        t.roots.iter().fold((0, 0, 0), |a, &r| {
+            (a.0 + t.node(r).owned, a.1 + t.dir(r).compsize, a.2 + t.dir(r).freeable)
+        })
     };
-    let (sa, sb) = (sum(&ma), sum(&mb));
+    let (sa, sb) = (totals(&ta), totals(&tb));
     println!(
-        "compared paths (live subtrees): owned {} vs {} ({:+}), compsize {} vs {} ({:+})",
-        sa.0, sb.0, sb.0 as i64 - sa.0 as i64, sa.1, sb.1, sb.1 as i64 - sa.1 as i64
+        "whole tree: owned {} vs {} ({:+}), compsize {} vs {} ({:+}), freeable {} vs {} ({:+})",
+        sa.0,
+        sb.0,
+        sb.0 as i64 - sa.0 as i64,
+        sa.1,
+        sb.1,
+        sb.1 as i64 - sa.1 as i64,
+        sa.2,
+        sb.2,
+        sb.2 as i64 - sa.2 as i64
     );
     println!(
-        "whole tree: owned {} vs {} ({:+})",
-        ta.node(ta.roots[0]).owned,
-        tb.node(tb.roots[0]).owned,
-        tb.node(tb.roots[0]).owned as i64 - ta.node(ta.roots[0]).owned as i64
+        "{} paths in A, {} in B; {} differ or are in one only",
+        ma.len(),
+        mb.len(),
+        diffs.len()
     );
-    println!("{} paths compared, {} differ", ma.len(), diffs.len());
-    for (d, path, va, vb) in diffs.iter().take(top) {
+    for (scale, what, path, va, vb) in diffs.iter().take(top) {
+        let label = match what {
+            1 => "owned",
+            2 => "compsize",
+            3 => "both",
+            4 => "only in A",
+            _ => "only in B",
+        };
         println!(
-            "  {:>13}  owned {:>12} vs {:>12}  compsize {:>12} vs {:>12}  {}",
-            d,
+            "  {:>12} {label:<10} owned {:>12} vs {:>12}  compsize {:>12} vs {:>12}  {}",
+            scale,
             va.0,
             vb.0,
             va.1,

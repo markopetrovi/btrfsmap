@@ -42,7 +42,7 @@ filesystem).
 |---|---|
 | **owned** | Semantic ownership: **the oldest holder of an extent owns it**. Every reference carries a key of (the file's birth time, the creation time of the subvolume it lives in); the smallest key owns the extent, and references sharing that smallest key split it evenly. A reference from inside a *snapshot-class* subvolume carries **no** birth time: `(unknown, the snapshot's own creation time)`. So a snapshot owns what the live trees have let go of, and nothing they still hold - its files' birth times are not a fact about the data, since a reflink copy and a rename are enough to hand a live file a younger inode - and among snapshots the oldest is the custodian, so deleting the parent transfers ownership to it. A reflink copy inside the live tree is strictly younger than its source, whichever live subvolume it landed in. Additive: children sum to the parent and the whole tree sums to the true physical usage. This is the default. |
 | **freeable** | Bytes that deleting this path would actually free: extents whose references are *all* below it. Same idea as `btrfs fi du`'s "Exclusive", but per subtree and compression-aware. |
-| **compsize** | Exactly what `compsize <path>` prints as Disk Usage: every extent referenced anywhere below, counted once. The cross-check number (it is order-independent even though compsize itself is not). |
+| **compsize** | Exactly what `compsize <path>` prints as Disk Usage, inline payloads aside (see Limits): every extent referenced anywhere below, counted once. The cross-check number (it is order-independent even though compsize itself is not). |
 | **referenced** | What the files claim (du/baobab's number, the 27 TB). |
 | **uncompressed** | Deduplicated data before compression; `compsize / uncompressed` is the effective compression ratio. |
 
@@ -76,7 +76,8 @@ mean re-walking 37M files.
 The scan reads the filesystem's own trees instead of the files - `INODE_ITEM`,
 `DIR_INDEX` and `EXTENT_DATA` out of each subvolume's fs tree, subvolume nesting out
 of the root tree - which needs no `statx` and no per-file ioctl and is about 2.5x
-faster than the file walk for the same numbers.
+faster than the file walk for the same numbers. Scanning a subdirectory costs a
+full sweep of its containing subvolume.
 
 **Mounts under the scanned path are read.** A subvolume mounted inside the scan -
 `/home` when scanning `/` - is nowhere in any fs tree: the containing tree has an
@@ -215,6 +216,12 @@ failed to parse (the count has to be zero).
 * A scan is a snapshot in time; files changing during it are counted once, as
   seen - and it reads the committed tree, so a file written moments ago may not
   be in it until `sync`.
+* An extent's address is carried as a 4 KiB page number in a `u32`, which is
+  what packs a reference into one word - and caps the logical address it can
+  name at 16 TiB. An extent above that is skipped, with a warning. Measured
+  here: the highest chunk ends at 2.30 TiB on this 898 GiB filesystem, since
+  addresses grow with allocation and not with what is held, so the cliff is
+  about 7x away - a filesystem several times larger would need the key widened.
 * A mount the scan does not enter - a non-btrfs filesystem (loop mounts,
   overlayfs, tmpfs, `/boot`), a *different* btrfs filesystem (its fsid is
   compared with the scanned one by `BTRFS_IOC_FS_INFO` before anything is read
@@ -266,8 +273,9 @@ The scanner is std-only Rust; the browser is GTK4 (gtk4-rs). The scan reads the
 filesystem's own trees with `BTRFS_IOC_TREE_SEARCH_V2`: `INODE_ITEM` (mode,
 size, mtime and birth time), `DIR_INDEX` (the directory structure) and
 `EXTENT_DATA` (the extents) out of each subvolume's fs tree, and the root tree's
-`ROOT_ITEM` records for the UUID inventory - so no file is `statx`ed, opened or
-even named by the kernel on its behalf. Subvolume identity comes from
+`ROOT_ITEM` records for the UUID inventory - so no file is `statx`ed or read on
+its behalf; only subvolume roots are opened, one per subvolume walked, and
+`INO_LOOKUP` names the directories inside a collapsed one. Subvolume identity comes from
 `BTRFS_IOC_GET_SUBVOL_INFO`, so snapshots are recognised structurally rather
 than by path convention. Compression, inline extents, prealloc and holes are all
 accounted the way compsize accounts them.
