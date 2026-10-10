@@ -8,10 +8,27 @@
 
 use crate::model::*;
 use crate::scan::ScanStats;
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// The two syscalls a save needs beyond std's, to write an unnamed file and give
+// it a name at the end. open(2) flags are x86_64 Linux, as in btrfs.rs.
+extern "C" {
+    fn open(path: *const i8, flags: i32, mode: i32) -> i32;
+    fn linkat(olddirfd: i32, oldpath: *const i8, newdirfd: i32, newpath: *const i8, flags: i32) -> i32;
+    fn unlink(path: *const i8) -> i32;
+}
+
+const O_WRONLY: i32 = 0o1;
+/// `O_TMPFILE`: open a directory and get an unnamed file in it.
+const O_TMPFILE: i32 = 0o20200000;
+const AT_FDCWD: i32 = -100;
+const AT_SYMLINK_FOLLOW: i32 = 0x400;
 
 const MAGIC: &[u8; 8] = b"CSTREE\x01\n";
 const VERSION: u32 = 5;
@@ -77,16 +94,51 @@ fn read_array<T: Copy, R: Read>(r: &mut R, count: usize) -> io::Result<Vec<T>> {
     Ok(v)
 }
 
+/// An unnamed file in `dir`: an `O_TMPFILE` inode has no name until it is
+/// linked. `None` when the filesystem refuses one - it is optional - and the
+/// caller falls back to a named temporary.
+fn anonymous_in(dir: &Path) -> Option<File> {
+    let c = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let fd = unsafe { open(c.as_ptr(), O_TMPFILE | O_WRONLY, 0o644) };
+    if fd < 0 {
+        return None;
+    }
+    Some(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Give an anonymous file the name it was written for. Whatever holds that name
+/// goes first: `linkat` will not replace it.
+fn name_anonymous(fd: i32, path: &Path) -> io::Result<()> {
+    let src = CString::new(format!("/proc/self/fd/{fd}"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path"))?;
+    let dst = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path"))?;
+    unsafe { unlink(dst.as_ptr()) }; // usually nothing is there
+    let rc = unsafe { linkat(AT_FDCWD, src.as_ptr(), AT_FDCWD, dst.as_ptr(), AT_SYMLINK_FOLLOW) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 impl Cache {
-    /// Write beside the target and rename, so a failed save never leaves a
-    /// half-written scan under the real name - and, if the write *fails*, take
-    /// the temporary with it rather than leaving it for the user to find. (A
-    /// process killed outright cannot clean up after itself; that is how a
-    /// 4.4 GiB `.tmp` outlived the scan that was writing it.)
-    fn write_via_tmp<F>(path: &Path, write: F) -> io::Result<()>
+    /// Write a scan to `path`, leaving nothing behind if the write fails.
+    fn save<F>(path: &Path, write: F) -> io::Result<()>
     where
         F: FnOnce(&mut BufWriter<File>) -> io::Result<()>,
     {
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        if let Some(f) = anonymous_in(dir) {
+            let mut w = BufWriter::with_capacity(8 << 20, f);
+            write(&mut w)?;
+            w.flush()?;
+            return name_anonymous(w.get_ref().as_raw_fd(), path);
+        }
+        // No O_TMPFILE here: a named temporary and a rename, removed if the
+        // save fails.
         let tmp = path.with_extension("tmp");
         let saved = (|| {
             let f = File::create(&tmp)?;
@@ -102,7 +154,7 @@ impl Cache {
     }
 
     pub fn write(&self, path: &Path) -> io::Result<()> {
-        Self::write_via_tmp(path, |w| self.write_to(w))
+        Self::save(path, |w| self.write_to(w))
     }
 
     fn write_to<W: Write>(&self, sink: &mut W) -> io::Result<()> {
@@ -346,7 +398,7 @@ impl Cache {
     /// Compress on the way to disk, in-process: 4-5x smaller, and `load_auto`
     /// decompresses it again transparently.
     pub fn write_compressed(&self, path: &Path) -> io::Result<()> {
-        Self::write_via_tmp(path, |w| {
+        Self::save(path, |w| {
             let mut enc = zstd::stream::write::Encoder::new(w, 3)?;
             self.write_to(&mut enc)?;
             enc.finish()?;

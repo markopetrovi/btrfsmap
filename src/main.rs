@@ -312,13 +312,21 @@ fn need_root() -> bool {
     root
 }
 
-/// Hand a file we wrote as root to the user who invoked us.
+/// Hand a file we wrote as root to the user who invoked us, so a scan run under
+/// sudo leaves something they can read without it.
 pub fn hand_over(path: &std::path::Path) {
     let Some((uid, gid, _home)) = cache::invoking_user() else {
+        return; // not run through sudo: nobody to hand it to
+    };
+    let Ok(c) = CString::new(path.as_os_str().as_bytes()) else {
         return;
     };
-    if let Ok(c) = CString::new(path.as_os_str().as_bytes()) {
-        unsafe { chown(c.as_ptr(), uid, gid) };
+    if unsafe { chown(c.as_ptr(), uid, gid) } != 0 {
+        eprintln!(
+            "warning: could not hand {} to uid {uid}: {} - it stays root-owned",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
     }
 }
 
