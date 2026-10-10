@@ -27,10 +27,6 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 use std::io;
 
-pub const DT_DIR: u8 = 4;
-pub const DT_REG: u8 = 8;
-pub const DT_LNK: u8 = 10;
-
 /// One inode's metadata, plus the accumulated extent accounting for it.
 #[derive(Clone, Copy, Default)]
 struct InodeRec {
@@ -51,7 +47,6 @@ struct Entry {
     child: u64,
     name_off: u32,
     name_len: u16,
-    ft: u8,
     /// the location's key type: BTRFS_ROOT_ITEM_KEY means a subvolume entry
     loc_type: u8,
 }
@@ -153,7 +148,6 @@ struct Collector {
     shard: Shard,
     subs: Vec<Collected>,
     subvols: Vec<Subvol>,
-    unreadable: u64,
     files: u64,
     dirs: u64,
     /// walk every fs tree, including the snapshot-class subvolumes (the M2
@@ -428,7 +422,6 @@ fn collect_subvolume(
                     child: e.child,
                     name_off,
                     name_len: e.name.len() as u16,
-                    ft: e.file_type,
                     loc_type: e.location_type,
                 });
             }
@@ -701,11 +694,6 @@ fn collect_collapsed_refs(
     let mut cur_data = false;
     let mut named_in_scan = false;
     let mut named_gone = false;
-    // Unresolved extents whose references run through a block the kernel does
-    // not trust, kept as (len, bytenr) for the budgeted repair below. That flag
-    // is the general signal: it is exactly the case where the extent tree's ref
-    // list is known to be incomplete, so a subvolume that holds the extent can
-    // be missing from it.
 
     btrfs::for_each_extent_tree_item(fd, cancel, &mut |bytenr, ty, key_off, payload| {
         if bytenr != cur_bytenr {
@@ -1118,8 +1106,8 @@ fn build(
             let hi = entries.partition_point(|e| e.parent <= inode);
             for e in &entries[lo..hi] {
             let child_name = names[e.name_off as usize..e.name_off as usize + e.name_len as usize].to_vec();
-            let (child_ci, child_inode, child_flags, collapsed) = if e.loc_type == 132 {
-                // a directory entry pointing at another subvolume's root
+            let is_subvol_entry = u32::from(e.loc_type) == btrfs::BTRFS_ROOT_ITEM_KEY;
+            let (child_ci, child_inode, child_flags, collapsed) = if is_subvol_entry {
                 let nested = c.subs[ci]
                     .nested
                     .iter()
@@ -1820,7 +1808,7 @@ fn set_windows(tree: &Tree, refs: &[u64], extents: &mut ExtentMap, subvol_otime:
 fn debug_ownership(
     tree: &Tree,
     extents: &ExtentMap,
-    ref_blocks: &[Vec<u64>],
+    refs: &[u64],
     subvol_otime: &[u64],
 ) {
     let mut wanted: HashSet<u32> = HashSet::new();
@@ -1845,7 +1833,7 @@ fn debug_ownership(
     let mut refs_of: HashMap<u32, Vec<u32>> = HashMap::new();
     // every page any node references at all
     let mut referenced: HashSet<u32> = HashSet::new();
-    for r in ref_blocks[0].iter() {
+    for r in refs {
         let page = (*r >> 32) as u32;
         referenced.insert(page);
         if wanted.contains(&page) {
@@ -1974,7 +1962,7 @@ fn debug_ownership(
 fn debug_ownership_stats(
     tree: &Tree,
     extents: &ExtentMap,
-    ref_blocks: &[Vec<u64>],
+    refs: &[u64],
     subvol_otime: &[u64],
 ) {
     // The split arithmetic: an extent is divided by win_count, and win_count
@@ -1986,7 +1974,7 @@ fn debug_ownership_stats(
     {
         let mut matched: HashMap<u32, u32> = HashMap::new();
         let mut match_subvol: HashMap<u32, u16> = HashMap::new();
-        for r in ref_blocks[0].iter() {
+        for r in refs {
             let page = (*r >> 32) as u32;
             let Some(e) = extents.get(&page) else { continue };
             if e.win_count == 0 {
@@ -2174,15 +2162,16 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     let show_phases = std::env::var_os("CST_TIME").is_some();
     macro_rules! phase {
         ($name:expr) => {{
+            let since = t_phase;
+            t_phase = std::time::Instant::now();
             if show_phases {
                 eprintln!(
                     "[time] {:<24} {:8.2}s (total {:.2}s)",
                     $name,
-                    t_phase.elapsed().as_secs_f64(),
+                    t_phase.duration_since(since).as_secs_f64(),
                     started.elapsed().as_secs_f64()
                 );
             }
-            t_phase = std::time::Instant::now();
         }};
     }
     let mut stats = ScanStats::default();
@@ -2194,7 +2183,6 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         shard: Shard::default(),
         subs: Vec::new(),
         subvols: Vec::new(),
-        unreadable: 0,
         files: 0,
         dirs: 0,
         full_scan: opts.full_scan,
@@ -2354,7 +2342,6 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         }
     }
 
-    let mut ref_blocks = vec![final_refs];
     // deterministic subvolume numbering, same as the file backend
     {
         let mut order: Vec<usize> = (0..tree.subvols.len()).collect();
@@ -2378,9 +2365,7 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     stats.files = c.files;
     stats.dirs = c.dirs;
     stats.extents = c.shard.extents.len() as u64;
-    stats.refs = ref_blocks[0].len() as u64;
-    stats.elapsed = started.elapsed();
-    tree.stats = stats.clone();
+    stats.refs = final_refs.len() as u64;
     tree.scanned_at = crate::cache::now();
     tree.scanned_roots = opts.roots.clone();
 
@@ -2408,37 +2393,68 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     let subvol_otime: Vec<u64> = tree.subvols.iter().map(|s| s.otime).collect();
     // The one place windows are set: from the references that reach the block,
     // so a holder build() never placed cannot own - or deny - an extent.
-    set_windows(&tree, &ref_blocks[0], &mut extents, &subvol_otime);
-    tree.attribute_owned(&ref_blocks, &mut extents, &subvol_otime, cancel);
+    set_windows(&tree, &final_refs, &mut extents, &subvol_otime);
+    tree.attribute_owned(&final_refs, &mut extents, &subvol_otime, cancel);
     phase!("attribute_owned");
     if cancelled() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
     }
     if std::env::var_os("CST_DEBUG_OWN").is_some() {
-        debug_ownership(&tree, &extents, &ref_blocks, &subvol_otime);
+        debug_ownership(&tree, &extents, &final_refs, &subvol_otime);
         phase!("debug_ownership");
     }
     if std::env::var_os("CST_DEBUG_OWN_STATS").is_some() {
-        debug_ownership_stats(&tree, &extents, &ref_blocks, &subvol_otime);
+        debug_ownership_stats(&tree, &extents, &final_refs, &subvol_otime);
         phase!("debug_ownership_stats");
     }
-    tree.attribute_reach(&mut ref_blocks, &extents, cancel);
+    tree.attribute_reach(&mut final_refs, &extents, cancel);
     phase!("attribute_reach");
     if cancelled() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
     }
     tree.rollup();
     phase!("rollup");
+
+    // Sharing partners the scan did not walk: a snapshot of a subvolume it did
+    // walk, living outside the scanned paths. Its references are invisible
+    // here, so extents shared with it look exclusive to what was scanned - say
+    // so, rather than let the numbers read as complete.
+    {
+        let seen: HashSet<u64> = tree.subvols.iter().map(|s| s.id).collect();
+        let mut outside: Vec<(Vec<u8>, u64, usize)> = Vec::new();
+        for s in &tree.subvols {
+            if s.uuid == [0u8; 16] {
+                continue;
+            }
+            let n = inv
+                .iter()
+                .filter(|r| r.parent_uuid == s.uuid && !seen.contains(&r.treeid))
+                .count();
+            if n > 0 {
+                outside.push((s.name.clone(), s.id, n));
+            }
+        }
+        for (name, id, n) in outside {
+            tree.warnings.push(format!(
+                "subvolume {} (id {}) has {n} snapshot(s) outside the scanned paths; \
+                 shared extents will look exclusive to what was scanned",
+                String::from_utf8_lossy(&name),
+                id
+            ));
+        }
+    }
+
+    stats.elapsed = started.elapsed();
+    tree.stats = stats.clone();
     if let Some(l) = &live {
         l.running.store(false, Ordering::SeqCst);
     }
     Ok((tree, stats))
 }
 
-
-
-/// Time the kernel's reference lookup on a sample of extents.
-pub fn probe_logical_ino(fd: i32, sample: usize) -> io::Result<(usize, usize, f64)> {
+/// Time the kernel's reference lookup on a sample of extents:
+/// (extents asked about, references resolved, lookups that failed, seconds).
+pub fn probe_logical_ino(fd: i32, sample: usize) -> io::Result<(usize, usize, usize, f64)> {
     let mut extents: Vec<u64> = Vec::new();
     btrfs::for_each_extent_tree_item(fd, None, &mut |bytenr, ty, _len, payload| {
         if extents.len() >= sample {
@@ -2462,7 +2478,7 @@ pub fn probe_logical_ino(fd: i32, sample: usize) -> io::Result<(usize, usize, f6
             Err(_) => failed += 1,
         }
     }
-    Ok((extents.len(), refs + failed * 0, started.elapsed().as_secs_f64()))
+    Ok((extents.len(), refs, failed, started.elapsed().as_secs_f64()))
 }
 
 /// Development aid: what one pass over the filesystem's extent tree sees.

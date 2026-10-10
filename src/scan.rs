@@ -75,6 +75,11 @@ pub struct ScanStats {
     pub extents: u64,
     pub refs: u64,
     pub subvolumes: u64,
+    // The next four belong to the retired file backend, which walked paths and
+    // had to detect what it crossed. The tree reader never sets them - it reads
+    // this filesystem's own trees and cannot meet a non-btrfs mount inside one
+    // - but they stay here (and in the saved-scan layout) so scans written by
+    // the reference build still read back, and so their counts still show.
     pub skipped_nonbtrfs: u64,
     /// subvolumes skipped because they belong to a different btrfs filesystem
     pub skipped_otherfs: u64,

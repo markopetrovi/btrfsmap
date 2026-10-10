@@ -554,7 +554,8 @@ pub fn render_tree_report(tree: &Tree, stats: &ScanStats, opt: &TreeReportOption
         out.push_str(&format!(
             "\n{}  [subvolume {}]\n",
             String::from_utf8_lossy(&tree.path_of(root)),
-            d.subvol
+            // the btrfs id, so it can be looked up in `btrfs subvolume list`
+            tree.subvols[d.subvol as usize].id
         ));
         out.push_str(&format!(
             "  owned        {:>10}   semantic share of physical extents (adds up)\n",

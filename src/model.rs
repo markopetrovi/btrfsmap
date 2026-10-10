@@ -45,9 +45,10 @@ pub struct Node {
     pub name_off: u32,
     pub first_child: u32,
     pub nchildren: u32,
+    /// this node's run of references in the scan's reference array
     pub first_ref: u32,
     pub nrefs: u32,
-    /// dir: index into `dirs`; file: ref block index
+    /// dir: index into `dirs`; unused (0) for a file
     pub extra: u32,
     pub mtime: u32,
     pub owned: u64,
@@ -216,7 +217,7 @@ impl Tree {
     /// every subtree's total still equals the real physical usage.
     pub fn attribute_owned(
         &mut self,
-        refs: &[Vec<u64>],
+        refs: &[u64],
         extents: &mut ExtentMap,
         subvol_otime: &[u64],
         cancel: Option<&std::sync::atomic::AtomicBool>,
@@ -232,7 +233,7 @@ impl Tree {
             {
                 return;
             }
-            let (kind, nrefs, first_ref, block, btime, btime_ns, parent, flags) = {
+            let (kind, nrefs, first_ref, extra, btime, btime_ns, parent, flags) = {
                 let n = &self.nodes[i];
                 (
                     n.kind,
@@ -249,11 +250,10 @@ impl Tree {
             if kind != KIND_FILE && !collapsed {
                 continue;
             }
-            // A file's `extra` is its reference block; a directory's is its
-            // dir index - so a collapsed subvolume, which is a directory, still
-            // needs `extra` to find its own subvolume. Its references were
-            // appended to the one shared reference block.
-            let ref_block = if collapsed { 0 } else { block };
+            // `extra` is unused for a file, but a collapsed subvolume is a
+            // directory, whose `extra` is its dir index - where its own
+            // subvolume is. Its references sit in the same array as everyone
+            // else's (see `build`).
             let ctime = if collapsed {
                 // A collapsed subvolume stands in for every file it holds, so
                 // its key cannot be any one file's birth time. It carries
@@ -264,9 +264,7 @@ impl Tree {
                 // decide - which is exactly what the file backend does for a
                 // snapshot, whose files are shared with its parent and
                 // therefore tie on birth time too.
-                *subvol_otime
-                    .get(self.dirs[block].subvol as usize)
-                    .unwrap_or(&0)
+                *subvol_otime.get(self.dirs[extra].subvol as usize).unwrap_or(&0)
             } else {
                 let p = &self.nodes[parent as usize];
                 let sv = if p.kind == KIND_DIR {
@@ -281,7 +279,7 @@ impl Tree {
             // file claims (`referenced`, which the walk counts).
             let mut owned = 0u64;
             let mut uncomp = 0u64;
-            for r in &refs[ref_block][first_ref..first_ref + nrefs] {
+            for r in &refs[first_ref..first_ref + nrefs] {
                 let Some(e) = extents.get_mut(&((*r >> 32) as u32)) else {
                     continue;
                 };
@@ -315,15 +313,12 @@ impl Tree {
     /// single ancestor walk shared by both metrics.
     pub fn attribute_reach(
         &mut self,
-        refs: &mut [Vec<u64>],
+        refs: &mut [u64],
         extents: &ExtentMap,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) {
-        let nblocks = refs.len();
-        for r in refs.iter_mut() {
-            r.sort_unstable();
-        }
-        let mut heads = vec![0usize; nblocks];
+        refs.sort_unstable();
+        let mut head = 0usize;
         // generation-stamped marker array: much cheaper than a set per extent
         let mut stamp = vec![0u32; self.nodes.len()];
         let mut gen: u32 = 0;
@@ -331,35 +326,20 @@ impl Tree {
         let mut owners: Vec<u32> = Vec::new();
 
         let mut batch = 0u32;
-        loop {
+        while head < refs.len() {
             batch += 1;
             if batch % 1024 == 0
                 && cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
             {
                 return;
             }
-            // smallest page still available across all sorted blocks
-            let mut page: Option<u32> = None;
-            for b in 0..nblocks {
-                if heads[b] < refs[b].len() {
-                    let p = (refs[b][heads[b]] >> 32) as u32;
-                    page = Some(match page {
-                        Some(cur) => cur.min(p),
-                        None => p,
-                    });
-                }
-            }
-            let Some(page) = page else { break };
-
+            // the sorted array groups an extent's references together, so the
+            // page at the cursor is the smallest one left
+            let page = (refs[head] >> 32) as u32;
             owners.clear();
-            for b in 0..nblocks {
-                while heads[b] < refs[b].len() && (refs[b][heads[b]] >> 32) as u32 == page {
-                    owners.push((refs[b][heads[b]] & 0xffff_ffff) as u32);
-                    heads[b] += 1;
-                }
-            }
-            if owners.is_empty() {
-                continue;
+            while head < refs.len() && (refs[head] >> 32) as u32 == page {
+                owners.push((refs[head] & 0xffff_ffff) as u32);
+                head += 1;
             }
             let Some(e) = extents.get(&page) else { continue };
 

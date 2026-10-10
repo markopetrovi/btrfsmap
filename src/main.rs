@@ -119,9 +119,9 @@ fn cmd_extent_probe(path: &PathBuf) -> ExitCode {
                 println!("    root {root}: {n} refs");
             }
             println!("  read in {:.1}s", started.elapsed().as_secs_f64());
-            if let Ok((n, refs, secs)) = metadata::probe_logical_ino(fd, 20000) {
+            if let Ok((n, refs, failed, secs)) = metadata::probe_logical_ino(fd, 20000) {
                 println!(
-                    "  logical-ino on {n} extents: {refs} refs in {secs:.2}s ({:.1} us/extent)",
+                    "  logical-ino on {n} extents: {refs} refs, {failed} failed, in {secs:.2}s ({:.1} us/extent)",
                     secs * 1e6 / n.max(1) as f64
                 );
             }
@@ -525,7 +525,6 @@ fn cmd_scan(args: &[String]) -> ExitCode {
         if reproducible {
             c.scanned_at = 0;
             c.stats.elapsed = std::time::Duration::ZERO;
-            c.stats.fd_fallback = 0;
             c.warnings.clear();
         }
         let res = if compress {

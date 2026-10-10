@@ -464,11 +464,8 @@ pub fn fmt_uuid(uuid: &[u8; 16]) -> String {
 // ---------------------------------------------------------------------------
 
 pub const BTRFS_INODE_ITEM_KEY: u32 = 1;
-pub const BTRFS_INODE_REF_KEY: u32 = 12;
-pub const BTRFS_INODE_EXTREF_KEY: u32 = 13;
 pub const BTRFS_ROOT_BACKREF_KEY: u32 = 144;
 pub const BTRFS_DIR_INDEX_KEY: u32 = 96;
-pub const BTRFS_DIR_ITEM_KEY: u32 = 84;
 
 /// A directory entry: `btrfs_dir_item` is packed, location@0 (a disk key:
 /// objectid@0, type@8, offset@9), name_len@27, file type@29, name@30.
@@ -478,8 +475,6 @@ pub struct DirEntry<'a> {
     /// key type of the location: BTRFS_ROOT_ITEM_KEY means the child is a
     /// subvolume root rather than a file inside this tree
     pub location_type: u8,
-    /// DT_* style file type of the entry
-    pub file_type: u8,
     pub name: &'a [u8],
 }
 
@@ -490,27 +485,22 @@ pub fn parse_dir_item(p: &[u8]) -> Option<DirEntry<'_>> {
     let child = u64::from_le_bytes(p[0..8].try_into().unwrap());
     let location_type = p[8];
     let name_len = u16::from_le_bytes(p[27..29].try_into().unwrap()) as usize;
-    let file_type = p[29];
     if p.len() < 30 + name_len {
         return None;
     }
     Some(DirEntry {
         child,
         location_type,
-        file_type,
         name: &p[30..30 + name_len],
     })
 }
 pub const BTRFS_FIRST_FREE_OBJECTID: u64 = 256;
 
 pub const S_IFDIR: u16 = 0o040000;
-pub const S_IFLNK: u16 = 0o120000;
 
 /// Everything the scan needs about one inode, read from its INODE_ITEM.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InodeItem {
-    pub size: u64,
-    pub nlink: u32,
     pub mode: u16,
     pub mtime_sec: u64,
     /// inode creation time - the ownership rule's primary key
@@ -528,41 +518,11 @@ pub fn parse_inode_item(p: &[u8]) -> Option<InodeItem> {
     let u32_at = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
     let u16_at = |o: usize| u16::from_le_bytes(p[o..o + 2].try_into().unwrap());
     Some(InodeItem {
-        size: u64_at(16),
-        nlink: u32_at(40),
         mode: u16_at(52),
         mtime_sec: u64_at(136),
         otime_sec: u64_at(148),
         otime_nsec: u32_at(156),
     })
-}
-
-/// Parent inode and name of this inode, from an INODE_REF (`index@0`,
-/// `name_len@8`) or an INODE_EXTREF (`parent@0`, `index@8`, `name_len@16`).
-pub fn parse_inode_ref(p: &[u8], extref: bool) -> Option<(u64, &[u8])> {
-    let (parent, name_off, name_len) = if extref {
-        if p.len() < 18 {
-            return None;
-        }
-        (
-            u64::from_le_bytes(p[0..8].try_into().unwrap()),
-            18usize,
-            u16::from_le_bytes(p[16..18].try_into().unwrap()) as usize,
-        )
-    } else {
-        if p.len() < 10 {
-            return None;
-        }
-        (
-            0,
-            10usize,
-            u16::from_le_bytes(p[8..10].try_into().unwrap()) as usize,
-        )
-    };
-    if p.len() < name_off + name_len {
-        return None;
-    }
-    Some((parent, &p[name_off..name_off + name_len]))
 }
 
 /// Enumerate every item of one subvolume's fs tree, in key order.
@@ -623,7 +583,6 @@ pub fn subvolumes_inside(fd: i32, parent_root: u64) -> io::Result<Vec<(u64, u64,
         if payload.len() >= 18 + name_len {
             out.push((child, dirid, payload[18..18 + name_len].to_vec()));
         }
-        let _ = &out;
     })?;
     Ok(out)
 }
@@ -669,15 +628,12 @@ pub const BTRFS_EXTENT_ITEM_KEY: u32 = 168;
 pub const BTRFS_METADATA_ITEM_KEY: u32 = 169;
 pub const BTRFS_EXTENT_DATA_REF_KEY: u32 = 178;
 pub const BTRFS_SHARED_DATA_REF_KEY: u32 = 184;
-pub const BTRFS_BLOCK_GROUP_DATA: u64 = 1 << 0;
-pub const BTRFS_BLOCK_GROUP_METADATA: u64 = 1 << 2;
 
 /// A data extent's header: `btrfs_extent_item` is 24 bytes packed, with the
-/// reference count first, the generation, and the extent flags last.
+/// reference count first, the generation, and the extent flags last. Only the
+/// flags are read here: the other two are not part of the accounting.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtentItemHdr {
-    pub refs: u64,
-    pub generation: u64,
     pub flags: u64,
     /// a metadata (tree block) extent: what the scan counts against the tree
     /// rather than against file data
@@ -688,9 +644,6 @@ pub struct ExtentItemHdr {
 /// the block-group flags - is what marks an extent item as metadata, and it is
 /// also what decides whether a `btrfs_tree_block_info` follows the header.
 pub const BTRFS_EXTENT_FLAG_TREE_BLOCK: u64 = 1 << 1;
-/// the extent's refs are not a complete list of its referrers; the kernel does a
-/// full backref walk for these instead of trusting them
-pub const BTRFS_BLOCK_FLAG_FULL_BACKREF: u64 = 1 << 8;
 
 /// True for a `METADATA_ITEM` key, or an `EXTENT_ITEM` whose flags say tree block.
 pub fn is_metadata_extent(key_type: u32, hdr: &ExtentItemHdr) -> bool {
@@ -701,12 +654,8 @@ pub fn parse_extent_item_hdr(p: &[u8]) -> Option<ExtentItemHdr> {
     if p.len() < 24 {
         return None;
     }
-    let refs = u64::from_le_bytes(p[0..8].try_into().unwrap());
-    let generation = u64::from_le_bytes(p[8..16].try_into().unwrap());
     let flags = u64::from_le_bytes(p[16..24].try_into().unwrap());
     Some(ExtentItemHdr {
-        refs,
-        generation,
         flags,
         is_metadata: flags & BTRFS_EXTENT_FLAG_TREE_BLOCK != 0,
     })
@@ -784,13 +733,12 @@ pub fn for_each_inline_ref<F: FnMut(u32, &[u8])>(key_type: u32, p: &[u8], f: &mu
     true
 }
 
-/// A shared reference to a data extent: which block holds the reference, and
-/// how many references that block holds. `btrfs_shared_data_ref` (a 4-byte
-/// count) sits *after* the 9-byte inline ref, so the payload is parent + count.
+/// A shared reference to a data extent: the block that holds the reference.
+/// `btrfs_shared_data_ref` is parent then a 4-byte count; only the parent is
+/// needed, since it is what the block-reference graph resolves to subvolumes.
 #[derive(Debug, Clone, Copy)]
 pub struct SharedDataRef {
     pub parent: u64,
-    pub count: u32,
 }
 
 pub fn parse_shared_data_ref(p: &[u8]) -> Option<SharedDataRef> {
@@ -799,17 +747,15 @@ pub fn parse_shared_data_ref(p: &[u8]) -> Option<SharedDataRef> {
     }
     Some(SharedDataRef {
         parent: u64::from_le_bytes(p[0..8].try_into().unwrap()),
-        count: u32::from_le_bytes(p[8..12].try_into().unwrap()),
     })
 }
 
-/// One reference to a data extent: which subvolume, which inode, at which file
-/// offset, and how many times over (`btrfs_extent_data_ref`, 28 bytes packed).
+/// One reference to a data extent: which subvolume, and how many times over
+/// (`btrfs_extent_data_ref`, 28 bytes packed; the inode and file offset that
+/// follow the subvolume are not part of the accounting).
 #[derive(Debug, Clone, Copy)]
 pub struct DataRef {
     pub root: u64,
-    pub inode: u64,
-    pub file_offset: u64,
     pub count: u32,
 }
 
@@ -819,8 +765,6 @@ pub fn parse_data_ref(p: &[u8]) -> Option<DataRef> {
     }
     Some(DataRef {
         root: u64::from_le_bytes(p[0..8].try_into().unwrap()),
-        inode: u64::from_le_bytes(p[8..16].try_into().unwrap()),
-        file_offset: u64::from_le_bytes(p[16..24].try_into().unwrap()),
         count: u32::from_le_bytes(p[24..28].try_into().unwrap()),
     })
 }

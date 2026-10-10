@@ -308,9 +308,6 @@ impl Cache {
     pub fn from_tree(tree: &Tree) -> Cache {
         let mut nodes = tree.nodes.clone();
         for n in nodes.iter_mut() {
-            if n.kind == KIND_FILE {
-                n.extra = 0;
-            }
             n.first_ref = 0;
             n.nrefs = 0;
         }

@@ -647,7 +647,6 @@ impl Ui {
         self.cancel_btn.set_visible(false);
         self.stack.set_visible_child_name("scan");
         self.status("");
-        self.loading.set(true);
 
         let (tx, rx) = mpsc::channel();
         *self.rx.borrow_mut() = Some(rx);
@@ -835,15 +834,29 @@ impl Ui {
                     .join(", ")
             ),
         };
+        // What the scan could not see whole (shared extents credited here, and
+        // the like): the count on the status line, the text on its tooltip.
+        let warn = if tree.warnings.is_empty() {
+            String::new()
+        } else {
+            format!(" · {} warning(s)", tree.warnings.len())
+        };
+        let warn_text = tree.warnings.join("\n");
+        self.status.set_tooltip_text(if warn_text.is_empty() {
+            None
+        } else {
+            Some(warn_text.as_str())
+        });
         self.status(&format!(
-            "{src} · {} files · {} extents · {} references · {} dirs · {:.0}s{}{}",
+            "{src} · {} files · {} extents · {} references · {} dirs · {:.0}s{}{}{}",
             thousands(stats.files),
             thousands(stats.extents),
             thousands(stats.refs),
             thousands(stats.dirs),
             stats.elapsed.as_secs_f64(),
             snap_note,
-            extra
+            extra,
+            warn
         ));
         self.navigate(root);
     }

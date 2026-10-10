@@ -61,7 +61,7 @@ Needs root to scan. The window has a lazily-loaded file list, a sunburst ring ch
 (click a wedge to descend, hover for details) that switches to a treemap, a metric
 selector, badges for snapshot and shared entries, and a status line summarising the
 scan. Files: `Open…` loads a saved scan, `Save scan…` writes the current one
-(zstd-compressed when it helps), both through native file dialogs.
+(zstd-compressed), both through native file dialogs.
 
 ### `scan` (needs root)
 
@@ -97,11 +97,9 @@ bytes per file: ~3.5 GB for a 37M file `/home`, or ~750 MB with `--compress`.
 | option | |
 |---|---|
 | `-j, --threads N` | worker threads for the fs-tree walks (default: CPUs; the scan they produce is the same at any count) |
-| `-L, --follow-symlinks` | follow symlinks found while walking (off: matches compsize) |
 | `--exclude PATH` | skip a path prefix; extents shared with it will look exclusive to what remains. Excluding a whole subvolume also skips *reading* it, which inside a snapshot is the difference between a sweep and nothing |
 | `--save FILE` | also write the scan to FILE, so the app can open it later |
 | `--compress` | compress the saved scan (3-5x smaller) |
-| `--buffer BYTES` | kernel search buffer per thread (default 1 MiB; larger is faster on files with millions of extents) |
 | `--depth N`, `--top N`, `--files N` | how much of the text report to print |
 | `-b, --bytes` | raw byte counts instead of human units |
 | `--full-scan` | walk snapshot-class subvolumes too (default: one node per snapshot, aggregates only) |
@@ -161,10 +159,7 @@ exact, because it is skipped before anything is read.
 `compsize-tree diff A.cst B.cst [--top N]` prints where two scans disagree, by path,
 largest first. `extent-probe PATH` reports what one pass over the extent tree sees -
 data extents, references, metadata extents, and how many items' inline references
-failed to parse (the count has to be zero). `resolve-probe PATH N` prints, for every
-Nth data extent, the subvolumes the block-reference graph resolves its shared
-references to, to be diffed against the kernel's own answer from
-`btrfs inspect-internal logical-resolve`.
+failed to parse (the count has to be zero).
 
 ## Limits
 
@@ -188,10 +183,6 @@ references to, to be diffed against the kernel's own answer from
   two modes agree - on the tree measured (`/home`), `owned` came out within
   140 KB of each other at 597 GiB. Use `--full-scan` when the interiors of the
   collapsed subvolumes matter.
-* `CST_RESOLVE_SECONDS=<n>` spends up to n seconds asking the kernel about the
-  largest unresolved extents - the exact route, for a filesystem where the
-  missing ones are the big ones. Default 0: it costs ~80-400 us per extent and
-  found nothing on the tree above, so it is a knob rather than a default.
 * The ownership rule treats a *snapshot-class* subvolume as one voice: its
   references carry no file birth time (unknown, with the subvolume's creation
   time as the tie-break), so a snapshot owns what the live trees have let go of
@@ -223,8 +214,7 @@ references to, to be diffed against the kernel's own answer from
   zero.)
 * A subvolume reachable through more than one mount point is walked once, so
   its files do not gain a second reference.
-* Symlinks are skipped unless `--follow-symlinks`; hardlinked paths are counted
-  per path, like compsize does.
+* Symlinks are skipped, like compsize; hardlinked paths are counted per path.
 * `owned`/`referenced` for a *file* is its share; `compsize`/`freeable` are
   stored per directory (a file's value shows its owned share).
 * `owned` and `freeable` are *physical*: a snapshot only owns bytes that would

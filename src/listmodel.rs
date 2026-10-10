@@ -90,8 +90,6 @@ mod imp {
                 return Some(o.clone());
             }
             let tree = self.tree.borrow().as_ref().cloned()?;
-            let row = self.rows.borrow_mut().remove(&id);
-            let _ = row;
             let obj = glib::BoxedAnyObject::new(RowData::build(
                 &tree,
                 id,
