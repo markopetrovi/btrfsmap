@@ -820,13 +820,11 @@ pub struct Root {
 ///
 /// `holder` is the directory the mount sits over, as the tree that holds it
 /// sees it: (the holder subvolume's root id, its inode there, the entry's name).
-/// A reader of fs trees has nothing better than this - the containing tree has
-/// an ordinary directory there, and the mounted subvolume is nowhere in it.
+/// That is all a reader of fs trees can know - the containing tree has an
+/// ordinary directory there, and the mounted subvolume is nowhere in it.
 ///
-/// `child` is set when this scan reads the mounted subvolume's tree here. It is
-/// not set when the mount is an alias (the same subvolume is read at another
-/// mount, or came out of the tree itself) or when the mounted filesystem is not
-/// this one, which is never entered.
+/// `child` is set when this scan reads the mounted subvolume here; an alias, a
+/// foreign filesystem and a bind mount of a directory all leave it unset.
 #[derive(Default)]
 struct MountPoint {
     /// the scan root whose path holds it
@@ -2061,14 +2059,10 @@ fn seed_mounts(
         // walker did: the subvolume's own name, at the path it is mounted on
         let child = c.intern_subvol(&info, inventory, &path);
         c.mounts[mi].child = Some(child);
-        // Where the mount sits in a subvolume whose directories were not read -
-        // a collapsed snapshot - there is no entry to place it from. It hangs
-        // off that collapsed node instead, exactly like a subvolume found
-        // through the root tree inside one: the kernel names the chain of
-        // directories between the two (INO_LOOKUP), and the mounted subvolume's
-        // own tree is read like any other. A mount that is only an alias of a
-        // tree the scan reaches elsewhere is not claimed at all, and the
-        // collapsed node stays closed.
+        // Where the holder is a collapsed snapshot its directories were not
+        // read, so there is no entry to place the mount from: it hangs off the
+        // collapsed node instead, like a subvolume the root tree names inside
+        // one, with the chain of directories between them named by the kernel.
         if let Some((_, _, holder_path)) = c
             .collapsed
             .iter()
