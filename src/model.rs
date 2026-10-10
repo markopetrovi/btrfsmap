@@ -30,6 +30,14 @@ pub const FLAG_SNAP_CLASS: u8 = 1 << 4; // node lives inside a snapshot-class su
 /// whole subtree. Its references come from the extent tree, so its interior is
 /// not browsable and its own metrics are the subtree's aggregate.
 pub const FLAG_COLLAPSED: u8 = 1 << 5;
+/// a subvolume mounted here: this node is where its tree begins (the directory
+/// in the containing tree is the mount's underlying directory, and holds none
+/// of the mounted subvolume's files)
+pub const FLAG_MOUNT: u8 = 1 << 6;
+/// a mount point whose content this scan did not read here - the same subvolume
+/// is counted at another of its mounts, or the mounted filesystem is not this
+/// one and is never entered
+pub const FLAG_MOUNT_OTHER: u8 = 1 << 7;
 
 pub const NO_NODE: u32 = u32::MAX;
 

@@ -59,9 +59,9 @@ appears or is deleted.
 
 Needs root to scan. The window has a lazily-loaded file list, a sunburst ring chart
 (click a wedge to descend, hover for details) that switches to a treemap, a metric
-selector, badges for snapshot and shared entries, and a status line summarising the
-scan. Files: `Open…` loads a saved scan, `Save scan…` writes the current one
-(zstd-compressed), both through native file dialogs.
+selector, badges for snapshot, mount and shared entries, and a status line
+summarising the scan. Files: `Open…` loads a saved scan, `Save scan…` writes the
+current one (zstd-compressed), both through native file dialogs.
 
 ### `scan` (needs root)
 
@@ -77,6 +77,15 @@ The scan reads the filesystem's own trees instead of the files - `INODE_ITEM`,
 `DIR_INDEX` and `EXTENT_DATA` out of each subvolume's fs tree, subvolume nesting out
 of the root tree - which needs no `statx` and no per-file ioctl and is about 2.5x
 faster than the file walk for the same numbers.
+
+**Mounts under the scanned path are read.** A subvolume mounted inside the scan -
+`/home` when scanning `/` - is nowhere in any fs tree: the containing tree has an
+ordinary directory where the mount is. The scan reads `/proc/self/mountinfo` to
+find them (one open, one stat and one ioctl per mount point, never per file) and
+reads each mounted subvolume the way it reads a nested one. A mount of a
+filesystem that is not this one is never entered - extent addresses are only
+unique within one filesystem - and neither is a mount of a plain directory; both
+show as a mount point with nothing under it.
 
 **Snapshots are not walked.** A subvolume whose `parent_uuid` still resolves to
 another subvolume of this filesystem is left as a single node holding its subtree's
@@ -202,18 +211,29 @@ failed to parse (the count has to be zero).
   read.
 * A scan is a snapshot in time; files changing during it are counted once, as
   seen.
-* Non-btrfs filesystems inside the tree (loop mounts, overlayfs, `/boot`) are
-  never entered: the scan follows btrfs fs trees, and those hold only this
-  filesystem's own files, so nothing under such a mount is read or counted.
-  That is also what keeps a *different* btrfs filesystem mounted inside the
-  scanned tree out of the dedup: its subvolumes are not in this filesystem's
-  root tree, and extent addresses are only unique within one filesystem.
-  Scanning such a filesystem works by starting the scan there. (The retired
-  file walker had to detect this with `BTRFS_IOC_FS_INFO`, since it walked
-  paths rather than trees; those stats are still in the cache layout and read
-  zero.)
-* A subvolume reachable through more than one mount point is walked once, so
-  its files do not gain a second reference.
+* A mount the scan does not enter - a non-btrfs filesystem (loop mounts,
+  overlayfs, tmpfs, `/boot`), a *different* btrfs filesystem (its fsid is
+  compared with the scanned one by `BTRFS_IOC_FS_INFO` before anything is read
+  from it, since extent addresses are only unique within one filesystem), or a
+  mount of a plain directory - is shown as a mount point with nothing under it.
+  Scanning such a filesystem works by starting the scan there. The
+  `skipped_nonbtrfs`/`skipped_otherfs` counters the file walker filled in are
+  still in the saved-scan layout and are read from scans the reference build
+  wrote, but the tree reader leaves them at zero: each mount is marked in the
+  tree instead.
+* A subvolume mounted under the scanned path is read at its mount, once. Of
+  several mounts of one subvolume the *oldest* is the one read - mount IDs are
+  handed out in mount order - and the others show as mount points with nothing
+  under them, so its files do not gain a second reference. A subvolume that also
+  lives inside the scanned tree keeps its tree location, and its mounts are only
+  aliases. A mount inside a subvolume that was *not* walked (a collapsed
+  snapshot) cannot be placed at all; the scan warns that what it mounts is not
+  counted.
+* Several paths may be given to one scan; a path inside another one is not
+  scanned separately, because it is already in that scan and a second placement
+  would split every extent between the two copies. The scan says so when it
+  drops one. A path under a mount the scan does not enter is *not* covered by
+  the containing root, and keeps its own scan.
 * Symlinks are skipped, like compsize; hardlinked paths are counted per path.
 * `owned`/`referenced` for a *file* is its share; `compsize`/`freeable` are
   stored per directory (a file's value shows its owned share).

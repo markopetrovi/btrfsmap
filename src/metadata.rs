@@ -19,6 +19,7 @@ use crate::btrfs::{
     self, BTRFS_DIR_INDEX_KEY, BTRFS_EXTENT_DATA_KEY, BTRFS_FILE_EXTENT_INLINE, BTRFS_INODE_ITEM_KEY,
 };
 use crate::model::*;
+use crate::mounts;
 use crate::scan::{Progress, ScanOptions, ScanStats};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::ffi::OsStrExt;
@@ -159,6 +160,9 @@ struct Collector {
     /// every tree claiming each of them: their trees are read, and this is
     /// where their nodes hang.
     graph_kids: Vec<GraphKid>,
+    /// mount points under the scan roots, with the subvolume each mounts once
+    /// the walks have decided whether this scan reads it there
+    mounts: Vec<MountPoint>,
 }
 
 impl Collector {
@@ -794,6 +798,45 @@ pub struct Root {
     pub subvol: u16,
     pub inode: u64,
     pub info: btrfs::SubvolInfo,
+    /// This root's own walk, as an index into the collector's `subs`. A root is
+    /// placed from the collection it produced and not by looking its subvolume
+    /// up: two roots can name directories of one subvolume, and then a lookup
+    /// finds only the first one's walk.
+    pub col: usize,
+    /// The path with symlinks resolved, for deciding what is inside what. Only
+    /// the mount table and the other roots are compared against it; the tree
+    /// keeps the spelling the user gave.
+    pub canonical: Vec<u8>,
+}
+
+/// A mount point under a scan root, and where it belongs in the tree.
+///
+/// `holder` is the directory the mount sits over, as the tree that holds it
+/// sees it: (the holder subvolume's root id, its inode there, the entry's name).
+/// A reader of fs trees has nothing better than this - the containing tree has
+/// an ordinary directory there, and the mounted subvolume is nowhere in it.
+///
+/// `child` is set when this scan reads the mounted subvolume's tree here. It is
+/// not set when the mount is an alias (the same subvolume is read at another
+/// mount, or came out of the tree itself) or when the mounted filesystem is not
+/// this one, which is never entered.
+#[derive(Default)]
+struct MountPoint {
+    /// the scan root whose path holds it
+    root: usize,
+    /// where the mount is, spelled as the scan root is
+    path: Vec<u8>,
+    /// the subvolume it mounts, when this is the mount that would read it: the
+    /// filesystem is ours and this is its oldest mount. Opening the mount is
+    /// what identified it, so its own name is here too - the mount point's name
+    /// is not the subvolume's.
+    candidate: Option<btrfs::SubvolInfo>,
+    /// set once the walk has read the mounted subvolume here
+    child: Option<u16>,
+    /// (holder subvolume root id, holder inode, entry name)
+    holder: (u64, u64, Vec<u8>),
+    /// where the mount is, absolute - what the tree-placement rules compare
+    abs: Vec<u8>,
 }
 
 /// Assemble the tree the rest of the program expects from the collected pieces.
@@ -815,10 +858,11 @@ fn push_collapsed_node(
     parent_node: u32,
     name: &[u8],
     depth: u16,
+    extra_flags: u8,
 ) -> u32 {
     let idx = tree.nodes.len() as u32;
     let s = &tree.subvols[subvol as usize];
-    let mut flags = FLAG_SUBVOL | FLAG_COLLAPSED | FLAG_SNAP_CLASS;
+    let mut flags = FLAG_SUBVOL | FLAG_COLLAPSED | FLAG_SNAP_CLASS | extra_flags;
     if s.is_snapshot() {
         flags |= FLAG_SNAPSHOT;
     }
@@ -895,31 +939,12 @@ fn build(
     tree.dirs.push(DirExtra::default());
 
     let mut final_refs: Vec<u64> = Vec::with_capacity(c.shard.refs.len());
-    // (collected index, inode, parent node, name, flags) worklist for the BFS
-    let mut queue: VecDeque<(usize, u64, u32, Vec<u8>, u8)> = VecDeque::new();
-
-    for root in roots {
-        // the root node itself: a real directory inside the collected subvolume
-        let Some(ci) = c.subs.iter().position(|s| s.subvol == root.subvol) else {
-            continue;
-        };
-        // name and mtime of the root path come from its own inode record
-        let name = root
-            .path
-            .rsplit(|b| *b == b'/')
-            .next()
-            .filter(|n| !n.is_empty())
-            .unwrap_or(&root.path)
-            .to_vec();
-        let mut flags = FLAG_SUBVOL;
-        let s = &tree.subvols[root.subvol as usize];
-        if s.is_snapshot() {
-            flags |= FLAG_SNAPSHOT;
-        }
-        if s.is_readonly() {
-            flags |= FLAG_READONLY;
-        }
-        queue.push_back((ci, root.inode, 0, name, flags));
+    // The mounts, by the directory each sits over: a subvolume's root id and a
+    // directory inode, so a directory being placed can find the mounts over it
+    // with one lookup - and most directories have none.
+    let mut mount_at: HashMap<(u64, u64), Vec<usize>> = HashMap::new();
+    for (i, m) in c.mounts.iter().enumerate() {
+        mount_at.entry((m.holder.0, m.holder.1)).or_default().push(i);
     }
 
     // children of a directory are a contiguous run of (parent, name)-sorted
@@ -951,9 +976,9 @@ fn build(
     // synthetic root's children: the paths given on the command line
     let mut root_queue: Vec<(usize, u64, Vec<u8>, u8, Vec<u8>)> = Vec::new();
     for root in roots {
-        let Some(ci) = c.subs.iter().position(|s| s.subvol == root.subvol) else {
-            continue;
-        };
+        // the root's own walk, by index: looking the subvolume up would find
+        // another root's collection when two roots share one subvolume
+        let ci = root.col;
         let name = root
             .path
             .rsplit(|b| *b == b'/')
@@ -1098,12 +1123,19 @@ fn build(
         }
         // gather this directory's children first: pushing nodes borrows the
         // collector mutably, so nothing may hold a borrow of its entries
+        //
+        // (collected index, inode, name, flags, collapsed subvolume, path)
         let mut kids: Vec<(usize, u64, Vec<u8>, u8, Option<u16>, Vec<u8>)> = Vec::new();
         {
             let entries = &c.subs[ci].entries;
             let names = &c.subs[ci].names;
             let lo = entries.partition_point(|e| e.parent < inode);
             let hi = entries.partition_point(|e| e.parent <= inode);
+            // the mounts over this directory: almost always none
+            let dir_mounts: &[usize] = mount_at
+                .get(&(tree.subvols[c.subs[ci].subvol as usize].id, inode))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
             for e in &entries[lo..hi] {
             let child_name = names[e.name_off as usize..e.name_off as usize + e.name_len as usize].to_vec();
             let is_subvol_entry = u32::from(e.loc_type) == btrfs::BTRFS_ROOT_ITEM_KEY;
@@ -1156,6 +1188,61 @@ fn build(
                     }
                     None => continue,
                 }
+            } else if let Some(mi) = dir_mounts
+                .iter()
+                .copied()
+                .find(|&mi| c.mounts[mi].holder.2 == child_name)
+            {
+                // A mount point: the containing tree has an ordinary directory
+                // here, and nothing of what is mounted over it.
+                //
+                // A mount this scan does not read here still shows the
+                // subvolume it mounts when that subvolume is read at its other
+                // mount - the node the file walker would find there - but it is
+                // never descended into: those files are placed at the mount
+                // that reads them, and a second placement would split every
+                // extent between the two.
+                let child = c.mounts[mi].child.or_else(|| {
+                    let id = c.mounts[mi].candidate.as_ref()?.treeid;
+                    c.subvols.iter().position(|s| s.id == id).map(|i| i as u16)
+                });
+                match child {
+                    Some(child) => {
+                        let read_here = c.mounts[mi].child.is_some();
+                        let root = tree.subvols[child as usize].id;
+                        let s = &tree.subvols[child as usize];
+                        let mut f = FLAG_SUBVOL;
+                        if s.is_snapshot() {
+                            f |= FLAG_SNAPSHOT;
+                        }
+                        if s.is_readonly() {
+                            f |= FLAG_READONLY;
+                        }
+                        f |= if read_here { FLAG_MOUNT } else { FLAG_MOUNT_OTHER };
+                        match c.collapsed.iter().find(|(r, _, _)| *r == root) {
+                            // a collapsed subvolume has no collected tree, so a
+                            // node for it can only stand where it is read
+                            Some(&(_, subvol, _)) if read_here => (usize::MAX, 0, f, Some(subvol)),
+                            Some(_) => (ci, e.child, FLAG_MOUNT_OTHER, None),
+                            None => {
+                                match c.subs.iter().position(
+                                    |s| tree.subvols[s.subvol as usize].id == root,
+                                ) {
+                                    Some(child_ci) => (
+                                        child_ci,
+                                        btrfs::BTRFS_FIRST_FREE_OBJECTID,
+                                        f,
+                                        None,
+                                    ),
+                                    None => (ci, e.child, FLAG_MOUNT_OTHER, None),
+                                }
+                            }
+                        }
+                    }
+                    // a filesystem this scan does not enter: the node is the
+                    // directory the tree holds, and says a mount is over it
+                    None => (ci, e.child, FLAG_MOUNT_OTHER, None),
+                }
             } else {
                 (ci, e.child, 0, None)
             };
@@ -1183,7 +1270,9 @@ fn build(
                 tree.dirs[tree.nodes[node_idx as usize].extra as usize].depth + 1
             };
             if let Some(subvol) = collapsed {
-                let idx = push_collapsed_node(&mut tree, c, subvol, node_idx, &child_name, depth);
+                let idx = push_collapsed_node(
+                    &mut tree, c, subvol, node_idx, &child_name, depth, child_flags,
+                );
                 let root_id = tree.subvols[subvol as usize].id;
                 collapsed_nodes.insert(root_id, idx);
                 // A subvolume the root tree says lives inside this collapsed one
@@ -1239,7 +1328,12 @@ fn build(
                     ..Default::default()
                 });
                 tree.nodes[idx as usize].extra = extra;
-                dirs.push_back((child_ci, child_inode, idx, child_path));
+                // a mount point the scan did not read holds nothing here: its
+                // content is counted at the mount that reads it (or is not this
+                // filesystem's at all)
+                if tree.nodes[idx as usize].flags & FLAG_MOUNT_OTHER == 0 {
+                    dirs.push_back((child_ci, child_inode, idx, child_path));
+                }
             }
         }
         let n = tree.nodes.len() as u32 - first_child;
@@ -1522,14 +1616,15 @@ fn collect_all(
     fd: i32,
     inventory: &[btrfs::RootItem],
     start: &Root,
+    root_index: usize,
     excludes: &[Vec<u8>],
     live: Option<&Progress>,
     threads: usize,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     if threads <= 1 {
         // the serial path, unchanged: one thread, no copies, no merges
         let pool = Pool::new();
-        return collect_walk(c, fd, inventory, start, excludes, live, &pool, false);
+        return collect_walk(c, fd, inventory, start, root_index, excludes, live, &pool, false);
     }
     // Declared outside the scope so the workers' borrow of it outlives them.
     let pool = Pool::new();
@@ -1537,7 +1632,7 @@ fn collect_all(
         for _ in 0..threads {
             s.spawn(|| pool_worker(&pool, fd, live));
         }
-        let r = collect_walk(c, fd, inventory, start, excludes, live, &pool, true);
+        let r = collect_walk(c, fd, inventory, start, root_index, excludes, live, &pool, true);
         pool.shutdown();
         r
     })
@@ -1545,16 +1640,20 @@ fn collect_all(
 
 /// The traversal: pop a subvolume, take its walk (or run it), discover what is
 /// nested inside it, and push that back on the list.
+///
+/// Returns the index of the start subvolume's own walk in the collector, which
+/// is what `build` places the root's node from.
 fn collect_walk(
     c: &mut Collector,
     fd: i32,
     inventory: &[btrfs::RootItem],
     start: &Root,
+    root_index: usize,
     excludes: &[Vec<u8>],
     live: Option<&Progress>,
     pool: &Pool,
     parallel: bool,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     // (root id, subvol index, path, whether to read its fs tree). A collapsed
     // subvolume is still *visited*, to find what lives inside it - just not
     // read.
@@ -1564,7 +1663,22 @@ fn collect_walk(
     // root ids handed to the pool: a subvolume reached twice is walked once
     let mut submitted: HashSet<u64> = HashSet::new();
     let cancel = live.map(|l| &l.cancel);
-    while let Some((root_id, subvol, path, read_tree)) = work.pop() {
+    // The start subvolume is the first thing popped, so its walk is the first
+    // one pushed.
+    let start_col = c.subs.len();
+    // Mounts under this root are taken up once the tree has had its say, so a
+    // subvolume the tree reached keeps its tree location and only the ones
+    // nothing else names are read at their mount.
+    let mut mounts_left = true;
+    loop {
+        let Some((root_id, subvol, path, read_tree)) = work.pop() else {
+            if !mounts_left {
+                break;
+            }
+            mounts_left = false;
+            seed_mounts(c, inventory, root_index, pool, parallel, &mut submitted, &mut work);
+            continue;
+        };
         // A GUI can cancel between subvolumes; the reads themselves cannot be
         // interrupted, since the kernel answers each fs-tree search whole.
         if let Some(l) = live {
@@ -1736,7 +1850,192 @@ fn collect_walk(
         }
         c.subs.push(col);
     }
-    Ok(())
+    Ok(start_col)
+}
+
+/// Find the mounts under the scan roots, and where each one belongs in the tree.
+///
+/// One open, one stat and one ioctl per mount point - never per file - and a
+/// mount whose type is not btrfs is not even opened. What it buys is that a
+/// scan of a path covers what the path holds, whichever tree the kernel serves
+/// it from.
+///
+/// The mounted filesystem is identified by its superblock's fsid: extent
+/// addresses are only unique within one filesystem, so another one's
+/// subvolumes must not be read, however they are mounted.
+fn discover_mounts(
+    roots: &[Root],
+    fs_id: ([u8; 16], [u8; 16]),
+    excludes: &[Vec<u8>],
+) -> Vec<MountPoint> {
+    let Ok(table) = mounts::list() else {
+        return Vec::new();
+    };
+    let mut out: Vec<MountPoint> = Vec::new();
+    // Subvolumes a mount has already claimed. The table is oldest first, so the
+    // oldest mount is the one that reads a subvolume mounted more than once.
+    let mut claimed: HashSet<u64> = HashSet::new();
+    for m in table {
+        let Some(ri) = roots
+            .iter()
+            .position(|r| mounts::under(&m.path, &r.canonical))
+        else {
+            continue;
+        };
+        // A scan root is not a mount *under* itself: it is the root's own node.
+        if m.path == roots[ri].canonical {
+            continue;
+        }
+        // Spelled as the scan root is, so --exclude and the subvolume's
+        // recorded path agree with the rest of the scan.
+        let rel = &m.path[roots[ri].canonical.len()..];
+        let mut path = roots[ri].path.clone();
+        if !path.ends_with(b"/") {
+            path.push(b'/');
+        }
+        path.extend_from_slice(rel.strip_prefix(b"/").unwrap_or(rel));
+        if excluded(&path, excludes) {
+            continue;
+        }
+        // Where it sits: the directory the mount is over, as the tree that
+        // holds that directory sees it.
+        let Ok(parent) = open_dir(mounts::parent_of(&m.path)) else {
+            continue;
+        };
+        let Ok(pinfo) = btrfs::get_subvol_info(std::os::fd::AsRawFd::as_raw_fd(&parent)) else {
+            continue;
+        };
+        let Ok(pino) = parent.metadata().map(|md| std::os::unix::fs::MetadataExt::ino(&md)) else {
+            continue;
+        };
+        let mut candidate = None;
+        if m.fs_type == b"btrfs" {
+            if let Ok(mf) = open_dir(&m.path) {
+                let mfd = std::os::fd::AsRawFd::as_raw_fd(&mf);
+                let ours = btrfs::fs_identity(mfd)
+                    .map(|id| id == fs_id)
+                    .unwrap_or(false);
+                if ours {
+                    if let Ok(info) = btrfs::get_subvol_info(mfd) {
+                        if claimed.insert(info.treeid) {
+                            candidate = Some(info);
+                        }
+                    }
+                }
+            }
+        }
+        out.push(MountPoint {
+            root: ri,
+            path,
+            candidate,
+            child: None,
+            holder: (pinfo.treeid, pino, mounts::name_of(&m.path).to_vec()),
+            abs: m.path,
+        });
+    }
+    out
+}
+
+/// Which roots lie inside another root, and so must not be placed twice:
+/// `(the root to drop, the root that covers it)`.
+///
+/// A mount this scan does not read - another filesystem, or a mount of a plain
+/// directory - hides what is under it from the containing root's tree, so a root
+/// below one is not covered and keeps its own scan.
+fn covered_roots(roots: &[Root], mounts: &[MountPoint]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for i in 0..roots.len() {
+        for j in 0..roots.len() {
+            if i == j || !mounts::under(&roots[i].canonical, &roots[j].canonical) {
+                continue;
+            }
+            if roots[i].canonical == roots[j].canonical {
+                // the same directory given twice: keep the first spelling
+                if j < i {
+                    out.push((i, j));
+                    break;
+                }
+                continue;
+            }
+            let blocked = mounts.iter().any(|m| {
+                m.candidate.is_none()
+                    && mounts::under(&m.abs, &roots[j].canonical)
+                    && mounts::under(&roots[i].canonical, &m.abs)
+            });
+            if !blocked {
+                out.push((i, j));
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Read the mounted subvolumes nothing else reached, as work for the walker.
+///
+/// Called when the tree's own work list runs dry, so a subvolume that the tree
+/// names (nested inside a walked one, or claimed through the root tree) has
+/// already been interned and keeps its tree location; a mount only supplies the
+/// subvolumes that would otherwise be missing from the scan entirely - which is
+/// what a mount is for. Of several mounts of one subvolume only the oldest
+/// (`MountPoint::candidate`) is read; the rest stay aliases and their nodes say
+/// so.
+#[allow(clippy::too_many_arguments)]
+fn seed_mounts(
+    c: &mut Collector,
+    inventory: &[btrfs::RootItem],
+    root_index: usize,
+    pool: &Pool,
+    parallel: bool,
+    submitted: &mut HashSet<u64>,
+    work: &mut Vec<(u64, u16, Vec<u8>, bool)>,
+) {
+    for mi in 0..c.mounts.len() {
+        if c.mounts[mi].root != root_index {
+            continue;
+        }
+        let Some(info) = c.mounts[mi].candidate.clone() else {
+            continue;
+        };
+        let child_root = info.treeid;
+        if c.subvols.iter().any(|s| s.id == child_root) {
+            continue; // the tree reached it first: its tree location wins
+        }
+        // A mount inside a subvolume this scan did not walk - a collapsed
+        // snapshot - has no directory in the tree to hang from: nothing read
+        // the entries that would hold it, and there is nowhere to put its node.
+        // Reading the mounted subvolume anyway would only make nodes nothing
+        // can reach, so it is not read, and the loss is said out loud.
+        if c.collapsed
+            .iter()
+            .any(|(r, _, _)| *r == c.mounts[mi].holder.0)
+        {
+            c.shard.warnings.push(format!(
+                "{}: a mount point inside a subvolume that was not walked; \
+                 what it mounts is not counted",
+                String::from_utf8_lossy(&c.mounts[mi].path)
+            ));
+            continue;
+        }
+        let path = c.mounts[mi].path.clone();
+        // interned from what the kernel says about the mount, as the file
+        // walker did: the subvolume's own name, at the path it is mounted on
+        let child = c.intern_subvol(&info, inventory, &path);
+        c.mounts[mi].child = Some(child);
+        let collapsed = c.collapse(child);
+        if collapsed {
+            c.collapsed.push((child_root, child, path.clone()));
+        } else if parallel && submitted.insert(child_root) {
+            pool.submit(Job {
+                root_id: child_root,
+                subvol: child,
+                snap_class: c.subvols[child as usize].is_snapshot(),
+                scope_inode: None,
+            });
+        }
+        // a collapsed mount is still visited, to find what lives inside it
+        work.push((child_root, child, path, !collapsed));
+    }
 }
 
 /// Would this path be skipped? `--exclude` is a prefix match, as in the file
@@ -2188,6 +2487,7 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         full_scan: opts.full_scan,
         collapsed: Vec::new(),
         graph_kids: Vec::new(),
+        mounts: Vec::new(),
     };
 
     // inventory of every subvolume, for snapshot classification
@@ -2197,6 +2497,7 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     let inv = btrfs::list_subvolumes(fd).unwrap_or_default();
 
 
+    let fs_id = btrfs::fs_identity(fd).unwrap_or(([0u8; 16], [0u8; 16]));
     let mut roots = Vec::new();
     for path in &opts.roots {
         let file = open_dir(path)?;
@@ -2206,12 +2507,52 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
             .metadata()
             .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
             .unwrap_or(btrfs::BTRFS_FIRST_FREE_OBJECTID);
+        let canonical = std::fs::canonicalize(std::ffi::OsStr::from_bytes(path))
+            .map(|p| p.as_os_str().as_bytes().to_vec())
+            .unwrap_or_else(|_| path.clone());
         roots.push(Root {
             path: path.clone(),
             subvol,
             inode,
             info,
+            col: 0,
+            canonical,
         });
+    }
+
+    // The mounts under the roots. A tree cannot see one: the containing tree
+    // has an ordinary directory where the mount is. Reading them is what makes
+    // a scan of a path cover what the path holds.
+    c.mounts = discover_mounts(&roots, fs_id, &opts.excludes);
+
+    // A root inside another root is inside that scan already, and one placed
+    // twice would be counted twice: the two copies carry the same ownership
+    // key, so they split every extent between them - halving what each shows
+    // and leaving nothing below either freeable. Keep the outer one and say so.
+    let covered = covered_roots(&roots, &c.mounts);
+    for (i, by) in &covered {
+        c.shard.warnings.push(format!(
+            "{} is inside {}, which is scanned: not scanned separately",
+            String::from_utf8_lossy(&roots[*i].path),
+            String::from_utf8_lossy(&roots[*by].path)
+        ));
+    }
+    let roots: Vec<Root> = roots
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !covered.iter().any(|(c, _)| c == i))
+        .map(|(_, r)| r)
+        .collect();
+    // The mounts were found under the roots as they were given; a dropped root
+    // may have been the one that held one, and what held it is now the root
+    // that covered it. Renumber, or the mount would be seeded for a root that
+    // is no longer scanned and never read.
+    let mut roots = roots;
+    for m in c.mounts.iter_mut() {
+        m.root = roots
+            .iter()
+            .position(|r| mounts::under(&m.abs, &r.canonical))
+            .unwrap_or(0);
     }
     phase!("inventory + roots");
     let t_collect = std::time::Instant::now();
@@ -2222,8 +2563,18 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     } else {
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
     };
-    for root in &roots {
-        collect_all(&mut c, fd, &inv, root, &opts.excludes, live.as_deref(), threads)?;
+    for i in 0..roots.len() {
+        let col = collect_all(
+            &mut c,
+            fd,
+            &inv,
+            &roots[i],
+            i,
+            &opts.excludes,
+            live.as_deref(),
+            threads,
+        )?;
+        roots[i].col = col;
     }
     if std::env::var_os("CST_TIME_SUBVOL").is_some() {
         eprintln!(

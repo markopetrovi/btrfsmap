@@ -10,6 +10,7 @@ mod gui;
 mod listmodel;
 mod metadata;
 mod model;
+mod mounts;
 mod report;
 mod scan;
 

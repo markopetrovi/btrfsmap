@@ -133,6 +133,39 @@ pub fn get_subvol_info(fd: i32) -> io::Result<SubvolInfo> {
 }
 
 // ---------------------------------------------------------------------------
+// FS_INFO: which filesystem is this, really
+// ---------------------------------------------------------------------------
+
+const FS_INFO_SIZE: usize = 1024;
+const OFF_FS_INFO_FSID: usize = 16;
+const OFF_FS_INFO_METADATA_UUID: usize = 64;
+const BTRFS_IOC_FS_INFO: u64 = ioc(IOC_READ, BTRFS_IOCTL_MAGIC, 31, FS_INFO_SIZE as u64);
+
+/// Identity of the filesystem an fd belongs to: the fsid stored in the
+/// superblock, plus its metadata_uuid when that feature is in use. It is per
+/// *filesystem* - every subvolume of one reports the same pair, and it is
+/// persisted on disk - which is what makes it the test for "is this mount the
+/// same filesystem, so are its extents comparable with ours".
+///
+/// Deliberately not statfs(2)'s f_fsid or stat's st_dev: btrfs gives every
+/// mounted subvolume its own anonymous device (measured here: `/` is 37,
+/// `/home` is 51, both subvolumes of one filesystem), so neither identifies the
+/// volume.
+pub fn fs_identity(fd: i32) -> io::Result<([u8; 16], [u8; 16])> {
+    let mut buf = [0u8; FS_INFO_SIZE];
+    let rc = unsafe { ioctl(fd, BTRFS_IOC_FS_INFO, buf.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut fsid = [0u8; 16];
+    fsid.copy_from_slice(&buf[OFF_FS_INFO_FSID..OFF_FS_INFO_FSID + 16]);
+    let mut metadata = [0u8; 16];
+    metadata
+        .copy_from_slice(&buf[OFF_FS_INFO_METADATA_UUID..OFF_FS_INFO_METADATA_UUID + 16]);
+    Ok((fsid, metadata))
+}
+
+// ---------------------------------------------------------------------------
 // TREE_SEARCH_V2: per-inode extent list
 // ---------------------------------------------------------------------------
 
