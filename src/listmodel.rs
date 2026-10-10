@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! Lazy list model over one directory's children.
 //!
 //! A directory can hold a million entries, so rows are materialised only when

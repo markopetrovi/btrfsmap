@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! Raw btrfs ioctl bindings.
 //!
 //! This mirrors what compsize(8) does: for every regular file, ask the kernel

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! compsize-tree: extent-accurate btrfs disk usage.
 //!
 //! GUI (no arguments): open a saved scan or scan a path.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! M1: a single-walk accounting pass that reproduces `compsize`'s output
 //! byte for byte, so the extent layer can be verified against it.
 //!

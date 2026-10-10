@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! Parallel one-pass walker.
 //!
 //! One pass over the tree collects, for every regular file, the physical

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! The usage chart: a sunburst ring chart and a treemap, drawn with cairo.
 //!
 //! The geometry is the same as the web version had, so the two look alike:

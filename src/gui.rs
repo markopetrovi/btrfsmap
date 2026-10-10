@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! The GTK4 application: scan a path or open a saved scan, watch the scan run,
 //! then browse the result as a ring chart, treemap and file list.
 
