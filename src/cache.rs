@@ -78,16 +78,31 @@ fn read_array<T: Copy, R: Read>(r: &mut R, count: usize) -> io::Result<Vec<T>> {
 }
 
 impl Cache {
-    pub fn write(&self, path: &Path) -> io::Result<()> {
+    /// Write beside the target and rename, so a failed save never leaves a
+    /// half-written scan under the real name - and, if the write *fails*, take
+    /// the temporary with it rather than leaving it for the user to find. (A
+    /// process killed outright cannot clean up after itself; that is how a
+    /// 4.4 GiB `.tmp` outlived the scan that was writing it.)
+    fn write_via_tmp<F>(path: &Path, write: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+    {
         let tmp = path.with_extension("tmp");
-        {
+        let saved = (|| {
             let f = File::create(&tmp)?;
             let mut w = BufWriter::with_capacity(8 << 20, f);
-            self.write_to(&mut w)?;
+            write(&mut w)?;
             w.flush()?;
+            fs::rename(&tmp, path)
+        })();
+        if saved.is_err() {
+            let _ = fs::remove_file(&tmp);
         }
-        fs::rename(&tmp, path)?;
-        Ok(())
+        saved
+    }
+
+    pub fn write(&self, path: &Path) -> io::Result<()> {
+        Self::write_via_tmp(path, |w| self.write_to(w))
     }
 
     fn write_to<W: Write>(&self, sink: &mut W) -> io::Result<()> {
@@ -331,15 +346,12 @@ impl Cache {
     /// Compress on the way to disk, in-process: 4-5x smaller, and `load_auto`
     /// decompresses it again transparently.
     pub fn write_compressed(&self, path: &Path) -> io::Result<()> {
-        let tmp = path.with_extension("tmp");
-        {
-            let f = File::create(&tmp)?;
-            let mut enc = zstd::stream::write::Encoder::new(BufWriter::with_capacity(8 << 20, f), 3)?;
+        Self::write_via_tmp(path, |w| {
+            let mut enc = zstd::stream::write::Encoder::new(w, 3)?;
             self.write_to(&mut enc)?;
-            enc.finish()?.flush()?;
-        }
-        fs::rename(&tmp, path)?;
-        Ok(())
+            enc.finish()?;
+            Ok(())
+        })
     }
 
     /// Read either a plain or a zstd-compressed cache.
