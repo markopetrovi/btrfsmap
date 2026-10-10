@@ -302,5 +302,6 @@ and reads the packed `btrfs_file_extent_item` layout directly, exactly like
 compsize.
 
 `BMAP_TIME=1` makes a scan print a phase-by-phase timing breakdown on stderr, the
-quickest way to see where its seconds go; the other `BMAP_*` variables in the
+quickest way to see where its seconds go; `BMAP_DARK=1` (or `=0`) pins the app's
+theme instead of following the desktop's; the other `BMAP_*` variables in the
 source are development aids for poking at one scan in detail.
