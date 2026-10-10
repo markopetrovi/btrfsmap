@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! The usage chart: a sunburst ring chart and a treemap, drawn with cairo.
 //!
 //! The current directory sits in the middle, its children form the first ring,

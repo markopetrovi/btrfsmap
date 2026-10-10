@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Build the gate fixture: the small btrfs tree that "Verifying a change" scans
 # with both implementations. It is created as .scratch/own in the current
 # directory (run it from the checkout), and it must not be modified afterwards -

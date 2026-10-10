@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! Cache file: the result of a scan, in a fixed-width layout that loads back
 //! with a single read per array.
 //!

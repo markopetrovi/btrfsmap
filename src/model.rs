@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! The usage model: one physical extent table plus a node tree, from which
 //! every per-directory number is derived.
 //!

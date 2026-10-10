@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! The mount table: the one thing a tree walk cannot see.
 //!
 //! A subvolume mounted at a path is invisible to a reader of fs trees. The

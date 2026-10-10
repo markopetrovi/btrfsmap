@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! Reading the trees instead of the files.
 //!
 //! The file backend asks the kernel about one inode at a time - `statx` for the

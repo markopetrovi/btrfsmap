@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! What a scan is handed and what it reports back.
 //!
 //! These types describe a scan, not how one is carried out: `ScanOptions` is
