@@ -1164,7 +1164,81 @@ fn build(
             for e in &entries[lo..hi] {
             let child_name = names[e.name_off as usize..e.name_off as usize + e.name_len as usize].to_vec();
             let is_subvol_entry = u32::from(e.loc_type) == btrfs::BTRFS_ROOT_ITEM_KEY;
-            let (child_ci, child_inode, child_flags, collapsed) = if is_subvol_entry {
+            let mount_here = dir_mounts
+                .iter()
+                .copied()
+                .find(|&mi| c.mounts[mi].holder.2 == child_name);
+            // A mount comes before the tree's own entry for the path: it is what
+            // the namespace serves there. Mounting a subvolume over another
+            // subvolume's own path is legal, and measured: without this, the
+            // covered subvolume's entry was found to be interned nowhere (its
+            // path opens the mount), the entry was dropped, and the *mounted*
+            // tree - read, and holding 2 MiB - had no node to hang from.
+            let (child_ci, child_inode, child_flags, collapsed) = if let Some(mi) = mount_here {
+                // A mount point: the containing tree has an ordinary directory
+                // here, and nothing of what is mounted over it.
+                //
+                // `child` is set only for the mount this scan reads the
+                // subvolume at, so that node is the subvolume's root. Every
+                // other mount point - an alias, a filesystem this scan does not
+                // enter, a bind mount of a directory - keeps the directory the
+                // containing tree holds, and is never descended into: what is
+                // mounted there is counted at the mount that reads it, and a
+                // second placement would split every extent between the two.
+                if is_subvol_entry {
+                    // The tree names a subvolume here and the namespace serves
+                    // another one. The covered subvolume is reachable nowhere
+                    // else - its own path opens the mount - so nothing will
+                    // count it; say so rather than let it disappear.
+                    let covered = c.subs[ci]
+                        .nested
+                        .iter()
+                        .find(|(_, dirid, name)| {
+                            *dirid == inode && name.as_slice() == child_name.as_slice()
+                        })
+                        .map(|(r, _, _)| *r);
+                    if let Some(root) = covered {
+                        if Some(root) != c.mounts[mi].candidate.as_ref().map(|i| i.treeid) {
+                            tree.warnings.push(format!(
+                                "a subvolume is mounted over {}: the subvolume the tree has \
+                                 there (id {root}) is not counted",
+                                String::from_utf8_lossy(&child_name)
+                            ));
+                        }
+                    }
+                }
+                match c.mounts[mi].child {
+                    Some(child) => {
+                        let root = tree.subvols[child as usize].id;
+                        let s = &tree.subvols[child as usize];
+                        let mut f = FLAG_SUBVOL | FLAG_MOUNT;
+                        if s.is_snapshot() {
+                            f |= FLAG_SNAPSHOT;
+                        }
+                        if s.is_readonly() {
+                            f |= FLAG_READONLY;
+                        }
+                        match c.collapsed.iter().find(|(r, _, _)| *r == root) {
+                            // a collapsed mount: one node for the whole subtree
+                            Some(&(_, subvol, _)) => (usize::MAX, 0, f, Some(subvol)),
+                            None => {
+                                match c.subs.iter().position(
+                                    |s| tree.subvols[s.subvol as usize].id == root,
+                                ) {
+                                    Some(child_ci) => (
+                                        child_ci,
+                                        btrfs::BTRFS_FIRST_FREE_OBJECTID,
+                                        f,
+                                        None,
+                                    ),
+                                    None => (ci, e.child, FLAG_MOUNT_OTHER, None),
+                                }
+                            }
+                        }
+                    }
+                    None => (ci, e.child, FLAG_MOUNT_OTHER, None),
+                }
+            } else if is_subvol_entry {
                 let nested = c.subs[ci]
                     .nested
                     .iter()
@@ -1212,52 +1286,6 @@ fn build(
                         }
                     }
                     None => continue,
-                }
-            } else if let Some(mi) = dir_mounts
-                .iter()
-                .copied()
-                .find(|&mi| c.mounts[mi].holder.2 == child_name)
-            {
-                // A mount point: the containing tree has an ordinary directory
-                // here, and nothing of what is mounted over it.
-                //
-                // `child` is set only for the mount this scan reads the
-                // subvolume at, so that node is the subvolume's root. Every
-                // other mount point - an alias, a filesystem this scan does not
-                // enter, a bind mount of a directory - keeps the directory the
-                // containing tree holds, and is never descended into: what is
-                // mounted there is counted at the mount that reads it, and a
-                // second placement would split every extent between the two.
-                match c.mounts[mi].child {
-                    Some(child) => {
-                        let root = tree.subvols[child as usize].id;
-                        let s = &tree.subvols[child as usize];
-                        let mut f = FLAG_SUBVOL | FLAG_MOUNT;
-                        if s.is_snapshot() {
-                            f |= FLAG_SNAPSHOT;
-                        }
-                        if s.is_readonly() {
-                            f |= FLAG_READONLY;
-                        }
-                        match c.collapsed.iter().find(|(r, _, _)| *r == root) {
-                            // a collapsed mount: one node for the whole subtree
-                            Some(&(_, subvol, _)) => (usize::MAX, 0, f, Some(subvol)),
-                            None => {
-                                match c.subs.iter().position(
-                                    |s| tree.subvols[s.subvol as usize].id == root,
-                                ) {
-                                    Some(child_ci) => (
-                                        child_ci,
-                                        btrfs::BTRFS_FIRST_FREE_OBJECTID,
-                                        f,
-                                        None,
-                                    ),
-                                    None => (ci, e.child, FLAG_MOUNT_OTHER, None),
-                                }
-                            }
-                        }
-                    }
-                    None => (ci, e.child, FLAG_MOUNT_OTHER, None),
                 }
             } else {
                 (ci, e.child, 0, None)
@@ -2645,6 +2673,32 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
 
     let (mut tree, final_refs, collapsed_nodes) = build(&mut c, &roots, &opts.excludes);
     tree.inventory = inv.clone();
+    // Nothing should be read without a node to stand for it: a subvolume whose
+    // tree was walked and placed nowhere puts its files' bytes in no subtree,
+    // where they count for nobody and roll into no root. Every path through
+    // build is supposed to place one, so if any is missing, say so - this is
+    // how the mount over a subvolume's own path was caught.
+    {
+        let mut placed: HashSet<u16> = HashSet::new();
+        for n in &tree.nodes {
+            if n.kind == KIND_DIR && n.flags & FLAG_SUBVOL != 0 {
+                placed.insert(tree.dirs[n.extra as usize].subvol);
+            }
+        }
+        let missing: Vec<u64> = tree
+            .subvols
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !placed.contains(&(*i as u16)))
+            .map(|(_, s)| s.id)
+            .collect();
+        if !missing.is_empty() {
+            tree.warnings.push(format!(
+                "{} subvolume(s) have no node in the tree; what they hold is not counted: {missing:?}",
+                missing.len()
+            ));
+        }
+    }
     // the assembled array, whose references name their owner node
     let mut final_refs = final_refs;
     phase!("build");
