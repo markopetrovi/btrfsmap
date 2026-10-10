@@ -48,7 +48,7 @@ filesystem).
 
 A fresh snapper snapshot of `/home` therefore shows a few hundred MB owned (its CoW cost so
 far) instead of "another 605 GB"; when the live tree overwrites or deletes something, that data's
-ownership moves to the snapshot holding it, and `/home/marko` keeps its compsize number even
+ownership moves to the snapshot holding it, and `/home/you` keeps its compsize number even
 though 190 snapshots reference the same extents. In a reflink farm the original keeps the shared
 bytes and every copy owns only its own deltas, so the numbers do not move when an unrelated copy
 appears or is deleted.
