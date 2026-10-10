@@ -18,6 +18,19 @@ a saved scan is just a file you choose the location of.
 Scanning needs root (the kernel's extent ioctl requires CAP_SYS_ADMIN), so start the
 app with `sudo compsize-tree`; opening a saved scan works unprivileged.
 
+## Building
+
+Rust (any recent stable) with GTK4 development headers - `gtk4-devel` on
+Fedora, `libgtk-4-dev` on Debian and Ubuntu - and a C toolchain for the `zstd`
+crate:
+
+```
+cargo build --release
+```
+
+That leaves the binary at `target/release/compsize-tree`; install it wherever you
+keep binaries, or run it from there.
+
 ## Why `du`/baobab are wrong here, and compsize is tedious
 
 `du` and baobab sum `st_blocks` per file. On btrfs that counts every reflink,
@@ -48,7 +61,7 @@ filesystem).
 
 A fresh snapper snapshot of `/home` therefore shows a few hundred MB owned (its CoW cost so
 far) instead of "another 605 GB"; when the live tree overwrites or deletes something, that data's
-ownership moves to the snapshot holding it, and `/home/marko` keeps its compsize number even
+ownership moves to the snapshot holding it, and `/home/you` keeps its compsize number even
 though 190 snapshots reference the same extents. In a reflink farm the original keeps the shared
 bytes and every copy owns only its own deltas, so the numbers do not move when an unrelated copy
 appears or is deleted.
@@ -136,46 +149,34 @@ own byte gates, which compare two users of it.
 
 The file walker is the reference implementation: what the tree reader produces has
 to match it byte for byte. It no longer ships in this tree - the
-`deprecated-files-backend` branch keeps it, and a build of that branch is kept at
-`/tmp/cst-old-files` as the gate (`git worktree add /tmp/cst deprecated-files-backend
-&& (cd /tmp/cst && cargo build --release)`, then `target/release/compsize-tree`).
+`deprecated-files-backend` branch keeps it, and the gate is a build of that branch:
+
+```
+git worktree add ../cst-ref deprecated-files-backend
+cargo build --release --manifest-path ../cst-ref/Cargo.toml
+```
+
 Scan the same tree with both and compare the caches:
 
 ```
 sudo compsize-tree scan --full-scan --save /tmp/a.cst --reproducible PATH
-sudo /tmp/cst-old-files scan --save /tmp/b.cst --reproducible PATH
+sudo ../cst-ref/target/release/compsize-tree scan --save /tmp/b.cst --reproducible PATH
 cmp /tmp/a.cst /tmp/b.cst
 ```
 
-The gate is run on two trees. One is `.scratch/own`, which must not be modified -
-it is the input to a byte comparison, and a frozen fixture is what makes a new
-difference between two runs mean something. It is a subvolume holding an
-inline-sized file, a hardlinked pair, a symlink, a file with real extents, a
-directory nested two deep, and a snapshot taken midway through - so it holds an
-older, smaller set of the same files - which is what makes the gate compare the
-snapshot and ownership paths and not only plain files. It is not in git (its
-snapshot is a subvolume, not files); if it is lost:
+Run it on two trees. One is the fixture, which `scripts/make-gate-fixture.sh`
+builds as `.scratch/own` in this directory and which must not be modified
+afterwards - it is the input to a byte comparison, and a fixture that changed
+would hide the differences the gate exists to catch. It is a subvolume holding a
+file small enough to live inline in its inode, a hardlinked pair, a symlink, files
+with real extents, a directory nested two deep, and a snapshot taken midway - so
+it holds an older, smaller set of the same files - which is what puts the snapshot
+and ownership paths under the comparison and not just plain files.
 
-```
-sudo btrfs subvolume create .scratch/own && sudo chown "$USER" .scratch/own
-cd .scratch/own
-printf 'hello\n' > a.txt && ln -s a.txt link
-head -c 300000 /dev/urandom > b.bin
-mkdir -p sub/deeper && printf '01234\n' > sub/c.txt
-head -c 120000 /dev/urandom > sub/deeper/d.bin
-sync && sudo btrfs subvolume snapshot . snap
-# after the snapshot, so it holds the older, smaller set: a second link to
-# a.txt, another file, and a longer c.txt - the snapshot keeps the six bytes
-ln a.txt hardlink
-head -c 90000 /dev/urandom > sub/e.bin
-printf '0123456\n' > sub/c.txt
-sync
-```
-
-The other is any tree with a large image file in it (the one used here is a 250 GB
-disk image, 381k extents): that is what exercises compression, and files with
-enough extents to page the kernel search - the fixture above is small and
-uncompressed, so it covers shapes, not those.
+The other tree is any with a large image file in it (tens of gigabytes, hundreds
+of thousands of extents): that is what exercises compression, and files long
+enough to page the kernel search. The fixture is small and uncompressed, so it
+covers shapes, not those.
 
 `--reproducible` drops timings and warnings, which is what makes two scans of an
 unchanged tree byte-identical. When the tree has snapshot-class subvolumes the
@@ -251,7 +252,7 @@ failed to parse (the count has to be zero).
 * An extent's address is carried as a 4 KiB page number in a `u32`, which is
   what packs a reference into one word - and caps the logical address it can
   name at 16 TiB. An extent above that is skipped, with a warning. Measured
-  here: the highest chunk ends at 2.30 TiB on this 898 GiB filesystem, since
+  here: on an 898 GiB filesystem the highest chunk ended at 2.30 TiB, since
   addresses grow with allocation and not with what is held, so the cliff is
   about 7x away - a filesystem several times larger would need the key widened.
 * A mount the scan does not enter - a non-btrfs filesystem (loop mounts,
@@ -316,3 +317,7 @@ accounted the way compsize accounts them.
 works one path at a time, asks the kernel for that inode's `EXTENT_DATA` items
 and reads the packed `btrfs_file_extent_item` layout directly, exactly like
 compsize.
+
+`CST_TIME=1` makes a scan print a phase-by-phase timing breakdown on stderr, the
+quickest way to see where its seconds go; the other `CST_*` variables in the
+source are development aids for poking at one scan in detail.
