@@ -56,7 +56,7 @@ struct Ui {
 
 pub fn run(open: Option<PathBuf>) -> ExitCode {
     let app = gtk::Application::builder()
-        .application_id("io.github.compsizetree")
+        .application_id("io.github.btrfsmap")
         .build();
     let open = RefCell::new(open);
     app.connect_activate(move |app| {
@@ -73,7 +73,7 @@ pub fn run(open: Option<PathBuf>) -> ExitCode {
 }
 
 fn is_dark() -> bool {
-    match std::env::var("COMPSIZE_TREE_DARK").ok().as_deref() {
+    match std::env::var("BMAP_DARK").ok().as_deref() {
         Some("1") => return true,
         Some("0") => return false,
         _ => {}
@@ -131,7 +131,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .build();
     root_warning.set_markup(
         "<span foreground='#c01c28'>Scanning needs root (the btrfs extent ioctl): run \
-         <tt>sudo compsize-tree</tt>. Opening a saved scan works as you are.</span>",
+         <tt>sudo btrfsmap</tt>. Opening a saved scan works as you are.</span>",
     );
 
     let start_box = gtk::Box::builder()
@@ -141,7 +141,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .valign(gtk::Align::Center)
         .build();
     let title = gtk::Label::builder()
-        .label("compsize-tree")
+        .label("btrfsmap")
         .css_classes(["h1"])
         .build();
     let subtitle = gtk::Label::builder()
@@ -369,7 +369,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
 
     let window = gtk::ApplicationWindow::builder()
         .application(app)
-        .title("compsize-tree")
+        .title("btrfsmap")
         .default_width(1400)
         .default_height(900)
         .child(&stack)
@@ -585,7 +585,7 @@ impl Ui {
             self.show_start();
             self.status(
                 "scanning reads extent data through an ioctl that needs root \
-                 - restart with: sudo compsize-tree",
+                 - restart with: sudo btrfsmap",
             );
             return;
         }
@@ -626,9 +626,9 @@ impl Ui {
             .modal(true)
             .build();
         let filter = gtk::FileFilter::new();
-        filter.set_name(Some("compsize-tree scans"));
-        filter.add_pattern("*.cst");
-        filter.add_pattern("*.cst.zst");
+        filter.set_name(Some("btrfsmap scans"));
+        filter.add_pattern("*.bmap");
+        filter.add_pattern("*.bmap.zst");
         filter.add_pattern("*");
         let filters = gio::ListStore::new::<gtk::FileFilter>();
         filters.append(&filter);
@@ -677,9 +677,9 @@ impl Ui {
             .map(|r| {
                 let s = String::from_utf8_lossy(r);
                 let slug = s.trim_matches('/').replace('/', "_");
-                format!("{}.cst", if slug.is_empty() { "scan".into() } else { slug })
+                format!("{}.bmap", if slug.is_empty() { "scan".into() } else { slug })
             })
-            .unwrap_or_else(|| "scan.cst".into());
+            .unwrap_or_else(|| "scan.bmap".into());
         let dialog = gtk::FileDialog::builder()
             .title("Save scan")
             .modal(true)

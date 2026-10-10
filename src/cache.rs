@@ -30,7 +30,9 @@ const O_TMPFILE: i32 = 0o20200000;
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_FOLLOW: i32 = 0x400;
 
-const MAGIC: &[u8; 8] = b"CSTREE\x01\n";
+const MAGIC: &[u8; 8] = b"BTRFSMAP";
+// The name before the rename: accepted on load, so older scans still open.
+const LEGACY_MAGIC: &[u8; 8] = b"CSTREE\x01\n";
 const VERSION: u32 = 5;
 
 pub struct Cache {
@@ -233,10 +235,10 @@ impl Cache {
         let mut r = r;
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
-        if &magic != MAGIC {
+        if &magic != MAGIC && &magic != LEGACY_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "not a compsize-tree cache",
+                "not a btrfsmap cache",
             ));
         }
         let version = read_u32(&mut r)?;

@@ -259,9 +259,9 @@ fn resolve_kids(c: &mut Collector) {
         s.name = win.name.clone();
         s.path = win.path.clone();
     }
-    // CST_DEBUG_CLAIMS: which tree each child found in the root tree went to,
+    // BMAP_DEBUG_CLAIMS: which tree each child found in the root tree went to,
     // and who else claimed it - the check that the rule did what it says.
-    if std::env::var_os("CST_DEBUG_CLAIMS").is_some() {
+    if std::env::var_os("BMAP_DEBUG_CLAIMS").is_some() {
         for kid in &kids {
             let who = |p: u64| {
                 let i = c.subvols.iter().position(|s| s.id == p);
@@ -1518,7 +1518,7 @@ struct Job {
 }
 
 /// A finished walk: the tree it collected, the shard it wrote, and how long
-/// the walk itself took (which is what CST_TIME_SUBVOL prints).
+/// the walk itself took (which is what BMAP_TIME_SUBVOL prints).
 type JobResult = io::Result<(Collected, Shard, std::time::Duration)>;
 
 /// Walks in flight, and the results workers park for the coordinator.
@@ -1825,7 +1825,7 @@ fn collect_walk(
                 }
                 work.push((child_root, child, child_path, !collapsed));
             }
-            if std::env::var_os("CST_DEBUG_CLAIMS").is_some() && n_kids + n_claims > 0 {
+            if std::env::var_os("BMAP_DEBUG_CLAIMS").is_some() && n_kids + n_claims > 0 {
                 eprintln!(
                     "[claim] collapsed {} ({}): {n_kids} new children, {n_claims} claims for known ones",
                     root_id,
@@ -1857,7 +1857,7 @@ fn collect_walk(
             )?;
             (col, t_sub.elapsed())
         };
-        if std::env::var_os("CST_TIME_SUBVOL").is_some() {
+        if std::env::var_os("BMAP_TIME_SUBVOL").is_some() {
             let s = &c.subvols[subvol as usize];
             eprintln!(
                 "[time]   subvol {} ({}) walked in {:.2}s: {} inodes, {} entries",
@@ -2187,7 +2187,7 @@ fn set_windows(tree: &Tree, refs: &[u64], extents: &mut ExtentMap, subvol_otime:
 /// `e.assigned` is how many (node, reference) pairs matched the extent's
 /// window - zero means the extent is in the map, is referenced, and is owned by
 /// nobody. Counts those, and prints the window and the referencing nodes'
-/// keys for the bytenrs named in CST_DEBUG_BYTENR / CST_DEBUG_BYTENR_FILE.
+/// keys for the bytenrs named in BMAP_DEBUG_BYTENR / BMAP_DEBUG_BYTENR_FILE.
 fn debug_ownership(
     tree: &Tree,
     extents: &ExtentMap,
@@ -2195,14 +2195,14 @@ fn debug_ownership(
     subvol_otime: &[u64],
 ) {
     let mut wanted: HashSet<u32> = HashSet::new();
-    if let Ok(list) = std::env::var("CST_DEBUG_BYTENR") {
+    if let Ok(list) = std::env::var("BMAP_DEBUG_BYTENR") {
         for t in list.split(',') {
             if let Ok(b) = t.trim().parse::<u64>() {
                 wanted.insert((b >> 12) as u32);
             }
         }
     }
-    if let Ok(path) = std::env::var("CST_DEBUG_BYTENR_FILE") {
+    if let Ok(path) = std::env::var("BMAP_DEBUG_BYTENR_FILE") {
         if let Ok(text) = std::fs::read_to_string(&path) {
             for line in text.lines() {
                 if let Ok(b) = line.trim().parse::<u64>() {
@@ -2261,7 +2261,7 @@ fn debug_ownership(
             .collect();
         eprintln!("[own]   smallest unowned bytenrs: {show:?}");
     }
-    if let Ok(path) = std::env::var("CST_DEBUG_OWN_DUMP") {
+    if let Ok(path) = std::env::var("BMAP_DEBUG_OWN_DUMP") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::File::create(&path) {
             let mut buf = String::new();
@@ -2330,7 +2330,7 @@ fn debug_ownership(
     }
 }
 
-/// Development aid, gated by `CST_DEBUG_OWN_STATS`: the ownership
+/// Development aid, gated by `BMAP_DEBUG_OWN_STATS`: the ownership
 /// arithmetic, checked rather than trusted.
 ///
 /// * `split` recomputes, per extent, how many references in the block match
@@ -2538,9 +2538,9 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     let started = std::time::Instant::now();
     // Per-phase timing on stderr: which part of a scan the seconds go to.
     let mut t_phase = std::time::Instant::now();
-    // Development aid, silent unless CST_TIME is set: where a scan's time goes,
+    // Development aid, silent unless BMAP_TIME is set: where a scan's time goes,
     // phase by phase, on stderr.
-    let show_phases = std::env::var_os("CST_TIME").is_some();
+    let show_phases = std::env::var_os("BMAP_TIME").is_some();
     macro_rules! phase {
         ($name:expr) => {{
             let since = t_phase;
@@ -2658,7 +2658,7 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
         )?;
         roots[i].col = col;
     }
-    if std::env::var_os("CST_TIME_SUBVOL").is_some() {
+    if std::env::var_os("BMAP_TIME_SUBVOL").is_some() {
         eprintln!(
             "[time]   collect_all wall {:.2}s for {} subvolumes",
             t_collect.elapsed().as_secs_f64(),
@@ -2785,7 +2785,7 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
                 cstats.gone.1 as f64 / 1073741824.0
             );
         }
-        if std::env::var_os("CST_DEBUG_EXT").is_some() {
+        if std::env::var_os("BMAP_DEBUG_EXT").is_some() {
             let mut per: HashMap<u32, u64> = HashMap::new();
             for (n, _) in pairs.iter() {
                 *per.entry(*n).or_insert(0) += 1;
@@ -2848,7 +2848,7 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     let mut extents = std::mem::take(&mut c.shard.extents);
     // Development aid: the extent map this scan ended up with, as logical
     // bytenrs, so two scans can be diffed against each other.
-    if let Ok(path) = std::env::var("CST_DUMP_MAP") {
+    if let Ok(path) = std::env::var("BMAP_DUMP_MAP") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::File::create(&path) {
             let mut pages: Vec<u32> = extents.keys().copied().collect();
@@ -2875,11 +2875,11 @@ pub fn scan_tree(opts: &ScanOptions) -> io::Result<(Tree, ScanStats)> {
     if cancelled() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
     }
-    if std::env::var_os("CST_DEBUG_OWN").is_some() {
+    if std::env::var_os("BMAP_DEBUG_OWN").is_some() {
         debug_ownership(&tree, &extents, &final_refs, &subvol_otime);
         phase!("debug_ownership");
     }
-    if std::env::var_os("CST_DEBUG_OWN_STATS").is_some() {
+    if std::env::var_os("BMAP_DEBUG_OWN_STATS").is_some() {
         debug_ownership_stats(&tree, &extents, &final_refs, &subvol_otime);
         phase!("debug_ownership_stats");
     }
@@ -2969,7 +2969,7 @@ pub fn probe_extent_tree(fd: i32) -> io::Result<(u64, u64, u64, u64, u64, Vec<(u
     let mut owner = 0u64;
     let mut per_root: HashMap<u64, u64> = HashMap::new();
     let mut cur_data = false;
-    if std::env::var_os("CST_DUMP_EXT").is_some() {
+    if std::env::var_os("BMAP_DUMP_EXT").is_some() {
         extents = 1; // dump mode: the first items, raw, for external checking
     }
     btrfs::for_each_extent_tree_item(fd, None, &mut |bytenr, ty, len, payload| match ty {
@@ -2985,7 +2985,7 @@ pub fn probe_extent_tree(fd: i32) -> io::Result<(u64, u64, u64, u64, u64, Vec<(u
             cur_data = true;
             extents += 1;
             bytes += len;
-            if std::env::var_os("CST_DUMP_EXT").is_some() && extents < 201 {
+            if std::env::var_os("BMAP_DUMP_EXT").is_some() && extents < 201 {
                 println!(
                     "{} {} {} {}",
                     bytenr,
@@ -3013,7 +3013,7 @@ pub fn probe_extent_tree(fd: i32) -> io::Result<(u64, u64, u64, u64, u64, Vec<(u
             });
             if !complete {
                 bad += 1;
-                if std::env::var_os("CST_DEBUG_EXT").is_some() {
+                if std::env::var_os("BMAP_DEBUG_EXT").is_some() {
                     eprintln!(
                         "  [desync] bytenr {bytenr} len {len} item_len {} hex {}",
                         payload.len(),
@@ -3037,7 +3037,7 @@ pub fn probe_extent_tree(fd: i32) -> io::Result<(u64, u64, u64, u64, u64, Vec<(u
         }
         _ => {}
     })?;
-    if extents > 0 && std::env::var_os("CST_DUMP_EXT").is_some() {
+    if extents > 0 && std::env::var_os("BMAP_DUMP_EXT").is_some() {
         extents -= 1;
     }
     if bad > 0 {

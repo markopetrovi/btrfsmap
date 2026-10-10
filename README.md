@@ -1,12 +1,12 @@
-# compsize-tree
+# btrfsmap
 
 Extent-accurate disk usage for btrfs: **one pass** over the tree gives every
 directory's true size, and a GTK4 browser shows it the way baobab would - if baobab
 understood reflinks, snapshots and compression.
 
 ```
-sudo compsize-tree                     # the app: scan a path, or open a saved scan
-sudo compsize-tree scan /home          # headless: one pass, per-directory metrics
+sudo btrfsmap                          # the app: scan a path, or open a saved scan
+sudo btrfsmap scan /home               # headless: one pass, per-directory metrics
 ```
 
 The graphical browser (GTK4) starts with no arguments. From there you can pick a
@@ -16,7 +16,7 @@ Nothing is written to disk unless you ask for it, and there is no cache director
 a saved scan is just a file you choose the location of.
 
 Scanning needs root (the kernel's extent ioctl requires CAP_SYS_ADMIN), so start the
-app with `sudo compsize-tree`; opening a saved scan works unprivileged.
+app with `sudo btrfsmap`; opening a saved scan works unprivileged.
 
 ## Building
 
@@ -28,7 +28,7 @@ crate:
 cargo build --release
 ```
 
-That leaves the binary at `target/release/compsize-tree`; install it wherever you
+That leaves the binary at `target/release/btrfsmap`; install it wherever you
 keep binaries, or run it from there.
 
 ## Why `du`/baobab are wrong here, and compsize is tedious
@@ -79,7 +79,7 @@ current one (zstd-compressed), both through native file dialogs.
 ### `scan` (needs root)
 
 ```
-sudo compsize-tree scan [options] PATH...
+sudo btrfsmap scan [options] PATH...
 ```
 
 One pass, then per-directory metrics. The scan itself never needs a cache: the tree
@@ -132,7 +132,7 @@ bytes per file: ~3.5 GB for a 37M file `/home`, or ~750 MB with `--compress`.
 ### `report` (the compsize-compatible verifier)
 
 ```
-sudo compsize-tree report [-b] PATH...
+sudo btrfsmap report [-b] PATH...
 ```
 
 Reproduces `compsize`'s table byte for byte from its own walk, at about compsize's
@@ -150,16 +150,16 @@ to match it byte for byte. It no longer ships in this tree - the
 `deprecated-files-backend` branch keeps it, and the gate is a build of that branch:
 
 ```
-git worktree add ../cst-ref deprecated-files-backend
-cargo build --release --manifest-path ../cst-ref/Cargo.toml
+git worktree add ../btrfsmap-ref deprecated-files-backend
+cargo build --release --manifest-path ../btrfsmap-ref/Cargo.toml
 ```
 
 Scan the same tree with both and compare the caches:
 
 ```
-sudo compsize-tree scan --full-scan --save /tmp/a.cst --reproducible PATH
-sudo ../cst-ref/target/release/compsize-tree scan --save /tmp/b.cst --reproducible PATH
-cmp /tmp/a.cst /tmp/b.cst
+sudo btrfsmap scan --full-scan --save /tmp/a.bmap --reproducible PATH
+sudo ../btrfsmap-ref/target/release/btrfsmap scan --save /tmp/b.bmap --reproducible PATH
+cmp /tmp/a.bmap /tmp/b.bmap
 ```
 
 Run it on two trees. One is the small fixture - `scripts/make-gate-fixture.sh`
@@ -193,7 +193,7 @@ nodes and references are dropped, and the extents it alone held come out unowned
 its internal extent count still says the scan saw them. Excluding a whole subvolume is
 exact, because it is skipped before anything is read.
 
-`compsize-tree diff A.cst B.cst [--top N]` prints where two scans disagree, by path,
+`btrfsmap diff A.bmap B.bmap [--top N]` prints where two scans disagree, by path,
 largest first. `extent-probe PATH` reports what one pass over the extent tree sees -
 data extents, references, metadata extents, and how many items' inline references
 failed to parse (the count has to be zero).
@@ -301,6 +301,6 @@ works one path at a time, asks the kernel for that inode's `EXTENT_DATA` items
 and reads the packed `btrfs_file_extent_item` layout directly, exactly like
 compsize.
 
-`CST_TIME=1` makes a scan print a phase-by-phase timing breakdown on stderr, the
-quickest way to see where its seconds go; the other `CST_*` variables in the
+`BMAP_TIME=1` makes a scan print a phase-by-phase timing breakdown on stderr, the
+quickest way to see where its seconds go; the other `BMAP_*` variables in the
 source are development aids for poking at one scan in detail.

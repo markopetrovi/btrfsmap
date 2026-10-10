@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! compsize-tree: extent-accurate btrfs disk usage.
+//! btrfsmap: extent-accurate btrfs disk usage.
 //!
 //! GUI (no arguments): open a saved scan or scan a path.
 //! CLI: `scan` for a headless pass, `report` for compsize-compatible output.
@@ -28,7 +28,7 @@ extern "C" {
 }
 
 const USAGE: &str = "\
-usage: compsize-tree [command] [options] [paths...]
+usage: btrfsmap [command] [options] [paths...]
 
 With no command, the graphical browser starts: open a saved scan or pick a path to scan.
 
@@ -36,8 +36,8 @@ commands:
   scan [options] PATH...   one pass, per-directory metrics on stdout
   report [-b] [--buffer BYTES] PATH...
                            compsize-compatible table (the verification mode)
-  view FILE.cst            open a saved scan in the graphical browser
-  check FILE.cst           load a saved scan and print what it holds (no GUI)
+  view FILE.bmap           open a saved scan in the graphical browser
+  check FILE.bmap          load a saved scan and print what it holds (no GUI)
 
 scan options:
   -j, --threads N          worker threads for the fs-tree walks (default: CPUs);
@@ -81,19 +81,19 @@ fn main() -> ExitCode {
         Some("check") => match args.get(1) {
             Some(f) => cmd_check(&PathBuf::from(f)),
             None => {
-                eprintln!("check needs a file: compsize-tree check FILE.cst");
+                eprintln!("check needs a file: btrfsmap check FILE.bmap");
                 ExitCode::from(2)
             }
         },
         Some("view") => match args.get(1) {
             Some(f) => gui::run(Some(PathBuf::from(f))),
             None => {
-                eprintln!("view needs a file: compsize-tree view FILE.cst");
+                eprintln!("view needs a file: btrfsmap view FILE.bmap");
                 ExitCode::from(2)
             }
         },
         Some(other) => {
-            eprintln!("compsize-tree: unknown command '{other}'\n");
+            eprintln!("btrfsmap: unknown command '{other}'\n");
             eprint!("{USAGE}");
             ExitCode::from(2)
         }
@@ -142,7 +142,7 @@ fn cmd_extent_probe(path: &PathBuf) -> ExitCode {
 /// deliberately has nothing there.
 fn cmd_diff(args: &[String]) -> ExitCode {
     let (Some(a), Some(b)) = (args.first(), args.get(1)) else {
-        eprintln!("diff needs two caches: compsize-tree diff A.cst B.cst [--top N]");
+        eprintln!("diff needs two caches: btrfsmap diff A.bmap B.bmap [--top N]");
         return ExitCode::from(2);
     };
     let load = |p: &String| -> Result<model::Tree, String> {
@@ -367,7 +367,7 @@ fn cmd_report(args: &[String]) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             s if s.starts_with('-') && s.len() > 1 => {
-                eprintln!("compsize-tree: unknown option '{s}'");
+                eprintln!("btrfsmap: unknown option '{s}'");
                 return ExitCode::from(2);
             }
             s => paths.push(s),
@@ -476,7 +476,7 @@ fn cmd_scan(args: &[String]) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             s if s.starts_with('-') && s.len() > 1 => {
-                eprintln!("compsize-tree: unknown option '{s}'");
+                eprintln!("btrfsmap: unknown option '{s}'");
                 return ExitCode::from(2);
             }
             s => opts.roots.push(s.as_bytes().to_vec()),
