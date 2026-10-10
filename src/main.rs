@@ -44,8 +44,6 @@ scan options:
       --top N              entries per level (default 12)
       --files N            biggest files to list (default 0)
   -b, --bytes              raw byte counts in the report
-      --full-scan          accepted for compatibility: this backend always
-                           walks snapshot-class subvolumes
       --dump-subvols       print the subvolume inventory and its classification
       --save FILE          also write the scan to FILE (the GUI can open it)
       --reproducible       omit timings and warnings from the saved scan, so two
@@ -279,10 +277,6 @@ fn cmd_scan(args: &[String]) -> ExitCode {
                 }
             }
             "-b" | "--bytes" => raw = true,
-            // The tree reader collapses snapshot-class subvolumes unless this
-            // is given; this backend walks paths and always reads them, so the
-            // flag is accepted to let one command line drive both.
-            "--full-scan" => {}
             "--dump-subvols" => dump_subvols = true,
             "--compress" => compress = true,
             "--save" => {
