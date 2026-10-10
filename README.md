@@ -61,7 +61,7 @@ Needs root to scan. The window has a lazily-loaded file list, a sunburst ring ch
 (click a wedge to descend, hover for details) that switches to a treemap, a metric
 selector, badges for snapshot and shared entries, and a status line summarising the
 scan. Files: `Open…` loads a saved scan, `Save scan…` writes the current one
-(zstd-compressed when it helps), both through native file dialogs.
+(zstd-compressed), both through native file dialogs.
 
 ### `scan` (needs root)
 
@@ -134,8 +134,7 @@ buffer.
   overwriting the first 5 MB of a 20 MB file the old extent (still referenced
   by the snapshot) is also referenced by the live file's remaining 15 MB. Since
   btrfs frees an extent only when its refcount reaches zero, at extent
-  granularity, deleting that snapshot frees *nothing* - measured with
-  `btrfs filesystem usage` as a -4096 byte change (noise). The unreferenced
+  granularity, deleting that snapshot frees *nothing*. The unreferenced
   head of such an extent is dead space inside live data, and this tool reports
   it that way: the snapshot shows `freeable 0`, while `compsize` still shows
   the 25 MB it logically holds. When the live file is deleted instead of
@@ -148,12 +147,21 @@ buffer.
 The scanner is std-only Rust; the browser is GTK4 (gtk4-rs). Per file it asks the kernel for the inode's
 `EXTENT_DATA` items with `BTRFS_IOC_TREE_SEARCH_V2`, exactly like compsize,
 and reads the packed `btrfs_file_extent_item` layout directly. One `statx` per file supplies the
-inode, mtime and birth time the ownership rule needs; that replaced `fstat`, and the ioctl reuses the
-containing directory's descriptor (it only needs *a* descriptor from the file's subvolume, since the
-inode number travels in the search key), so a file costs two syscalls instead of four. Subvolume
+inode, mtime and birth time the ownership rule needs, and the ioctl reuses the containing
+directory's descriptor (it only needs *a* descriptor from the file's subvolume, since the inode
+number travels in the search key), so a file costs two syscalls rather than four. Subvolume
 identity comes from `BTRFS_IOC_GET_SUBVOL_INFO` at `st_dev` boundaries plus a
 root-tree scan for the UUID inventory, so snapshots are recognised
 structurally rather than by path convention. Compression, inline extents,
 prealloc and holes are all accounted the way compsize accounts them.
 
---- this branch ---
+---
+
+## This branch
+
+`main` is the tool, and its README is its documentation. This branch keeps the
+implementation it replaced - the file walker, which visits paths rather than
+reading the trees, asking the kernel about one inode at a time. It is kept because
+`main` is verified against it: scanning the same tree with both has to produce
+byte-identical saved scans. It is a reference, not a maintained alternative, and
+`main`'s "Verifying a change" says how to build it and run the comparison.
