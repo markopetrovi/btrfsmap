@@ -135,15 +135,13 @@ bytes per file: ~3.5 GB for a 37M file `/home`, or ~750 MB with `--compress`.
 sudo compsize-tree report [-b] PATH...
 ```
 
-Reproduces `compsize`'s table byte for byte from its own walk, and runs at about
-compsize's speed (measured interleaved on a tree of 422k extents: 3.2-4.2 s against
-3.4-3.6 s; `--buffer` trades memory for roughly 20% more, and the output is unchanged
-at any size).
+Reproduces `compsize`'s table byte for byte from its own walk, at about compsize's
+speed (`--buffer` trades memory for a little more; the output is unchanged at any
+size).
 
-It is a second implementation of the extent layer, which is what makes it worth
-keeping: the item decoding the scanners share is compared here against an independent
-implementation of it, and a bug in that decoding would be invisible to the scanners'
-own byte gates, which compare two users of it.
+It is a second implementation of the extent layer, which is what makes it a check:
+the item decoding the scanners share is compared here against an independent
+implementation of it.
 
 ## Verifying a change
 
@@ -164,19 +162,12 @@ sudo ../cst-ref/target/release/compsize-tree scan --save /tmp/b.cst --reproducib
 cmp /tmp/a.cst /tmp/b.cst
 ```
 
-Run it on two trees. One is the fixture, which `scripts/make-gate-fixture.sh`
-builds as `.scratch/own` in this directory and which must not be modified
-afterwards - it is the input to a byte comparison, and a fixture that changed
-would hide the differences the gate exists to catch. It is a subvolume holding a
-file small enough to live inline in its inode, a hardlinked pair, a symlink, files
-with real extents, a directory nested two deep, and a snapshot taken midway - so
-it holds an older, smaller set of the same files - which is what puts the snapshot
-and ownership paths under the comparison and not just plain files.
-
-The other tree is any with a large image file in it (tens of gigabytes, hundreds
-of thousands of extents): that is what exercises compression, and files long
-enough to page the kernel search. The fixture is small and uncompressed, so it
-covers shapes, not those.
+Run it on two trees. One is the small fixture - `scripts/make-gate-fixture.sh`
+builds it as `.scratch/own` and says what shapes it puts in it; it must not be
+modified afterwards, since it is the input to a byte comparison. The other is any
+tree with a large image file in it (tens of gigabytes, hundreds of thousands of
+extents), which is what exercises compression and files long enough to page the
+kernel search.
 
 `--reproducible` drops timings and warnings, which is what makes two scans of an
 unchanged tree byte-identical. When the tree has snapshot-class subvolumes the
@@ -226,22 +217,19 @@ failed to parse (the count has to be zero).
   come from the extent tree, and subvolumes nested inside it are found through
   the root tree (`ROOT_BACKREF`) and have their own trees read. So the fast
   scan's aggregate is exact apart from the interiors being unbrowsable, and the
-  two modes agree - on the tree measured (`/home`), `owned` came out within
-  140 KB of each other at 597 GiB. Use `--full-scan` when the interiors of the
-  collapsed subvolumes matter.
+  two modes agree - on a real `/home`, `owned` came within 140 KB of the full
+  scan at 597 GiB. Use `--full-scan` when the interiors of the collapsed
+  subvolumes matter.
 * The ownership rule treats a *snapshot-class* subvolume as one voice: its
   references carry no file birth time (unknown, with the subvolume's creation
   time as the tie-break), so a snapshot owns what the live trees have let go of
   and nothing they still hold, and among snapshots the oldest is the custodian.
   Its files' birth times are deliberately ignored there: a reflink copy and a
   rename are enough to hand a live file a younger inode, which would otherwise
-  move ownership of data that never went anywhere to a snapshot. The rule is the
-  same in the file walker and the tree reader, so the reference scan and this
-  one agree.
-* The file walker finds a handful of files the tree reader does not (4 of
-  /home's 38M, 78 MB): they live in a subvolume the root-tree backref walk does
-  not reach. It shows up as a `~78 MB` difference in `owned` for one subtree,
-  and it predates the collapsed scan.
+  move ownership of data that never went anywhere to a snapshot.
+* A few files can be missed: they live in a subvolume the root-tree backref walk
+  does not reach (4 of a 38M-file `/home`, 78 MB, which shows up as that much in
+  one subtree's `owned`).
 * A collapsed snapshot's `uncompressed` is its compressed size for the extents
   only it holds - the extent tree has no uncompressed size. Its `referenced` is
   0 for the same reason: the logical sizes live in the files, which were not
@@ -251,20 +239,16 @@ failed to parse (the count has to be zero).
   be in it until `sync`.
 * An extent's address is carried as a 4 KiB page number in a `u32`, which is
   what packs a reference into one word - and caps the logical address it can
-  name at 16 TiB. An extent above that is skipped, with a warning. Measured
-  here: on an 898 GiB filesystem the highest chunk ended at 2.30 TiB, since
-  addresses grow with allocation and not with what is held, so the cliff is
-  about 7x away - a filesystem several times larger would need the key widened.
+  name at 16 TiB. An extent above that is skipped, with a warning. (On an
+  898 GiB filesystem the highest chunk ended at 2.30 TiB - addresses grow with
+  allocation, not with what is held - so the cliff is several times away; a much
+  larger filesystem would need the key widened.)
 * A mount the scan does not enter - a non-btrfs filesystem (loop mounts,
   overlayfs, tmpfs, `/boot`), a *different* btrfs filesystem (its fsid is
   compared with the scanned one by `BTRFS_IOC_FS_INFO` before anything is read
   from it, since extent addresses are only unique within one filesystem), or a
   mount of a plain directory - is shown as a mount point with nothing under it.
-  Scanning such a filesystem works by starting the scan there. The
-  `skipped_nonbtrfs`/`skipped_otherfs` counters the file walker filled in are
-  still in the saved-scan layout and are read from scans the reference build
-  wrote, but the tree reader leaves them at zero: each mount is marked in the
-  tree instead.
+  Scanning such a filesystem works by starting the scan there.
 * A subvolume mounted under the scanned path is read at its mount, once. Of
   several mounts of one subvolume the *oldest* is the one read - mount IDs are
   handed out in mount order - and the others show as mount points with nothing
@@ -291,8 +275,7 @@ failed to parse (the count has to be zero).
   overwriting the first 5 MB of a 20 MB file the old extent (still referenced
   by the snapshot) is also referenced by the live file's remaining 15 MB. Since
   btrfs frees an extent only when its refcount reaches zero, at extent
-  granularity, deleting that snapshot frees *nothing* - measured with
-  `btrfs filesystem usage` as a -4096 byte change (noise). The unreferenced
+  granularity, deleting that snapshot frees *nothing*. The unreferenced
   head of such an extent is dead space inside live data, and this tool reports
   it that way: the snapshot shows `freeable 0`, while `compsize` still shows
   the 25 MB it logically holds. When the live file is deleted instead of
