@@ -148,11 +148,15 @@ impl Chart {
             let st_click = state.clone();
             let click = gtk::GestureClick::new();
             click.connect_released(move |_, _, x, y| {
-                if let Some(id) = hit_test(&st_click.borrow(), x, y) {
-                    let cb = st_click.borrow().on_click.clone();
-                    if let Some(cb) = cb {
-                        cb(id);
-                    }
+                // The borrow has to end before the callback: it navigates, which
+                // asks for a mutable borrow of the same state. (`if let` would
+                // hold the temporary borrow through the body, which is exactly
+                // how a click on a wedge used to panic the app.)
+                let hit = hit_test(&st_click.borrow(), x, y);
+                let Some(id) = hit else { return };
+                let cb = st_click.borrow().on_click.clone();
+                if let Some(cb) = cb {
+                    cb(id);
                 }
             });
             area.add_controller(click);
